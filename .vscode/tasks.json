@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Resumax: Backend",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.sh backend",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "group": "resumax",
+        "reveal": "always"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Resumax: Frontend",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/dev.sh frontend",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "panel": "dedicated",
+        "group": "resumax",
+        "reveal": "always"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Resumax: Start",
+      "dependsOn": [
+        "Resumax: Backend",
+        "Resumax: Frontend"
+      ],
+      "dependsOrder": "parallel",
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
