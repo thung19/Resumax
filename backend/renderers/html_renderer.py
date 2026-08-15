@@ -10,7 +10,9 @@ Replicates the Layout Schema's exact formatting:
 
 from __future__ import annotations
 
+import re
 from html import escape
+from typing import Optional
 
 from backend.models.resume_content import (
     ResumeContent,
@@ -19,6 +21,7 @@ from backend.models.resume_content import (
 )
 from backend.models.resume_ir import ResumeIR
 from backend.models.resume_layout import ResumeLayout, StyleDef
+from backend.models.tailoring import BulletChange, TailoringResult
 
 
 def _px(pt: float) -> str:
@@ -29,14 +32,72 @@ def _in_css(inches: float) -> str:
     return f"{inches}in"
 
 
+def _word_diff_html(original: str, tailored: str) -> str:
+    """Produce inline HTML showing word-level changes on the resume itself.
+
+    Removed words: red background + strikethrough
+    Added words: green background
+    Unchanged words: normal
+    """
+    orig_words = original.split()
+    tail_words = tailored.split()
+
+    # LCS to find common subsequence
+    m, n = len(orig_words), len(tail_words)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if orig_words[i - 1].lower() == tail_words[j - 1].lower():
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+
+    # Backtrack to find diff
+    parts: list[str] = []
+    i, j = m, n
+    ops: list[tuple[str, str]] = []
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and orig_words[i - 1].lower() == tail_words[j - 1].lower():
+            ops.append(("keep", tail_words[j - 1]))
+            i -= 1
+            j -= 1
+        elif j > 0 and (i == 0 or dp[i][j - 1] >= dp[i - 1][j]):
+            ops.append(("add", tail_words[j - 1]))
+            j -= 1
+        else:
+            ops.append(("del", orig_words[i - 1]))
+            i -= 1
+
+    ops.reverse()
+
+    for op, word in ops:
+        ew = escape(word)
+        if op == "keep":
+            parts.append(ew)
+        elif op == "add":
+            parts.append(f'<span class="diff-add">{ew}</span>')
+        elif op == "del":
+            parts.append(f'<span class="diff-del">{ew}</span>')
+
+    return " ".join(parts)
+
+
 class HtmlRenderer:
     """Render a ResumeIR to HTML/CSS."""
 
-    def __init__(self, ir: ResumeIR):
+    def __init__(self, ir: ResumeIR, diff_changes: Optional[TailoringResult] = None):
         self._ir = ir
         self._content = ir.content
         self._layout = ir.layout
         self._styles = ir.layout.styles
+        # Build a bullet_id -> BulletChange map for diff highlighting
+        # Only UNRESOLVED rewrites get diff highlighting.
+        # Resolved ones (accepted or rejected) show clean text.
+        self._diffs: dict[str, BulletChange] = {}
+        if diff_changes:
+            for c in diff_changes.bullet_changes:
+                if c.action == "rewrite" and not c.resolved:
+                    self._diffs[c.bullet_id] = c
 
     def _font(self) -> str:
         """Get primary font family."""
@@ -117,6 +178,20 @@ body {{
   line-height: 1.15;
 }}
 .label {{ font-weight: bold; }}
+a.hl {{ color: #1a0dab; text-decoration: underline; }}
+.diff-add {{
+  background: #d1fae5;
+  border-radius: 2px;
+  padding: 0 2px;
+}}
+.diff-del {{
+  background: #fee2e2;
+  text-decoration: line-through;
+  border-radius: 2px;
+  padding: 0 2px;
+  color: #991b1b;
+  opacity: 0.7;
+}}
 """
 
         body = self._build_body()
@@ -210,7 +285,7 @@ body {{
         parts.append(self._lr(e.role, e.location or "", "italic", ""))
 
         for b in e.bullets:
-            parts.append(f'<div class="bullet">\u2022 {escape(b.text)}</div>')
+            parts.append(self._render_bullet(b))
         return "\n".join(parts)
 
     def _render_education(self, e) -> str:
@@ -233,7 +308,7 @@ body {{
             )
 
         for b in e.bullets:
-            parts.append(f'<div class="bullet">\u2022 {escape(b.text)}</div>')
+            parts.append(self._render_bullet(b))
         return "\n".join(parts)
 
     def _render_project(self, e) -> str:
@@ -241,12 +316,29 @@ body {{
         date = ""
         if e.start_date and e.end_date:
             date = f"{e.start_date} \u2013 {e.end_date}"
+
+        # Build name with optional hyperlink
+        name_html = escape(e.name)
+        if hasattr(e, 'url') and e.url:
+            # The name might contain "| GitHub" — make "GitHub" the link
+            if "|" in e.name:
+                name_part, link_text = e.name.rsplit("|", 1)
+                link_text = link_text.strip()
+                name_html = f'{escape(name_part.strip())} | <a class="hl" href="{escape(e.url)}" target="_blank">{escape(link_text)}</a>'
+            else:
+                name_html = f'<a class="hl" href="{escape(e.url)}" target="_blank">{escape(e.name)}</a>'
+
         if date:
-            parts.append(self._lr(e.name, date, "bold", "bold"))
+            parts.append(
+                f'<div class="lr">'
+                f'<span class="l bold">{name_html}</span>'
+                f'<span class="r bold">{escape(date)}</span>'
+                f'</div>'
+            )
         else:
-            parts.append(f'<div class="bold">{escape(e.name)}</div>')
+            parts.append(f'<div class="bold">{name_html}</div>')
         for b in e.bullets:
-            parts.append(f'<div class="bullet">\u2022 {escape(b.text)}</div>')
+            parts.append(self._render_bullet(b))
         return "\n".join(parts)
 
     def _render_skill(self, cat) -> str:
@@ -260,5 +352,13 @@ body {{
             else:
                 parts.append(f'<div class="bold">{escape(e.title)}</div>')
         for b in e.bullets:
-            parts.append(f'<div class="bullet">\u2022 {escape(b.text)}</div>')
+            parts.append(self._render_bullet(b))
         return "\n".join(parts)
+
+    def _render_bullet(self, b) -> str:
+        """Render a bullet, with inline diff highlighting if a change exists."""
+        change = self._diffs.get(b.id)
+        if change and change.original_text != change.tailored_text:
+            diff_html = _word_diff_html(change.original_text, change.tailored_text)
+            return f'<div class="bullet">\u2022 {diff_html}</div>'
+        return f'<div class="bullet">\u2022 {escape(b.text)}</div>'

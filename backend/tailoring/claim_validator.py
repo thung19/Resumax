@@ -23,7 +23,19 @@ class ValidationResult:
     severity: str = "ok"  # ok | warning | reject
 
 
-# Common technology terms to check for fabrication
+# Words that can be freely added to any software bullet — never flag these
+ALWAYS_ALLOWED = {
+    "software", "application", "applications", "system", "systems",
+    "developed", "development", "implemented", "implementation",
+    "designed", "engineered", "built", "deployed", "tested", "testing",
+    "debugged", "debugging", "automated", "optimized", "maintained",
+    "scalable", "production", "end-to-end", "cross-functional",
+    "technical", "agile", "scrum", "utilized", "leveraged",
+    "full-stack", "fullstack", "backend", "frontend",
+    "collaborated", "collaboration", "stakeholder",
+}
+
+# Specific technologies that need evidence — flag if added without source support
 TECH_TERMS = {
     "python", "java", "javascript", "typescript", "c++", "c#", "go", "rust",
     "ruby", "php", "swift", "kotlin", "scala", "r", "matlab",
@@ -87,9 +99,17 @@ class ClaimValidator:
     def _check_new_technologies(
         self, rewritten: str, source: str, result: ValidationResult
     ):
-        """Check if rewritten text introduces technologies not in source."""
+        """Check if rewritten text introduces specific technologies not in source.
+
+        Generic software terms (developed, tested, software, agile, etc.)
+        are always allowed. Only specific named technologies (Docker,
+        Kubernetes, React, etc.) are flagged when added without evidence.
+        """
         for tech in TECH_TERMS:
-            # Use word boundary matching
+            # Skip terms that are always allowed
+            if tech.lower() in ALWAYS_ALLOWED:
+                continue
+
             if len(tech) <= 2:
                 pattern = rf"\b{re.escape(tech)}\b"
             else:

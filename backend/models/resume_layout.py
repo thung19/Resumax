@@ -1,7 +1,8 @@
 """Resume IR - Layout Schema.
 
 Represents HOW the resume looks, independent of content.
-Describes page geometry, reusable styles, and per-element style bindings.
+Stores exact per-element formatting captured from the source document
+so the renderer can reproduce it faithfully.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from pydantic import BaseModel, Field
 
 
 # --- Enums ---
-
 
 class PageSize(str, Enum):
     LETTER = "letter"
@@ -51,33 +51,28 @@ class BorderStyle(str, Enum):
 
 
 class LayoutMode(str, Enum):
-    """How a row lays out its content."""
     NORMAL = "normal"
-    LEFT_RIGHT = "left_right"  # e.g. company on left, location on right
+    LEFT_RIGHT = "left_right"
     COLUMNS = "columns"
 
 
-# --- Sub-models ---
-
+# --- Low-level formatting models ---
 
 class BorderDef(BaseModel):
-    """A border on one or more sides of a paragraph."""
     enabled: bool = False
     style: BorderStyle = BorderStyle.SINGLE
     width_pt: float = 0.75
-    color: Optional[str] = None  # hex color
-    space_pt: float = 0  # space between text and border
+    color: Optional[str] = None
+    space_pt: float = 0
 
 
 class TabStop(BaseModel):
-    """A tab stop definition."""
-    position_in: float  # inches from left margin
+    position_twips: int = 0
     alignment: TabAlignment = TabAlignment.LEFT
     leader: TabLeader = TabLeader.NONE
 
 
 class FontSpec(BaseModel):
-    """Font specification with fallback."""
     family: str = "Arial"
     fallback: Optional[str] = None
     size_pt: float = 10.0
@@ -86,29 +81,26 @@ class FontSpec(BaseModel):
     underline: bool = False
     strikethrough: bool = False
     small_caps: bool = False
-    color: Optional[str] = None  # hex
+    color: Optional[str] = None
     letter_spacing_pt: Optional[float] = None
 
 
 class SpacingSpec(BaseModel):
-    """Paragraph spacing."""
-    line_spacing: Optional[float] = None  # multiplier (1.0 = single)
-    line_spacing_pt: Optional[float] = None  # exact pt value (overrides multiplier)
+    line_spacing: Optional[float] = None
+    line_spacing_pt: Optional[float] = None
     space_before_pt: float = 0
     space_after_pt: float = 0
 
 
 class IndentSpec(BaseModel):
-    """Paragraph indentation."""
     left_in: float = 0
     right_in: float = 0
-    first_line_in: float = 0  # positive = first-line indent
-    hanging_in: float = 0  # positive = hanging indent
+    first_line_in: float = 0
+    hanging_in: float = 0
 
 
 class BulletSpec(BaseModel):
-    """Bullet / list formatting."""
-    symbol: str = "\u2022"  # bullet character
+    symbol: str = "\u2022"
     font_family: Optional[str] = None
     font_size_pt: Optional[float] = None
     indent_in: float = 0.18
@@ -117,51 +109,104 @@ class BulletSpec(BaseModel):
 
 
 class HorizontalRule(BaseModel):
-    """A horizontal line (paragraph bottom border, shape, etc.)."""
     width_pt: float = 0.75
     color: Optional[str] = None
     style: BorderStyle = BorderStyle.SINGLE
-    # How the rule is implemented in the source doc
-    source_type: str = "paragraph_border"  # paragraph_border | shape | table_border
+    source_type: str = "paragraph_border"
 
 
-# --- Style definition ---
+# --- Per-run formatting (exact capture) ---
+
+class RunFormat(BaseModel):
+    """Exact formatting for a single run in a paragraph."""
+    text: str = ""
+    is_tab: bool = False
+    font_family: Optional[str] = None
+    font_size_half_pt: Optional[int] = None  # Word's native half-point unit
+    bold: Optional[bool] = None
+    bold_cs: Optional[bool] = None  # complex script bold
+    italic: Optional[bool] = None
+    italic_cs: Optional[bool] = None
+    underline: Optional[str] = None
+    color: Optional[str] = None
+    small_caps: bool = False
+    # Hyperlink
+    hyperlink_url: Optional[str] = None
 
 
-class StyleDef(BaseModel):
-    """A reusable style definition in the layout schema."""
-    font: FontSpec = Field(default_factory=FontSpec)
-    spacing: SpacingSpec = Field(default_factory=SpacingSpec)
-    indent: IndentSpec = Field(default_factory=IndentSpec)
-    alignment: Alignment = Alignment.LEFT
-    layout_mode: LayoutMode = LayoutMode.NORMAL
+# --- Per-paragraph formatting (exact capture) ---
 
-    # Borders
-    top_border: Optional[BorderDef] = None
-    bottom_border: Optional[BorderDef] = None
-    left_border: Optional[BorderDef] = None
-    right_border: Optional[BorderDef] = None
+class ParagraphFormat(BaseModel):
+    """Exact formatting for a single paragraph as captured from the source."""
+    # Spacing
+    line_value: Optional[int] = None  # twips (240 = single)
+    line_rule: Optional[str] = None  # "auto", "exact", "atLeast"
+    space_before_twips: Optional[int] = None
+    space_after_twips: Optional[int] = None
 
-    # Bullet formatting (only for bullet styles)
-    bullet: Optional[BulletSpec] = None
+    # Indentation (twips)
+    indent_left_twips: Optional[int] = None
+    indent_right_twips: Optional[int] = None
+    indent_hanging_twips: Optional[int] = None
+    indent_first_line_twips: Optional[int] = None
+
+    # Alignment
+    alignment: Optional[str] = None  # "left", "center", "right", "both"
 
     # Tab stops
     tab_stops: list[TabStop] = Field(default_factory=list)
 
-    # Paragraph control
-    keep_with_next: bool = False
-    keep_lines_together: bool = False
-    page_break_before: bool = False
+    # Borders
+    bottom_border: Optional[BorderDef] = None
+    top_border: Optional[BorderDef] = None
 
-    # Word style name from source doc (for round-trip fidelity)
-    source_word_style: Optional[str] = None
+    # Drawing/shape
+    has_drawing: bool = False
+    drawing_type: Optional[str] = None  # "line", "image", etc.
+    drawing_width_emu: Optional[int] = None
+    drawing_height_emu: Optional[int] = None
+
+    # Style reference
+    word_style: Optional[str] = None
+
+    # Keep with next / keep lines
+    keep_with_next: bool = False
+    keep_lines: bool = False
+
+    # Runs (exact content + formatting)
+    runs: list[RunFormat] = Field(default_factory=list)
+
+
+# --- Layout element types ---
+
+class ElementType(str, Enum):
+    NAME = "name"
+    CONTACT = "contact"
+    SPACER = "spacer"
+    SECTION_HEADING = "section_heading"
+    ENTRY_HEADER = "entry_header"       # company+date or project name
+    ENTRY_SUBHEADER = "entry_subheader"  # role+location
+    BULLET = "bullet"
+    SKILLS_ROW = "skills_row"
+    RAW = "raw"
+
+
+class LayoutElement(BaseModel):
+    """A single element in the document layout sequence.
+
+    Links a content element to its exact paragraph formatting.
+    The renderer walks this sequence to reproduce the document.
+    """
+    element_type: ElementType
+    content_id: Optional[str] = None  # links to content schema element
+    paragraph_format: ParagraphFormat = Field(default_factory=ParagraphFormat)
+    # For spacers: the font size that controls the gap height
+    spacer_size_half_pt: Optional[int] = None
 
 
 # --- Page setup ---
 
-
 class PageSetup(BaseModel):
-    """Page geometry."""
     size: PageSize = PageSize.LETTER
     width_in: float = 8.5
     height_in: float = 11.0
@@ -174,33 +219,46 @@ class PageSetup(BaseModel):
 
 
 class HeaderFooter(BaseModel):
-    """Header / footer content reference."""
     enabled: bool = False
     content: Optional[str] = None
-    style_ref: Optional[str] = None
 
 
-# --- Element-to-style binding ---
+# --- Style definition (kept for pattern detection) ---
+
+class StyleDef(BaseModel):
+    font: FontSpec = Field(default_factory=FontSpec)
+    spacing: SpacingSpec = Field(default_factory=SpacingSpec)
+    indent: IndentSpec = Field(default_factory=IndentSpec)
+    alignment: Alignment = Alignment.LEFT
+    layout_mode: LayoutMode = LayoutMode.NORMAL
+    top_border: Optional[BorderDef] = None
+    bottom_border: Optional[BorderDef] = None
+    left_border: Optional[BorderDef] = None
+    right_border: Optional[BorderDef] = None
+    bullet: Optional[BulletSpec] = None
+    tab_stops: list[TabStop] = Field(default_factory=list)
+    keep_with_next: bool = False
+    keep_lines_together: bool = False
+    page_break_before: bool = False
+    source_word_style: Optional[str] = None
 
 
 class ElementStyleBinding(BaseModel):
-    """Maps a content element (by ID or semantic role) to a style."""
     element_id: Optional[str] = None
-    semantic_role: Optional[str] = None  # e.g. "section_heading", "bullet"
-    style_ref: str  # key into ResumeLayout.styles
+    semantic_role: Optional[str] = None
+    style_ref: str
 
 
 # --- Top-level layout ---
-
 
 class ResumeLayout(BaseModel):
     """The complete layout schema for a resume."""
     page: PageSetup = Field(default_factory=PageSetup)
 
-    # Named styles: key is the style name (e.g. "section_heading", "bullet")
+    # Named styles (from pattern detection)
     styles: dict[str, StyleDef] = Field(default_factory=dict)
 
-    # Bindings from content elements to styles
+    # Element-to-style bindings
     bindings: list[ElementStyleBinding] = Field(default_factory=list)
 
     # Header/footer
@@ -210,8 +268,17 @@ class ResumeLayout(BaseModel):
     # Global defaults
     default_font: FontSpec = Field(default_factory=FontSpec)
 
-    # Section ordering (list of section IDs in display order)
+    # Section ordering
     section_order: list[str] = Field(default_factory=list)
 
-    # Detected horizontal rules and their positions (section_id they follow)
+    # Horizontal rules
     horizontal_rules: dict[str, HorizontalRule] = Field(default_factory=dict)
+
+    # === NEW: Exact document element sequence ===
+    # This is the ordered list of every paragraph in the document
+    # with its exact formatting. The renderer walks this to reproduce
+    # the document faithfully.
+    elements: list[LayoutElement] = Field(default_factory=list)
+
+    # Hyperlink targets: relationship_id -> URL
+    hyperlinks: dict[str, str] = Field(default_factory=dict)

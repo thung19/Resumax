@@ -91,6 +91,7 @@ class BulletChange(BaseModel):
     target_keywords: list[str] = Field(default_factory=list)
     reason: str = ""
     accepted: bool = True  # user can reject
+    resolved: bool = False  # has the user explicitly accepted/rejected this?
 
 
 class KeywordCoverage(BaseModel):
@@ -117,3 +118,11 @@ class TailoringResult(BaseModel):
 
     # Skills reordering
     reordered_skills: dict[str, list[str]] = Field(default_factory=dict)
+
+    # Skills additions: category -> [new skills to add]
+    added_skills: dict[str, list[str]] = Field(default_factory=dict)
+
+    # Planning pass metadata
+    planning_used: bool = False
+    planning_error: Optional[str] = None
+    planning_duration_ms: int = 0

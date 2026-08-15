@@ -41,12 +41,16 @@ from backend.models.resume_layout import (
     BorderDef,
     BorderStyle,
     BulletSpec,
+    ElementType,
     FontSpec,
     HorizontalRule,
     IndentSpec,
+    LayoutElement,
     LayoutMode,
     PageSetup,
+    ParagraphFormat,
     ResumeLayout,
+    RunFormat,
     SpacingSpec,
     StyleDef,
     TabAlignment,
@@ -649,6 +653,9 @@ class DocxImporter:
         styles_map = _parse_styles_xml(self._bytes)
         page_setup = _extract_page_setup(self._bytes)
 
+        # Extract hyperlink targets from relationships
+        hyperlinks = self._extract_hyperlinks()
+
         # Parse paragraphs from document.xml
         with zipfile.ZipFile(BytesIO(self._bytes), "r") as z:
             doc_xml = z.read("word/document.xml")
@@ -659,17 +666,29 @@ class DocxImporter:
             self._diag("error", "No w:body found in document.xml")
             return ResumeIR(source_filename=self._filename)
 
+        # Store raw paragraph elements for forensic capture
+        raw_p_elements = body.findall(qn("w:p"))
+
         # Extract all paragraphs with formatting
         paragraphs: list[ParagraphFormatting] = []
-        for p in body.findall(qn("w:p")):
+        for p in raw_p_elements:
             fmt = _extract_paragraph_formatting(p, numbering_map)
             paragraphs.append(fmt)
 
         # Build layout from detected formatting
         layout = self._build_layout(paragraphs, page_setup, numbering_map, styles_map)
 
+        # Forensic capture: exact element sequence with per-paragraph formatting
+        layout.elements = self._capture_element_sequence(
+            raw_p_elements, paragraphs, hyperlinks
+        )
+        layout.hyperlinks = hyperlinks
+
+        # Store elements for content building (hyperlink extraction)
+        self._layout_elements = layout.elements
+
         # Build content from paragraph text + structure
-        content = self._build_content(paragraphs)
+        content = self._build_content(paragraphs, hyperlinks)
 
         return ResumeIR(
             content=content,
@@ -679,6 +698,297 @@ class DocxImporter:
             source_filename=self._filename,
             diagnostics=self._diagnostics,
         )
+
+    def _extract_hyperlinks(self) -> dict[str, str]:
+        """Extract hyperlink relationship ID -> URL mapping."""
+        links: dict[str, str] = {}
+        try:
+            with zipfile.ZipFile(BytesIO(self._bytes), "r") as z:
+                if "word/_rels/document.xml.rels" not in z.namelist():
+                    return links
+                rels_xml = z.read("word/_rels/document.xml.rels")
+            root = etree.fromstring(rels_xml)
+            for rel in root:
+                rtype = rel.get("Type", "")
+                if "hyperlink" in rtype.lower():
+                    links[rel.get("Id", "")] = rel.get("Target", "")
+        except Exception:
+            pass
+        return links
+
+    def _capture_element_sequence(
+        self,
+        raw_elements: list,
+        paragraphs: list[ParagraphFormatting],
+        hyperlinks: dict[str, str],
+    ) -> list[LayoutElement]:
+        """Forensic capture: walk every paragraph element and record
+        its exact formatting into a LayoutElement sequence."""
+        elements: list[LayoutElement] = []
+
+        for i, (p_elem, fmt) in enumerate(zip(raw_elements, paragraphs)):
+            pf = self._capture_paragraph_format(p_elem, hyperlinks)
+            role = self._classify_paragraph_role(fmt)
+
+            if fmt.is_empty:
+                # Spacer paragraph — capture its font size
+                spacer_sz = None
+                if pf.runs:
+                    for run in pf.runs:
+                        if run.font_size_half_pt is not None:
+                            spacer_sz = run.font_size_half_pt
+                            break
+                elements.append(LayoutElement(
+                    element_type=ElementType.SPACER,
+                    paragraph_format=pf,
+                    spacer_size_half_pt=spacer_sz,
+                ))
+            elif role == "name":
+                elements.append(LayoutElement(
+                    element_type=ElementType.NAME,
+                    paragraph_format=pf,
+                ))
+            elif role == "contact":
+                elements.append(LayoutElement(
+                    element_type=ElementType.CONTACT,
+                    paragraph_format=pf,
+                ))
+            elif role in ("section_heading", "section_heading_with_rule"):
+                elements.append(LayoutElement(
+                    element_type=ElementType.SECTION_HEADING,
+                    paragraph_format=pf,
+                ))
+            elif role == "entry_header":
+                elements.append(LayoutElement(
+                    element_type=ElementType.ENTRY_HEADER,
+                    paragraph_format=pf,
+                ))
+            elif role == "entry_subheader":
+                elements.append(LayoutElement(
+                    element_type=ElementType.ENTRY_SUBHEADER,
+                    paragraph_format=pf,
+                ))
+            elif role == "bullet":
+                elements.append(LayoutElement(
+                    element_type=ElementType.BULLET,
+                    paragraph_format=pf,
+                ))
+            elif role == "skills_row":
+                elements.append(LayoutElement(
+                    element_type=ElementType.SKILLS_ROW,
+                    paragraph_format=pf,
+                ))
+            else:
+                elements.append(LayoutElement(
+                    element_type=ElementType.RAW,
+                    paragraph_format=pf,
+                ))
+
+        return elements
+
+    def _capture_paragraph_format(
+        self, p_elem: etree._Element, hyperlinks: dict[str, str]
+    ) -> ParagraphFormat:
+        """Capture every formatting property of a paragraph element."""
+        pf = ParagraphFormat()
+        pPr = p_elem.find(qn("w:pPr"))
+
+        if pPr is not None:
+            # Spacing
+            spacing = pPr.find(qn("w:spacing"))
+            if spacing is not None:
+                v = spacing.get(qn("w:line"))
+                if v is not None:
+                    pf.line_value = int(v)
+                pf.line_rule = spacing.get(qn("w:lineRule"))
+                v = spacing.get(qn("w:before"))
+                if v is not None:
+                    pf.space_before_twips = int(v)
+                v = spacing.get(qn("w:after"))
+                if v is not None:
+                    pf.space_after_twips = int(v)
+
+            # Indentation
+            ind = pPr.find(qn("w:ind"))
+            if ind is not None:
+                for attr, field in [
+                    ("left", "indent_left_twips"),
+                    ("right", "indent_right_twips"),
+                    ("hanging", "indent_hanging_twips"),
+                    ("firstLine", "indent_first_line_twips"),
+                ]:
+                    v = ind.get(qn(f"w:{attr}"))
+                    if v is not None:
+                        setattr(pf, field, int(v))
+
+            # Alignment
+            jc = pPr.find(qn("w:jc"))
+            if jc is not None:
+                pf.alignment = jc.get(qn("w:val"))
+
+            # Tab stops
+            tabs = pPr.find(qn("w:tabs"))
+            if tabs is not None:
+                for tab in tabs.findall(qn("w:tab")):
+                    pos = tab.get(qn("w:pos"))
+                    val = tab.get(qn("w:val"))
+                    if pos:
+                        ta = TabAlignment.LEFT
+                        if val == "right":
+                            ta = TabAlignment.RIGHT
+                        elif val == "center":
+                            ta = TabAlignment.CENTER
+                        pf.tab_stops.append(TabStop(
+                            position_twips=int(pos),
+                            alignment=ta,
+                        ))
+
+            # Borders
+            pBdr = pPr.find(qn("w:pBdr"))
+            if pBdr is not None:
+                bottom = pBdr.find(qn("w:bottom"))
+                if bottom is not None:
+                    bval = bottom.get(qn("w:val"))
+                    if bval and bval != "none":
+                        sz = bottom.get(qn("w:sz"))
+                        pf.bottom_border = BorderDef(
+                            enabled=True,
+                            width_pt=int(sz) / 8.0 if sz else 0.75,
+                            color=bottom.get(qn("w:color")),
+                        )
+
+            # Style
+            pStyle = pPr.find(qn("w:pStyle"))
+            if pStyle is not None:
+                pf.word_style = pStyle.get(qn("w:val"))
+
+            # Keep with next
+            if pPr.find(qn("w:keepNext")) is not None:
+                pf.keep_with_next = True
+            if pPr.find(qn("w:keepLines")) is not None:
+                pf.keep_lines = True
+
+        # Drawing shapes
+        for drawing in p_elem.findall(f".//{qn('w:drawing')}"):
+            pf.has_drawing = True
+            # Check type
+            WPS_NS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+            A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+            for wsp in drawing.findall(f".//{{{WPS_NS}}}wsp"):
+                spPr = wsp.find(f"{{{WPS_NS}}}spPr")
+                if spPr is None:
+                    spPr = wsp.find(f"{{{A_NS}}}spPr")
+                if spPr is not None:
+                    prstGeom = spPr.find(f"{{{A_NS}}}prstGeom")
+                    if prstGeom is not None:
+                        pf.drawing_type = prstGeom.get("prst")
+            # Get dimensions
+            WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            extent = drawing.find(f".//{{{WP_NS}}}extent")
+            if extent is not None:
+                cx = extent.get("cx")
+                cy = extent.get("cy")
+                if cx:
+                    pf.drawing_width_emu = int(cx)
+                if cy:
+                    pf.drawing_height_emu = int(cy)
+
+        # Also check VML fallback
+        MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+        VML_NS = "urn:schemas-microsoft-com:vml"
+        for ac in p_elem.findall(f".//{{{MC_NS}}}AlternateContent"):
+            for fb in ac.findall(f".//{{{MC_NS}}}Fallback"):
+                if fb.findall(f".//{{{VML_NS}}}line"):
+                    pf.has_drawing = True
+                    pf.drawing_type = "line"
+
+        # Runs
+        for child in p_elem:
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+            if tag == "r":
+                rf = self._capture_run_format(child)
+                pf.runs.append(rf)
+
+            elif tag == "hyperlink":
+                # Hyperlink: extract runs inside it
+                rid = child.get(qn("r:id"))
+                url = hyperlinks.get(rid, "") if rid else ""
+                for r in child.findall(qn("w:r")):
+                    rf = self._capture_run_format(r)
+                    rf.hyperlink_url = url
+                    pf.runs.append(rf)
+
+        return pf
+
+    def _capture_run_format(self, r_elem: etree._Element) -> RunFormat:
+        """Capture exact formatting of a single run."""
+        rf = RunFormat()
+
+        # Text
+        texts = []
+        for t in r_elem.findall(qn("w:t")):
+            texts.append(t.text or "")
+        rf.text = "".join(texts)
+
+        # Tab
+        if r_elem.findall(qn("w:tab")):
+            rf.is_tab = True
+
+        # Run properties
+        rPr = r_elem.find(qn("w:rPr"))
+        if rPr is not None:
+            # Font
+            rFonts = rPr.find(qn("w:rFonts"))
+            if rFonts is not None:
+                rf.font_family = (
+                    rFonts.get(qn("w:ascii"))
+                    or rFonts.get(qn("w:hAnsi"))
+                    or rFonts.get(qn("w:cs"))
+                )
+
+            # Size
+            sz = rPr.find(qn("w:sz"))
+            if sz is not None:
+                v = sz.get(qn("w:val"))
+                if v:
+                    rf.font_size_half_pt = int(v)
+
+            # Bold
+            b = rPr.find(qn("w:b"))
+            if b is not None:
+                bval = b.get(qn("w:val"))
+                rf.bold = bval != "0" and bval != "false"
+
+            bCs = rPr.find(qn("w:bCs"))
+            if bCs is not None:
+                rf.bold_cs = True
+
+            # Italic
+            i_el = rPr.find(qn("w:i"))
+            if i_el is not None:
+                ival = i_el.get(qn("w:val"))
+                rf.italic = ival != "0" and ival != "false"
+
+            iCs = rPr.find(qn("w:iCs"))
+            if iCs is not None:
+                rf.italic_cs = True
+
+            # Underline
+            u = rPr.find(qn("w:u"))
+            if u is not None:
+                rf.underline = u.get(qn("w:val"))
+
+            # Color
+            color = rPr.find(qn("w:color"))
+            if color is not None:
+                rf.color = color.get(qn("w:val"))
+
+            # Small caps
+            if rPr.find(qn("w:smallCaps")) is not None:
+                rf.small_caps = True
+
+        return rf
 
     def _build_layout(
         self,
@@ -951,6 +1261,15 @@ class DocxImporter:
                 has_non_bold = True
         return has_bold and has_non_bold
 
+    def _extract_hyperlink_from_paragraph(self, p_index: int) -> Optional[str]:
+        """Extract the first hyperlink URL from a paragraph's layout elements."""
+        if p_index < len(self._layout_elements):
+            el = self._layout_elements[p_index]
+            for run in el.paragraph_format.runs:
+                if run.hyperlink_url:
+                    return run.hyperlink_url
+        return None
+
     def _is_section_heading(self, p: ParagraphFormatting) -> bool:
         """Check if a paragraph is a section heading."""
         role = self._classify_paragraph_role(p)
@@ -985,7 +1304,7 @@ class DocxImporter:
         return bullets, i, bullet_counter
 
     def _build_content(
-        self, paragraphs: list[ParagraphFormatting]
+        self, paragraphs: list[ParagraphFormatting], hyperlinks: Optional[dict[str, str]] = None
     ) -> ResumeContent:
         """Build the Content Schema from paragraph text."""
         content = ResumeContent()
@@ -1192,9 +1511,24 @@ class DocxImporter:
                     continue
 
                 elif current_section_type == SectionType.PROJECTS:
+                    # Extract hyperlink URL and text from this paragraph
+                    proj_url = self._extract_hyperlink_from_paragraph(i)
+                    proj_name = header_text
+
+                    # If there's a hyperlink, include the link text in the name
+                    if proj_url and i < len(self._layout_elements):
+                        el = self._layout_elements[i]
+                        for run in el.paragraph_format.runs:
+                            if run.hyperlink_url and run.text.strip():
+                                link_text = run.text.strip()
+                                # Append link text if not already in the name
+                                if link_text.lower() not in proj_name.lower():
+                                    proj_name = proj_name.rstrip(" |") + " | " + link_text
+
                     entry = ProjectEntry(
                         id=f"proj_{entry_counter}",
-                        name=header_text,
+                        name=proj_name,
+                        url=proj_url,
                     )
 
                     bullets, i, bullet_counter = self._collect_bullets(paragraphs, i + 1, bullet_counter)

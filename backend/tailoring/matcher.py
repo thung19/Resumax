@@ -29,6 +29,7 @@ from backend.models.tailoring import ResumeBank
 
 
 # --- Normalization aliases ---
+# Direct name aliases: JD keyword -> [strings that ARE the same thing]
 
 ALIASES: dict[str, list[str]] = {
     "javascript": ["js", "javascript"],
@@ -53,6 +54,75 @@ ALIASES: dict[str, list[str]] = {
     "git": ["git"],
     "docker": ["docker"],
     "kubernetes": ["kubernetes", "k8s"],
+    "full-stack": ["full-stack", "full stack", "fullstack"],
+    "software": ["software"],
+}
+
+# Implication mappings: JD keyword -> [resume phrases that PROVE that skill]
+# If any of these appear in the resume, the candidate demonstrably has the skill
+# even if the exact JD keyword isn't written.
+
+IMPLIES: dict[str, list[str]] = {
+    "machine learning": [
+        "sentencetransformers", "sentence-transformers", "scikit-learn",
+        "sklearn", "tensorflow", "pytorch", "neural network", "classification",
+        "regression", "training model", "trained model", "model training",
+        "embeddings", "embedding", "rag", "vector search", "cosine similarity",
+        "nlp", "natural language",
+    ],
+    "llms": [
+        "rag", "langchain", "gemini api", "openai", "claude", "gpt",
+        "llm", "large language model", "sentencetransformers",
+        "sentence-transformers", "prompt",
+    ],
+    "embeddings": [
+        "sentencetransformers", "sentence-transformers", "embedding",
+        "vector search", "vector-search", "cosine similarity",
+        "semantic search",
+    ],
+    "ai": [
+        "machine learning", "ml", "rag", "llm", "neural", "embedding",
+        "sentencetransformers", "gemini api", "gpt", "nlp",
+    ],
+    "full-stack development": [
+        "full-stack", "full stack", "react", "frontend", "backend",
+        "next.js", "fastapi", "node.js",
+    ],
+    "software": [
+        "software", "engineer", "developer", "development", "application",
+        "system", "codebase", "debugging", "testing",
+    ],
+    "debugging": [
+        "debug", "debugged", "troubleshoot", "fix", "issue", "bug",
+    ],
+    "testing": [
+        "test", "tested", "testing", "unit test", "integration test",
+        "pytest", "jest", "cypress",
+    ],
+    "collaboration": [
+        "collaborated", "partnering", "cross-functional", "team",
+        "researchers", "stakeholder",
+    ],
+    "communication": [
+        "presentation", "stakeholder", "translating requirements",
+        "cross-functional", "collaborated",
+    ],
+    "problem-solving": [
+        "optimiz", "debug", "troubleshoot", "architected", "designed",
+        "engineered", "algorithms",
+    ],
+    "database design": [
+        "postgresql", "mongodb", "data model", "nosql", "sql",
+        "sqlite", "dynamodb", "database",
+    ],
+    "web services": [
+        "rest api", "restful", "api", "endpoint", "fastapi",
+        "node.js", "express",
+    ],
+    "api design": [
+        "rest api", "restful api", "api", "fastapi", "endpoint",
+        "graphql",
+    ],
 }
 
 
@@ -70,7 +140,8 @@ def _expand_aliases(keyword: str) -> set[str]:
 
 
 def _text_contains_keyword(text_lower: str, keyword: str) -> bool:
-    """Check if text contains a keyword (with alias expansion)."""
+    """Check if text contains a keyword via aliases OR implication."""
+    # Direct alias match
     for alias in _expand_aliases(keyword):
         if len(alias) <= 2:
             if re.search(rf"\b{re.escape(alias)}\b", text_lower):
@@ -78,6 +149,15 @@ def _text_contains_keyword(text_lower: str, keyword: str) -> bool:
         else:
             if alias in text_lower:
                 return True
+
+    # Implication match: does the text contain evidence that proves this skill?
+    kw_lower = keyword.lower().strip()
+    for canonical, evidence_terms in IMPLIES.items():
+        if kw_lower == canonical or kw_lower in _expand_aliases(canonical):
+            for evidence in evidence_terms:
+                if evidence in text_lower:
+                    return True
+
     return False
 
 
