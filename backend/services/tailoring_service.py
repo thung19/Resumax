@@ -56,24 +56,15 @@ class TailoringService:
         if bank is None:
             bank = generate_bank_from_ir(ir)
 
-        # === STAGE 1: Compute target char count per bullet ===
+        # === STAGE 1: Compute line capacity from layout ===
         from backend.tailoring.bullet_measurer import BulletMeasurer
         measurer = None
+        line_capacity = max_bullet_chars or 120
         try:
             measurer = BulletMeasurer(ir.layout)
             line_capacity = self._find_line_capacity(measurer)
         except Exception:
-            line_capacity = max_bullet_chars
-
-        # Target = line capacity for all bullets (fill the line)
-        target_chars: dict[str, int] = {}
-        for section in ir.content.sections:
-            for entry in section.experience_entries:
-                for b in entry.bullets:
-                    target_chars[b.id] = line_capacity
-            for entry in section.project_entries:
-                for b in entry.bullets:
-                    target_chars[b.id] = line_capacity
+            pass
 
         # === STAGE 2: Unified LLM tailoring pass ===
         result = TailoringResult(resume_id="", job_title=jd.job_title)
@@ -82,9 +73,8 @@ class TailoringService:
             engine = TailoringEngine()
             engine_result = engine.tailor(
                 content=ir.content,
-                jd=jd,
-                bank=bank,
-                target_chars=target_chars,
+                jd_raw_text=jd.raw_text,
+                max_chars_per_line=line_capacity,
                 max_bullets_per_entry=max_bullets_per_entry,
             )
 
@@ -154,6 +144,10 @@ class TailoringService:
         measurer,
     ):
         """Fabrication check + overflow revert. No shortening pass."""
+        # Build full resume text so validator can check skills section too
+        full_resume_text = self._build_full_resume_text(ir.content)
+
+        reverted_reasons: list[str] = []
         for change in result.bullet_changes:
             if change.action != "rewrite":
                 continue
@@ -163,6 +157,7 @@ class TailoringService:
                 change.tailored_text = change.original_text
                 change.action = "keep"
                 change.reason = "No meaningful change"
+                reverted_reasons.append(f"{change.bullet_id}: identical")
                 continue
 
             # Rewrite only removed words without adding anything
@@ -172,6 +167,7 @@ class TailoringService:
                 change.tailored_text = change.original_text
                 change.action = "keep"
                 change.reason = "Rewrite only removed words"
+                reverted_reasons.append(f"{change.bullet_id}: only removed words")
                 continue
 
             # Validate claimed keywords are actually present
@@ -182,17 +178,22 @@ class TailoringService:
                     if kw.lower() in text_lower
                 ]
 
-            # Fabrication check
+            # Fabrication check — include full resume as context
+            # so skills listed in the Skills section count as evidence
             facts = self._get_facts_for_bullet(
                 change.bullet_id, bank, ir.content,
             )
-            validation = validator.validate(change, facts)
+            facts_with_resume = facts + [
+                {"id": "_resume", "text": full_resume_text},
+            ]
+            validation = validator.validate(change, facts_with_resume)
             if not validation.valid:
                 change.tailored_text = change.original_text
                 change.action = "keep"
                 change.reason = (
                     f"Rewrite rejected: {'; '.join(validation.issues)}"
                 )
+                reverted_reasons.append(f"{change.bullet_id}: fabrication")
                 continue
 
             # Metric preservation warning
@@ -212,6 +213,17 @@ class TailoringService:
                         f"Rewrite overflows line "
                         f"({measurement.line_count} lines) — reverted"
                     )
+                    reverted_reasons.append(
+                        f"{change.bullet_id}: overflow "
+                        f"({measurement.line_count} lines, "
+                        f"{len(change.tailored_text)} chars)"
+                    )
+
+        if reverted_reasons:
+            logger.warning(
+                f"Safety net reverted {len(reverted_reasons)} rewrites: "
+                + "; ".join(reverted_reasons)
+            )
 
     # ------------------------------------------------------------------
     # Deterministic fallback
@@ -528,6 +540,23 @@ class TailoringService:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_full_resume_text(content: ResumeContent) -> str:
+        """Build full resume text for validator context."""
+        parts: list[str] = []
+        for section in content.sections:
+            for entry in section.experience_entries:
+                parts.append(f"{entry.company} {entry.role}")
+                for b in entry.bullets:
+                    parts.append(b.text)
+            for entry in section.project_entries:
+                parts.append(entry.name)
+                for b in entry.bullets:
+                    parts.append(b.text)
+            for cat in section.skill_categories:
+                parts.append(f"{cat.category}: {' '.join(cat.skills)}")
+        return " ".join(parts)
 
     def _get_facts_for_bullet(
         self,

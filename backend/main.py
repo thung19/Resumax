@@ -785,6 +785,67 @@ async def update_layout_settings(resume_id: str, update: LayoutSettingsUpdate):
     return {"status": "ok", "updated": update.model_dump(exclude_none=True)}
 
 
+# --- Format templates ---
+
+class SaveTemplateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+@app.post("/templates/save/{resume_id}")
+async def save_format_template(resume_id: str, req: SaveTemplateRequest):
+    """Save the formatting style of an uploaded resume as a reusable template."""
+    from backend.services.template_service import extract_template, save_template
+
+    ir = _load_ir(resume_id)
+    template = extract_template(ir, name=req.name, description=req.description)
+
+    template_id = req.name.lower().replace(" ", "_").replace("-", "_")
+    save_template(template, template_id)
+
+    return {
+        "template_id": template_id,
+        "name": template.name,
+        "font": template.body_font_family,
+        "size": template.body_font_size_pt,
+        "spacing": "1.0x" if template.body_line_spacing_val == 240 else f"{template.body_line_spacing_val/240:.2f}x",
+        "spacer": f"{template.spacer_size_half_pt / 2}pt",
+        "margins": {
+            "top": template.page.margin_top_in,
+            "bottom": template.page.margin_bottom_in,
+            "left": template.page.margin_left_in,
+            "right": template.page.margin_right_in,
+        },
+        "styles": {role: s.model_dump() for role, s in template.styles.items()},
+    }
+
+
+@app.get("/templates")
+async def list_format_templates():
+    """List all available format templates."""
+    from backend.services.template_service import list_templates
+    return {"templates": list_templates()}
+
+
+@app.get("/templates/{template_id}")
+async def get_format_template(template_id: str):
+    """Get a specific format template."""
+    from backend.services.template_service import load_template
+    template = load_template(template_id)
+    if template is None:
+        raise HTTPException(404, f"Template '{template_id}' not found")
+    return template.model_dump()
+
+
+@app.delete("/templates/{template_id}")
+async def delete_format_template(template_id: str):
+    """Delete a format template."""
+    from backend.services.template_service import delete_template
+    if not delete_template(template_id):
+        raise HTTPException(404, f"Template '{template_id}' not found")
+    return {"status": "deleted"}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "phase": 5}

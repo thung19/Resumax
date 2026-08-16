@@ -1,42 +1,134 @@
 """Bullet Measurer — layout-accurate line count measurement.
 
 Uses ReportLab's Paragraph.wrap() to determine the actual rendered
-height of a bullet, using the same font mapping and indentation as
-the PDF renderer. This gives us the exact same wrapping decision
-the final PDF will make.
+height of a bullet. Attempts to register the actual font from the
+uploaded DOCX (e.g., Garamond) so measurements match what Word renders.
 
-The key insight: Paragraph.wrap(avail_width, avail_height) returns
-(actual_width, actual_height). Since we know the leading (line height),
-actual_height / leading = number of lines.
+If the exact font isn't available on the system, falls back to the
+closest built-in font.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
-from html import escape
 from typing import Optional
 
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph
 
-from backend.models.resume_layout import PageSetup, ResumeLayout, StyleDef
+from backend.models.resume_layout import ResumeLayout
 
+logger = logging.getLogger(__name__)
 
-# --- Font mapping (mirrors pdf_renderer.py) ---
+# --- Font resolution ---
 
+# Registered TTF fonts (cached across instances)
+_registered_fonts: set[str] = set()
+
+# Common system font directories
+_FONT_DIRS = [
+    "/System/Library/Fonts/Supplemental",
+    "/System/Library/Fonts",
+    "/Library/Fonts",
+    os.path.expanduser("~/Library/Fonts"),
+    # Linux
+    "/usr/share/fonts/truetype",
+    "/usr/local/share/fonts",
+    # Windows
+    r"C:\Windows\Fonts",
+]
+
+# Map font family names to search patterns for TTF files
+_FONT_FILE_PATTERNS: dict[str, list[str]] = {
+    "garamond": ["Garamond.ttf", "Garamond-Regular.ttf", "EBGaramond-Regular.ttf", "garamond.ttf"],
+    "calibri": ["Calibri.ttf", "calibri.ttf"],
+    "cambria": ["Cambria.ttf", "cambria.ttf"],
+    "georgia": ["Georgia.ttf", "georgia.ttf"],
+    "palatino": ["Palatino.ttc", "PalatinoLinotype.ttf"],
+    "arial": ["Arial.ttf", "arial.ttf"],
+    "helvetica": ["Helvetica.ttc", "HelveticaNeue.ttc"],
+    "times new roman": ["Times New Roman.ttf", "times.ttf"],
+    "times": ["Times.ttc", "Times New Roman.ttf"],
+}
+
+# Fallback: map font families to ReportLab built-in fonts
 _SERIF = {"garamond", "georgia", "times", "times new roman", "palatino", "cambria"}
 _SANS = {"arial", "helvetica", "calibri", "verdana", "tahoma", "segoe ui"}
 
 
-def _resolve_font(family: str, bold: bool, italic: bool) -> str:
-    """Map font family + style to ReportLab built-in font name.
-    Must stay in sync with PdfRenderer._resolve_font."""
+def _find_font_file(family: str) -> Optional[str]:
+    """Search system font directories for a TTF/TTC file matching the family."""
     fl = family.lower().strip()
-    if fl in _SERIF or "garamond" in fl:
+
+    # Try known patterns first
+    patterns = _FONT_FILE_PATTERNS.get(fl, [f"{family}.ttf", f"{family.title()}.ttf"])
+
+    for font_dir in _FONT_DIRS:
+        if not os.path.isdir(font_dir):
+            continue
+        for pattern in patterns:
+            path = os.path.join(font_dir, pattern)
+            if os.path.isfile(path):
+                return path
+
+    # Broader search: any file containing the family name
+    for font_dir in _FONT_DIRS:
+        if not os.path.isdir(font_dir):
+            continue
+        try:
+            for f in os.listdir(font_dir):
+                if fl in f.lower() and f.lower().endswith((".ttf", ".otf")):
+                    return os.path.join(font_dir, f)
+        except OSError:
+            continue
+
+    return None
+
+
+def _register_and_resolve(family: str, bold: bool = False, italic: bool = False) -> str:
+    """Try to register the actual TTF font with ReportLab.
+
+    Returns the ReportLab font name to use (either the registered TTF
+    or a built-in fallback).
+    """
+    fl = family.lower().strip()
+    rl_name = f"Custom-{family.replace(' ', '')}"
+
+    # Already registered?
+    if rl_name in _registered_fonts:
+        return rl_name
+
+    # Try to find and register the TTF
+    font_path = _find_font_file(family)
+    if font_path:
+        try:
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+
+            if font_path.endswith(".ttc"):
+                # TTC (TrueType Collection) — use subfont index 0
+                pdfmetrics.registerFont(TTFont(rl_name, font_path, subfontIndex=0))
+            else:
+                pdfmetrics.registerFont(TTFont(rl_name, font_path))
+
+            _registered_fonts.add(rl_name)
+            logger.info(f"Registered font '{family}' from {font_path}")
+            return rl_name
+        except Exception as e:
+            logger.warning(f"Failed to register font '{family}' from {font_path}: {e}")
+
+    # Fallback to ReportLab built-in
+    return _builtin_fallback(fl, bold, italic)
+
+
+def _builtin_fallback(family_lower: str, bold: bool, italic: bool) -> str:
+    """Map to ReportLab built-in font as last resort."""
+    if family_lower in _SERIF or "garamond" in family_lower:
         base = "Times"
-    elif fl in _SANS:
+    elif family_lower in _SANS:
         base = "Helvetica"
     else:
         base = "Helvetica"
@@ -67,58 +159,61 @@ class BulletMeasurement:
     available_width_pt: float
     leading_pt: float
     fits_one_line: bool
-    overflow_ratio: float  # >1.0 means overflows (e.g. 1.15 = 15% too wide)
+    overflow_ratio: float  # >1.0 means overflows
 
 
 # --- Measurer ---
 
 class BulletMeasurer:
-    """Measure bullet line count using the actual ReportLab layout engine.
+    """Measure bullet line count using the actual font from the resume.
 
-    Constructs a ParagraphStyle matching the PDF renderer's configuration
-    for bullet points, then uses Paragraph.wrap() to determine how many
-    lines the text would occupy.
+    Tries to find and register the exact font (e.g., Garamond) from
+    the system so measurements match Word's rendering. Falls back to
+    ReportLab built-in fonts if the exact font isn't available.
     """
 
     def __init__(
         self,
         layout: ResumeLayout,
-        safety_margin: float = 0.03,  # 3% safety margin
+        safety_margin: float = 0.03,
     ):
         self._layout = layout
         self._safety_margin = safety_margin
 
         # Compute available width for bullets (in points)
         page = layout.page
-        content_width_pt = (page.width_in - page.margin_left_in - page.margin_right_in) * 72
+        content_width_pt = (
+            page.width_in - page.margin_left_in - page.margin_right_in
+        ) * 72
 
-        # Bullet indentation — use detected style or PDF renderer defaults
+        # Bullet indentation
         bullet_style = layout.styles.get("bullet")
         if bullet_style and bullet_style.indent.left_in:
             left_indent_pt = bullet_style.indent.left_in * 72
         else:
-            left_indent_pt = 0  # Original resume uses inline bullets, no indent
+            left_indent_pt = 0
 
         self._raw_width_pt = content_width_pt - left_indent_pt
         self._safe_width_pt = self._raw_width_pt * (1.0 - safety_margin)
 
-        # Build the paragraph style
-        font_family = "Times-Roman"  # default
+        # Resolve the actual font
+        font_family = "Times-Roman"
         font_size = 10.0
-        leading = 11.5  # 1.15 line spacing at 10pt
+        leading = 11.5
 
         if bullet_style:
-            font_family = _resolve_font(
-                bullet_style.font.family, bullet_style.font.bold, bullet_style.font.italic
+            font_family = _register_and_resolve(
+                bullet_style.font.family,
+                bullet_style.font.bold,
+                bullet_style.font.italic,
             )
             font_size = bullet_style.font.size_pt
             ls = bullet_style.spacing.line_spacing or 1.15
             leading = font_size * ls
         else:
-            # Try to detect from layout default font
             df = layout.default_font
             if df.family:
-                font_family = _resolve_font(df.family, False, False)
+                font_family = _register_and_resolve(df.family, False, False)
             if df.size_pt:
                 font_size = df.size_pt
                 leading = font_size * 1.15
@@ -137,12 +232,10 @@ class BulletMeasurer:
 
     @property
     def safe_width_pt(self) -> float:
-        """Available width for bullet text, with safety margin applied."""
         return self._safe_width_pt
 
     @property
     def raw_width_pt(self) -> float:
-        """Available width without safety margin."""
         return self._raw_width_pt
 
     @property
@@ -156,30 +249,21 @@ class BulletMeasurer:
     def measure(self, text: str) -> BulletMeasurement:
         """Measure a bullet's rendered line count.
 
-        The text should be the bullet content WITHOUT the bullet character
-        (the '•' prefix). We prepend it for measurement since the renderer
-        does the same.
+        The text should be the bullet content WITHOUT the bullet
+        character. We prepend '•' for measurement.
         """
-        # Build the text as the renderer would output it
         display_text = f"\u2022 {_escape(text)}"
 
         para = Paragraph(display_text, self._style)
-        # wrap() returns (actual_width_used, actual_height)
         w, h = para.wrap(self._safe_width_pt, 10000)
 
         line_count = max(1, round(h / self._leading))
 
-        # Calculate overflow ratio: how wide is it relative to safe width?
-        # We need to check against the raw (no-safety) width for the ratio
         w_raw, h_raw = para.wrap(self._raw_width_pt, 10000)
-        raw_lines = max(1, round(h_raw / self._leading))
 
-        # If it wraps with safety margin but not without, the overflow is small
         overflow_ratio = 1.0
         if line_count > 1:
-            # Estimate: how much wider than one line?
-            # Use the raw width to see if it's close
-            overflow_ratio = h / self._leading  # e.g. 2.0 means exactly 2 lines
+            overflow_ratio = h / self._leading
 
         return BulletMeasurement(
             text=text,
@@ -193,7 +277,7 @@ class BulletMeasurer:
         )
 
     def measure_line(self, text: str) -> BulletMeasurement:
-        """Measure arbitrary text (no bullet prefix) against the content width."""
+        """Measure arbitrary text (no bullet prefix)."""
         display_text = _escape(text)
         para = Paragraph(display_text, self._style)
         w, h = para.wrap(self._safe_width_pt, 10000)
@@ -210,17 +294,9 @@ class BulletMeasurer:
         )
 
     def compute_compression_target(self, measurement: BulletMeasurement) -> float:
-        """Calculate the compression ratio needed to fit on one line.
-
-        Returns a ratio like 0.85 meaning "shorten to 85% of current length".
-        """
+        """Calculate compression ratio needed to fit on one line."""
         if measurement.fits_one_line:
             return 1.0
-
-        # Target: fit within safe_width in one line
-        # Current: occupies overflow_ratio lines
-        # Compression needed: 1.0 / overflow_ratio (with some margin)
         compression = 1.0 / measurement.overflow_ratio
-        # Add a small extra margin for safety
         compression *= 0.95
-        return min(compression, 0.95)  # never ask for less than 5% reduction
+        return min(compression, 0.95)

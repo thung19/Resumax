@@ -112,6 +112,19 @@ class HorizontalRule(BaseModel):
     width_pt: float = 0.75
     color: Optional[str] = None
     style: BorderStyle = BorderStyle.SINGLE
+
+
+class NormalStyle(BaseModel):
+    """Word Normal style properties extracted from the source document.
+
+    Controls what empty paragraphs and unstyled text inherit.
+    """
+    font_family: str = "Arial"
+    font_size_pt: float = 11.0
+    line_spacing_val: int = 276  # w:line value (240 = 1.0x, 276 = 1.15x)
+    line_rule: str = "auto"
+    space_before_twips: int = 0
+    space_after_twips: int = 0
     source_type: str = "paragraph_border"
 
 
@@ -172,6 +185,12 @@ class ParagraphFormat(BaseModel):
     # Keep with next / keep lines
     keep_with_next: bool = False
     keep_lines: bool = False
+
+    # Paragraph-level default run properties (pPr/rPr)
+    # These control what unstyled/empty parts of the paragraph inherit.
+    # Different from individual run formatting.
+    ppr_font_size_half_pt: Optional[int] = None
+    ppr_font_family: Optional[str] = None
 
     # Runs (exact content + formatting)
     runs: list[RunFormat] = Field(default_factory=list)
@@ -267,6 +286,18 @@ class ResumeLayout(BaseModel):
 
     # Global defaults
     default_font: FontSpec = Field(default_factory=FontSpec)
+
+    # Word Normal style (extracted from source document)
+    normal_style: NormalStyle = Field(default_factory=NormalStyle)
+
+    # Body font: the actual font used for content (bullets, entries)
+    # as opposed to default_font which is docDefaults (often a theme)
+    body_font_family: str = ""
+    body_font_size_pt: float = 10.0
+    body_line_spacing_val: int = 240  # w:line value for content paragraphs
+
+    # Normalized spacer size (most common across all spacer elements)
+    spacer_size_half_pt: int = 10  # 5pt default
 
     # Section ordering
     section_order: list[str] = Field(default_factory=list)

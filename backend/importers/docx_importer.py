@@ -609,10 +609,16 @@ def _parse_styles_xml(docx_bytes: bytes) -> dict[str, dict]:
             if spacing is not None:
                 before = spacing.get(qn("w:before"))
                 after = spacing.get(qn("w:after"))
+                line = spacing.get(qn("w:line"))
+                line_rule = spacing.get(qn("w:lineRule"))
                 if before:
                     info["space_before_pt"] = _twips_to_pt(int(before))
                 if after:
                     info["space_after_pt"] = _twips_to_pt(int(after))
+                if line:
+                    info["line_value"] = int(line)
+                if line_rule:
+                    info["line_rule"] = line_rule
 
         styles_map[style_id] = info
 
@@ -684,6 +690,9 @@ class DocxImporter:
         )
         layout.hyperlinks = hyperlinks
 
+        # Derive body font and spacer size from elements
+        self._derive_body_formatting(layout)
+
         # Store elements for content building (hyperlink extraction)
         self._layout_elements = layout.elements
 
@@ -715,6 +724,58 @@ class DocxImporter:
         except Exception:
             pass
         return links
+
+    @staticmethod
+    def _derive_body_formatting(layout: ResumeLayout):
+        """Derive body font, line spacing, and spacer size from elements.
+
+        Reads actual values from the captured elements rather than
+        hardcoding defaults.
+        """
+        from collections import Counter
+        from backend.models.resume_layout import ElementType
+
+        # Body font: from bullet style (most representative of content)
+        bullet_style = layout.styles.get("bullet")
+        if bullet_style:
+            layout.body_font_family = bullet_style.font.family
+            layout.body_font_size_pt = bullet_style.font.size_pt
+        elif layout.default_font.family:
+            layout.body_font_family = layout.default_font.family
+            layout.body_font_size_pt = layout.default_font.size_pt
+
+        # Body line spacing: most common line_value among content elements
+        line_values: Counter = Counter()
+        for el in layout.elements:
+            if el.element_type in (
+                ElementType.BULLET,
+                ElementType.ENTRY_HEADER,
+                ElementType.ENTRY_SUBHEADER,
+                ElementType.SKILLS_ROW,
+            ):
+                if el.paragraph_format.line_value is not None:
+                    line_values[el.paragraph_format.line_value] += 1
+        if line_values:
+            layout.body_line_spacing_val = line_values.most_common(1)[0][0]
+
+        # Spacer size: most common among spacers that have a size
+        spacer_sizes: Counter = Counter()
+        for el in layout.elements:
+            if (
+                el.element_type == ElementType.SPACER
+                and el.spacer_size_half_pt is not None
+            ):
+                spacer_sizes[el.spacer_size_half_pt] += 1
+        if spacer_sizes:
+            layout.spacer_size_half_pt = spacer_sizes.most_common(1)[0][0]
+
+        # Normalize: fill in None-sized spacers with the detected size
+        for el in layout.elements:
+            if (
+                el.element_type == ElementType.SPACER
+                and el.spacer_size_half_pt is None
+            ):
+                el.spacer_size_half_pt = layout.spacer_size_half_pt
 
     def _capture_element_sequence(
         self,
@@ -890,6 +951,19 @@ class DocxImporter:
             if pPr.find(qn("w:keepLines")) is not None:
                 pf.keep_lines = True
 
+            # Paragraph-level default run properties (pPr/rPr)
+            ppr_rPr = pPr.find(qn("w:rPr"))
+            if ppr_rPr is not None:
+                sz = ppr_rPr.find(qn("w:sz"))
+                if sz is not None:
+                    pf.ppr_font_size_half_pt = _int_val(sz)
+                rFonts = ppr_rPr.find(qn("w:rFonts"))
+                if rFonts is not None:
+                    pf.ppr_font_family = (
+                        rFonts.get(qn("w:ascii"))
+                        or rFonts.get(qn("w:hAnsi"))
+                    )
+
         # Drawing shapes
         for drawing in p_elem.findall(f".//{qn('w:drawing')}"):
             pf.has_drawing = True
@@ -1022,12 +1096,27 @@ class DocxImporter:
         """Build the Layout Schema from extracted paragraph formatting."""
         layout = ResumeLayout(page=page_setup)
 
-        # Set default font from styles.xml
+        # Set default font from styles.xml docDefaults
         defaults = styles_map.get("__defaults__", {})
         if defaults.get("font"):
             layout.default_font.family = defaults["font"]
         if defaults.get("size_pt"):
             layout.default_font.size_pt = defaults["size_pt"]
+
+        # Extract Normal style from styles.xml
+        from backend.models.resume_layout import NormalStyle
+        normal_info = styles_map.get("Normal", {})
+        if normal_info:
+            ns = NormalStyle()
+            if normal_info.get("font"):
+                ns.font_family = normal_info["font"]
+            if normal_info.get("size_pt"):
+                ns.font_size_pt = normal_info["size_pt"]
+            if normal_info.get("line_value"):
+                ns.line_spacing_val = normal_info["line_value"]
+            if normal_info.get("line_rule"):
+                ns.line_rule = normal_info["line_rule"]
+            layout.normal_style = ns
 
         # Detect formatting patterns and create named styles
         style_groups = self._cluster_paragraph_styles(paragraphs)
