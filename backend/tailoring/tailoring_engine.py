@@ -1,11 +1,10 @@
 """Unified Tailoring Engine.
 
-Single LLM pass that sees the full resume, full JD analysis, matcher
-coverage report, source facts bank, and per-bullet line capacity.
-Returns all bullet changes, skill reorders, and skill additions in
-one structured response.
+Single LLM pass that sees the full resume and full JD.
+Produces all bullet rewrites, skill reorders, and skill additions.
 
-Replaces the old planner → rewriter × N pipeline.
+The prompt is intentionally simple — modeled on what works
+when pasting a resume + JD into ChatGPT with a one-line instruction.
 """
 
 from __future__ import annotations
@@ -39,43 +38,49 @@ class TailoringEngineResult:
 # Prompt
 # ---------------------------------------------------------------------------
 
-TAILORING_SYSTEM = """You are a senior resume strategist and ATS optimization expert. You see the COMPLETE resume and COMPLETE job description. Your job is to make surgical, high-impact changes that improve ATS keyword matching while keeping the resume honest and natural-sounding.
+TAILORING_SYSTEM = """You are a resume ATS optimization expert. You will receive a full resume, a job description, and source facts. Your job is to make small, surgical changes to improve ATS keyword matching.
 
 RULES:
-1. PRESERVE all quantified metrics (numbers, percentages, dollar amounts) — these are your strongest content
-2. PRESERVE specific technical details — only replace if swapping for an equivalent JD term
-3. Do NOT invent technologies, metrics, responsibilities, projects, or claims not supported by source facts
-4. Most rewrites should change 2-5 words. Think word swaps, not full rewrites
-5. Each bullet has a CHARACTER BUDGET (floor and ceiling). Stay within it. Aim close to the ceiling to maximize keyword space
-6. Verb and framing swaps are high-value: "collaborated" → "communicated", "built" → "developed", "made" → "engineered"
-7. Think about keyword DISTRIBUTION — spread different JD keywords across different bullets instead of cramming the same ones everywhere
-8. For skills: only suggest adding skills the candidate demonstrably has based on their experience bullets. Place additions in the correct existing category. Never add soft skills or activity descriptions (debugging, testing, collaboration) as listed skills
-9. A "keep" decision means the bullet is already strong for this JD — do not default to keep. Most bullets can benefit from at least a small keyword swap
+1. Keep each bullet approximately the same length. The current bullets fill the page — do NOT make them shorter. If anything, use available space to add a keyword.
+2. Each bullet has a target character count shown as (~N chars). Your rewrite should be close to that length.
+3. Change 1-5 words per bullet. Think word swaps and small insertions, not full rewrites.
+4. PRESERVE all numbers, metrics, percentages, and dollar amounts exactly.
+5. Do NOT invent technologies, metrics, or claims not supported by the source facts.
+6. Spread different JD keywords across different bullets — don't cram the same keyword everywhere.
 
-Return ONLY valid JSON, no markdown code blocks."""
+GOOD CHANGES:
+- Add a JD verb: "Built" → "Built and tested", "Designed" → "Designed and deployed"
+- Add a JD descriptor: "API pipelines" → "reliable API pipelines", "REST API" → "scalable REST API"
+- Swap for JD terminology: "collaborated with" → "cross-functional collaboration with", "app" → "application", "NoSQL models" → "database models"
+- Swap near-synonyms: "natural language processing" → "LLM tooling", "60+ professionals" → "60+ users"
+
+BAD CHANGES:
+- Making a bullet shorter without adding anything
+- Removing words just to rephrase
+- Claiming to add a keyword that isn't actually in your new_text
+- Adding a technology the candidate never used
+
+If you cannot meaningfully improve a bullet, mark it "keep". That is perfectly fine.
+
+For skills: reorder to put JD-relevant skills first. Add technical concepts (LLMs, Embeddings, RAG, CI/CD) the candidate demonstrably used — never add soft skills as listed skills.
+
+Return ONLY valid JSON, no markdown."""
 
 
-TAILORING_USER_TEMPLATE = """Tailor this resume for the following job description.
+TAILORING_USER_TEMPLATE = """Improve this resume to match the job description for ATS. Tell me what lines you would change and what the new versions would be. Keep each bullet around the same length so it goes to the end of the line.
 
-JOB DESCRIPTION ANALYSIS:
+JOB DESCRIPTION:
 Title: {job_title}
-Required Skills: {required_skills}
-Preferred Skills: {preferred_skills}
-Key Responsibilities:
+Required: {required_skills}
+Preferred: {preferred_skills}
+Responsibilities:
 {responsibilities}
-ATS Keywords: {ats_keywords}
 
-KEYWORD COVERAGE (from deterministic analysis):
-Already in resume: {covered_keywords}
-Missing from resume: {missing_keywords}
-
-FULL RESUME:
+RESUME:
 {resume_text}
 
-SOURCE FACTS BANK (claims you may draw from — do NOT go beyond these):
+SOURCE FACTS (claims you may draw from):
 {facts_text}
-
-For each bullet, I've included its character budget: [floor-ceiling]. Your rewrite MUST fall within this range. Aim close to the ceiling.
 
 Return a JSON object:
 {{
@@ -89,27 +94,23 @@ Return a JSON object:
     }}
   ],
   "skill_reorders": {{
-    "Category Name": ["skill1", "skill2", "skill3"]
+    "Category Name": ["skill1 in new order", "skill2", "skill3"]
   }},
   "skill_additions": {{
     "Category Name": ["NewSkill1", "NewSkill2"]
   }}
 }}
 
-DECISION GUIDANCE:
-- "rewrite": The bullet can be improved by swapping words for JD terminology. This is the default for most bullets.
-- "keep": The bullet already has strong keyword coverage AND good metrics/impact. Should be rare.
-- "remove": ONLY if the entry has more bullets than {max_bullets} AND this bullet is genuinely irrelevant to the JD. Very rare.
-
-For skill_reorders: put JD-relevant skills first in each category. Only include categories that need reordering.
-For skill_additions: only add named technologies/methodologies the candidate demonstrably used. Place in the correct existing category. Never add soft skills or generic terms."""
+Only include bullets you are changing — omit bullets you would keep as-is.
+Only include skill categories you are reordering or adding to.
+For removals: only remove if an entry has more than {max_bullets} bullets AND the bullet is irrelevant."""
 
 
 def _build_resume_text(
     content: ResumeContent,
-    char_budgets: dict[str, tuple[int, int]],
+    target_chars: dict[str, int],
 ) -> str:
-    """Build structured resume text with per-bullet character budgets."""
+    """Build resume text with per-bullet target character counts."""
     parts: list[str] = []
 
     for section in content.sections:
@@ -123,8 +124,8 @@ def _build_resume_text(
             parts.append(f"\n{entry.company}{date}")
             parts.append(f"{entry.role} | {entry.location or ''}")
             for b in entry.bullets:
-                budget = char_budgets.get(b.id, (80, 120))
-                parts.append(f"  [{b.id}] (chars: {budget[0]}-{budget[1]}) {b.text}")
+                tc = target_chars.get(b.id, len(b.text))
+                parts.append(f"  [{b.id}] (~{tc} chars) {b.text}")
 
         for entry in section.education_entries:
             parts.append(f"\n{entry.institution}")
@@ -134,8 +135,8 @@ def _build_resume_text(
         for entry in section.project_entries:
             parts.append(f"\n{entry.name}")
             for b in entry.bullets:
-                budget = char_budgets.get(b.id, (80, 120))
-                parts.append(f"  [{b.id}] (chars: {budget[0]}-{budget[1]}) {b.text}")
+                tc = target_chars.get(b.id, len(b.text))
+                parts.append(f"  [{b.id}] (~{tc} chars) {b.text}")
 
         for cat in section.skill_categories:
             parts.append(f"{cat.category}: {', '.join(cat.skills)}")
@@ -170,9 +171,7 @@ class TailoringEngine:
         content: ResumeContent,
         jd: JobAnalysis,
         bank: ResumeBank,
-        covered_keywords: list[str],
-        missing_keywords: list[str],
-        char_budgets: dict[str, tuple[int, int]],
+        target_chars: dict[str, int],
         max_bullets_per_entry: int = 4,
     ) -> TailoringEngineResult:
         """Run the unified tailoring pass."""
@@ -190,7 +189,7 @@ class TailoringEngine:
             return result
 
         # Build prompt
-        resume_text = _build_resume_text(content, char_budgets)
+        resume_text = _build_resume_text(content, target_chars)
         facts_text = _build_facts_text(bank)
 
         required = ", ".join(
@@ -202,16 +201,12 @@ class TailoringEngine:
         responsibilities = "\n".join(
             f"- {r.text}" for r in jd.responsibilities[:10]
         ) or "Not specified"
-        ats_kws = ", ".join(jd.ats_phrases[:20]) or "Not specified"
 
         user_msg = TAILORING_USER_TEMPLATE.format(
             job_title=jd.job_title or "Not specified",
             required_skills=required,
             preferred_skills=preferred,
             responsibilities=responsibilities,
-            ats_keywords=ats_kws,
-            covered_keywords=", ".join(covered_keywords[:20]) or "None",
-            missing_keywords=", ".join(missing_keywords[:20]) or "None",
             resume_text=resume_text,
             facts_text=facts_text,
             max_bullets=max_bullets_per_entry,
@@ -284,7 +279,7 @@ class TailoringEngine:
                 for b in entry.bullets:
                     bullet_texts[b.id] = b.text
 
-        # Parse bullet changes
+        # Parse bullet changes from LLM (only changed bullets)
         bullet_changes: list[BulletChange] = []
         for item in data.get("bullet_changes", []):
             if not isinstance(item, dict):
@@ -313,16 +308,16 @@ class TailoringEngine:
                 reason=item.get("reason", ""),
             ))
 
-        # Ensure all bullets have a change entry (default to keep)
+        # Fill in keeps for bullets the LLM didn't mention
         seen_ids = {c.bullet_id for c in bullet_changes}
-        for bid, text in bullet_texts.items():
+        for bid, btext in bullet_texts.items():
             if bid not in seen_ids:
                 bullet_changes.append(BulletChange(
                     bullet_id=bid,
-                    original_text=text,
-                    tailored_text=text,
+                    original_text=btext,
+                    tailored_text=btext,
                     action="keep",
-                    reason="Not addressed by LLM",
+                    reason="Already well-written for this JD",
                 ))
 
         return {
@@ -372,7 +367,6 @@ def _parse_json_robust(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Trim from end until valid
     for trim in range(1, min(500, len(text))):
         candidate = text[:-trim]
         ob = candidate.count('{') - candidate.count('}')

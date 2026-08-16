@@ -1,10 +1,10 @@
 """Tailoring Service.
 
-Simplified pipeline:
+Pipeline:
 1. JD Analysis (hybrid LLM + deterministic)
-2. Matcher (deterministic coverage report)
-3. Tailoring Engine (single LLM pass — rewrites, removals, skill changes)
-4. Safety Net (fabrication check + layout fit)
+2. Compute target character count per bullet (from layout measurer)
+3. Tailoring Engine (single LLM pass)
+4. Safety Net (fabrication check only — revert overflows to original)
 5. Skills fitting + page fitting
 """
 
@@ -26,7 +26,6 @@ from backend.models.tailoring import (
 )
 from backend.services.resume_bank_service import generate_bank_from_ir
 from backend.tailoring.claim_validator import ClaimValidator
-from backend.tailoring.matcher import Matcher
 from backend.tailoring.tailoring_engine import TailoringEngine
 
 logger = logging.getLogger(__name__)
@@ -54,26 +53,29 @@ class TailoringService:
         max_bullet_chars: int = 115,
     ) -> TailoringResult:
         """Run the tailoring pipeline."""
-        self._one_line_bullets = one_line_bullets
-        self._max_bullets = max_bullets_per_entry
-
         if bank is None:
             bank = generate_bank_from_ir(ir)
 
-        # === STAGE 1: Deterministic matching (coverage report) ===
-        matcher = Matcher(jd, ir.content, bank)
-        match_result = matcher.match()
-
-        # === STAGE 2: Compute per-bullet character budgets ===
+        # === STAGE 1: Compute target char count per bullet ===
         from backend.tailoring.bullet_measurer import BulletMeasurer
+        measurer = None
         try:
             measurer = BulletMeasurer(ir.layout)
-            char_budgets = self._compute_char_budgets(ir.content, measurer)
+            line_capacity = self._find_line_capacity(measurer)
         except Exception:
-            # Fallback: use max_bullet_chars
-            char_budgets = self._fallback_char_budgets(ir.content, max_bullet_chars)
+            line_capacity = max_bullet_chars
 
-        # === STAGE 3: Unified LLM tailoring pass ===
+        # Target = line capacity for all bullets (fill the line)
+        target_chars: dict[str, int] = {}
+        for section in ir.content.sections:
+            for entry in section.experience_entries:
+                for b in entry.bullets:
+                    target_chars[b.id] = line_capacity
+            for entry in section.project_entries:
+                for b in entry.bullets:
+                    target_chars[b.id] = line_capacity
+
+        # === STAGE 2: Unified LLM tailoring pass ===
         result = TailoringResult(resume_id="", job_title=jd.job_title)
 
         if self._use_llm:
@@ -82,9 +84,7 @@ class TailoringService:
                 content=ir.content,
                 jd=jd,
                 bank=bank,
-                covered_keywords=match_result.matched_keywords,
-                missing_keywords=match_result.missing_keywords,
-                char_budgets=char_budgets,
+                target_chars=target_chars,
                 max_bullets_per_entry=max_bullets_per_entry,
             )
 
@@ -93,7 +93,6 @@ class TailoringService:
                 result.planning_used = True
                 result.planning_duration_ms = engine_result.duration_ms
 
-                # Skill changes from engine
                 for cat, skills in engine_result.skill_reorders.items():
                     result.reordered_skills[cat] = skills
                 for cat, skills in engine_result.skill_additions.items():
@@ -104,75 +103,25 @@ class TailoringService:
                     f"Tailoring engine failed: {engine_result.llm_error}"
                 )
 
-        # If LLM didn't produce results, fall back to deterministic keep-all
+        # If LLM didn't produce results, fall back to keep-all
         if not result.bullet_changes:
             result.bullet_changes = self._deterministic_fallback(ir.content)
 
-        # === STAGE 4: Safety net ===
+        # === STAGE 3: Safety net (fabrication + overflow revert) ===
         validator = ClaimValidator()
-        self._run_safety_net(result, bank, ir, validator)
+        self._run_safety_net(result, bank, ir, validator, measurer)
 
-        # === STAGE 5: Layout fitting ===
-        if one_line_bullets:
-            try:
-                measurer_obj = BulletMeasurer(ir.layout)
-                self._enforce_line_fit(result, measurer_obj, bank)
-            except Exception as e:
-                logger.warning(f"Layout fitting skipped: {e}")
-
-        # === STAGE 6: Keyword coverage report ===
+        # === STAGE 4: Build coverage report ===
+        from backend.tailoring.matcher import Matcher
+        matcher = Matcher(jd, ir.content, bank)
+        match_result = matcher.match()
         self._build_coverage_report(result, ir, jd, match_result)
 
         return result
 
     # ------------------------------------------------------------------
-    # Character budgets
+    # Line capacity
     # ------------------------------------------------------------------
-
-    def _compute_char_budgets(
-        self,
-        content: ResumeContent,
-        measurer,
-    ) -> dict[str, tuple[int, int]]:
-        """Compute per-bullet (floor, ceiling) character budgets.
-
-        Floor = 80% of original length (don't lose content).
-        Ceiling = max chars that fit on one rendered line.
-        """
-        # Find single-line capacity via binary search
-        max_line_chars = self._find_line_capacity(measurer)
-
-        budgets: dict[str, tuple[int, int]] = {}
-        for section in content.sections:
-            for entry in section.experience_entries:
-                for b in entry.bullets:
-                    floor = int(len(b.text) * 0.80)
-                    ceiling = max_line_chars
-                    budgets[b.id] = (floor, ceiling)
-            for entry in section.project_entries:
-                for b in entry.bullets:
-                    floor = int(len(b.text) * 0.80)
-                    ceiling = max_line_chars
-                    budgets[b.id] = (floor, ceiling)
-        return budgets
-
-    def _fallback_char_budgets(
-        self,
-        content: ResumeContent,
-        max_chars: int,
-    ) -> dict[str, tuple[int, int]]:
-        """Fallback budgets when measurer is unavailable."""
-        budgets: dict[str, tuple[int, int]] = {}
-        for section in content.sections:
-            for entry in section.experience_entries:
-                for b in entry.bullets:
-                    floor = int(len(b.text) * 0.80)
-                    budgets[b.id] = (floor, max_chars)
-            for entry in section.project_entries:
-                for b in entry.bullets:
-                    floor = int(len(b.text) * 0.80)
-                    budgets[b.id] = (floor, max_chars)
-        return budgets
 
     def _find_line_capacity(self, measurer) -> int:
         """Binary search for how many chars fit on one rendered line."""
@@ -202,18 +151,41 @@ class TailoringService:
         bank: ResumeBank,
         ir: ResumeIR,
         validator: ClaimValidator,
+        measurer,
     ):
-        """Check for fabrication and metric loss. Revert bad rewrites."""
+        """Fabrication check + overflow revert. No shortening pass."""
         for change in result.bullet_changes:
             if change.action != "rewrite":
                 continue
 
-            # Get source facts for this bullet
+            # Identical to original
+            if change.tailored_text.strip() == change.original_text.strip():
+                change.tailored_text = change.original_text
+                change.action = "keep"
+                change.reason = "No meaningful change"
+                continue
+
+            # Rewrite only removed words without adding anything
+            orig_words = set(change.original_text.lower().split())
+            new_words = set(change.tailored_text.lower().split())
+            if not (new_words - orig_words):
+                change.tailored_text = change.original_text
+                change.action = "keep"
+                change.reason = "Rewrite only removed words"
+                continue
+
+            # Validate claimed keywords are actually present
+            if change.target_keywords:
+                text_lower = change.tailored_text.lower()
+                change.target_keywords = [
+                    kw for kw in change.target_keywords
+                    if kw.lower() in text_lower
+                ]
+
+            # Fabrication check
             facts = self._get_facts_for_bullet(
                 change.bullet_id, bank, ir.content,
             )
-
-            # Fabrication check
             validation = validator.validate(change, facts)
             if not validation.valid:
                 change.tailored_text = change.original_text
@@ -226,61 +198,20 @@ class TailoringService:
             # Metric preservation warning
             if validation.metric_warnings:
                 change.reason = (
-                    (change.reason or "") +
-                    f" | WARNING: {'; '.join(validation.metric_warnings)}"
+                    (change.reason or "")
+                    + f" | WARNING: {'; '.join(validation.metric_warnings)}"
                 )
 
-    # ------------------------------------------------------------------
-    # Layout fitting
-    # ------------------------------------------------------------------
-
-    def _enforce_line_fit(
-        self,
-        result: TailoringResult,
-        measurer,
-        bank: ResumeBank,
-    ):
-        """Check each rewritten bullet fits on one line. Shorten if needed."""
-        for change in result.bullet_changes:
-            if change.action not in ("rewrite", "keep"):
-                continue
-
-            text = change.tailored_text
-            measurement = measurer.measure(text)
-
-            if measurement.fits_one_line:
-                continue
-
-            # Try shortening via LLM
-            if change.action == "rewrite":
-                try:
-                    from backend.tailoring.rewriter import BulletRewriter
-                    rewriter = BulletRewriter()
-                    facts = [{"id": "original", "text": change.original_text}]
-                    shortened = rewriter.shorten_bullet(
-                        bullet_id=change.bullet_id,
-                        bullet_text=text,
-                        facts=facts,
-                        target_lines=1,
-                        chars_per_line=len(text) - 10,  # rough target
+            # Overflow check — revert to original, don't shorten
+            if measurer:
+                measurement = measurer.measure(change.tailored_text)
+                if not measurement.fits_one_line:
+                    change.tailored_text = change.original_text
+                    change.action = "keep"
+                    change.reason = (
+                        f"Rewrite overflows line "
+                        f"({measurement.line_count} lines) — reverted"
                     )
-                    new_m = measurer.measure(shortened.tailored_text)
-                    if new_m.fits_one_line:
-                        change.tailored_text = shortened.tailored_text
-                        change.reason = (
-                            (change.reason or "") + " | Shortened to fit line"
-                        )
-                        continue
-                except Exception:
-                    pass
-
-                # LLM shortening failed — revert to original
-                change.tailored_text = change.original_text
-                change.action = "keep"
-                change.reason = (
-                    f"Rewrite overflows line ({measurement.line_count} lines)"
-                    " — reverted"
-                )
 
     # ------------------------------------------------------------------
     # Deterministic fallback
@@ -313,7 +244,7 @@ class TailoringService:
         return changes
 
     # ------------------------------------------------------------------
-    # Keyword coverage report
+    # Coverage report
     # ------------------------------------------------------------------
 
     def _build_coverage_report(
@@ -351,7 +282,6 @@ class TailoringService:
                         orig_text += " " + " ".join(
                             s.lower() for s in cat.skills
                         )
-
                 status = "matched" if kw.lower() in orig_text else "added"
                 source = (
                     "present in resume"
@@ -430,7 +360,6 @@ class TailoringService:
 
             elif section.type == SectionType.SKILLS:
                 for cat in section.skill_categories:
-                    # Add new skills
                     if cat.category in result.added_skills:
                         existing = {s.lower() for s in cat.skills}
                         for new_skill in result.added_skills[cat.category]:
@@ -440,10 +369,9 @@ class TailoringService:
                                 cat.skills.append(new_skill)
                                 existing.add(new_skill.lower())
 
-                    # Reorder skills
                     if cat.category in result.reordered_skills:
                         accepted = result.reorder_accepted.get(
-                            cat.category, True
+                            cat.category, True,
                         )
                         if accepted:
                             reordered = list(
@@ -457,7 +385,6 @@ class TailoringService:
                                     reordered.append(s)
                             cat.skills = reordered
 
-        # Ensure skills rows fit on one line
         if fit_skills:
             self._fit_skills_to_line(new_ir, result)
 
@@ -609,7 +536,6 @@ class TailoringService:
         content: ResumeContent,
     ) -> list[dict]:
         """Get source facts for a bullet from the bank."""
-        # Find which entry this bullet belongs to
         entry_id = ""
         for section in content.sections:
             for entry in section.experience_entries:
