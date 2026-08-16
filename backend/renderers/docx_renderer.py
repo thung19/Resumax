@@ -31,6 +31,7 @@ from backend.models.resume_layout import (
     ParagraphFormat,
     ResumeLayout,
     RunFormat,
+    TabAlignment,
     TabStop,
 )
 
@@ -48,6 +49,22 @@ class DocxRenderer:
         self._content_width_twips = int(
             (page.width_in - page.margin_left_in - page.margin_right_in) * 1440
         )
+        self._spacer_half_pt = self._detect_spacer_size()
+
+    def _detect_spacer_size(self) -> int:
+        """Pick the most common spacer size across all elements.
+
+        The source document may have inconsistent spacer sizes.
+        We normalise to a single value so spacing is uniform.
+        """
+        from collections import Counter
+        sizes: Counter = Counter()
+        for el in self._layout.elements:
+            if el.element_type == ElementType.SPACER and el.spacer_size_half_pt is not None:
+                sizes[el.spacer_size_half_pt] += 1
+        if sizes:
+            return sizes.most_common(1)[0][0]
+        return 10  # 5pt default
 
     def _detect_font(self) -> str:
         for role in ["name", "entry_header", "bullet", "contact"]:
@@ -78,13 +95,19 @@ class DocxRenderer:
         section.left_margin = Inches(page.margin_left_in)
         section.right_margin = Inches(page.margin_right_in)
 
-        # Normal style: single spacing, zero margins
+        # Normal style: match the original document's defaults
+        # Original: font=Arial, sz=22 (11pt), line=276 (1.15x), after=not set
         normal = self._doc.styles["Normal"]
-        normal.font.name = self._font
-        normal.font.size = Pt(11)
+
+        # Use the document's defaults — Normal style typically overrides docDefaults
+        # docDefaults says 12pt but Normal style in the original is 11pt (sz=22)
+        default_font = self._layout.default_font
+        normal_font = default_font.family if default_font.family and default_font.family.lower() != "minorhansi" else "Arial"
+        normal.font.name = normal_font
+        normal.font.size = Pt(11)  # Standard Normal style size (sz=22)
+
         pf = normal.paragraph_format
-        pf.space_after = Pt(0)
-        pf.space_before = Pt(0)
+        # Do NOT set space_after=0 — let it inherit the original default
         pPr = normal.element.find(qn("w:pPr"))
         if pPr is None:
             pPr = OxmlElement("w:pPr")
@@ -93,10 +116,13 @@ class DocxRenderer:
         if spacing is None:
             spacing = OxmlElement("w:spacing")
             pPr.append(spacing)
-        spacing.set(qn("w:line"), "240")
+        # Match original Normal style: line=276 (1.15x spacing)
+        # Individual paragraphs override to line=240 where needed
+        spacing.set(qn("w:line"), "276")
         spacing.set(qn("w:lineRule"), "auto")
-        spacing.set(qn("w:after"), "0")
+        # Explicitly zero before/after to prevent Word defaults leaking
         spacing.set(qn("w:before"), "0")
+        spacing.set(qn("w:after"), "0")
 
     # --- OOXML helpers ---
 
@@ -104,7 +130,8 @@ class DocxRenderer:
         """Apply captured paragraph formatting to a python-docx paragraph."""
         pPr = para._element.get_or_add_pPr()
 
-        # Spacing
+        # Spacing – always write explicit before/after to prevent
+        # Word Normal-style defaults from leaking extra space.
         if pf.line_value is not None or pf.space_before_twips is not None or pf.space_after_twips is not None:
             spacing = pPr.find(qn("w:spacing"))
             if spacing is None:
@@ -114,10 +141,8 @@ class DocxRenderer:
                 spacing.set(qn("w:line"), str(pf.line_value))
             if pf.line_rule is not None:
                 spacing.set(qn("w:lineRule"), pf.line_rule)
-            if pf.space_before_twips is not None:
-                spacing.set(qn("w:before"), str(pf.space_before_twips))
-            if pf.space_after_twips is not None:
-                spacing.set(qn("w:after"), str(pf.space_after_twips))
+            spacing.set(qn("w:before"), str(pf.space_before_twips or 0))
+            spacing.set(qn("w:after"), str(pf.space_after_twips or 0))
 
         # Indentation
         if any([pf.indent_left_twips, pf.indent_right_twips,
@@ -310,6 +335,109 @@ class DocxRenderer:
         hyperlink.append(run_el)
         para._element.append(hyperlink)
 
+    def _set_paragraph_rPr(self, para: Paragraph, half_pt: int, font: str):
+        """Set pPr/rPr — paragraph-level default run properties.
+
+        Controls the visual height and font of empty (spacer) paragraphs.
+        Both font size AND font family must be set, otherwise Word falls
+        back to the Normal style font which may differ.
+        """
+        pPr = para._element.get_or_add_pPr()
+        rPr = pPr.find(qn("w:rPr"))
+        if rPr is None:
+            rPr = OxmlElement("w:rPr")
+            pPr.append(rPr)
+        # Font family
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rPr.insert(0, rFonts)
+        for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
+            rFonts.set(qn(f"w:{attr}"), font)
+        # Font size
+        for tag in ["w:sz", "w:szCs"]:
+            el = rPr.find(qn(tag))
+            if el is None:
+                el = OxmlElement(tag)
+                rPr.append(el)
+            el.set(qn("w:val"), str(half_pt))
+
+    def _clean_lr_paragraph(self, pf: ParagraphFormat) -> ParagraphFormat:
+        """Collapse a tab-separated paragraph into a clean left/right layout.
+
+        Source documents often use 5-15 consecutive tab runs to visually
+        push dates to the right.  We collapse these into:
+          [left text runs] [single tab] [right text runs]
+        with a single right-aligned tab stop at the content width.
+
+        If the right side is empty or has no date/location content,
+        we just strip the tabs and return the left side only (keeping
+        any non-tab runs that follow, like hyperlink text).
+        """
+        import re
+
+        has_tab_run = any(r.is_tab for r in pf.runs)
+        if not has_tab_run:
+            return pf
+
+        pf = pf.model_copy(deep=True)
+
+        # Split runs at the first tab into left and right groups
+        left_runs: list[RunFormat] = []
+        right_runs: list[RunFormat] = []
+        seen_tab = False
+        for r in pf.runs:
+            if r.is_tab and not seen_tab:
+                seen_tab = True
+                continue
+            if r.is_tab and seen_tab:
+                continue  # skip subsequent tabs
+            if not seen_tab:
+                left_runs.append(r)
+            else:
+                if not right_runs and not r.text.strip():
+                    continue  # skip whitespace padding
+                right_runs.append(r)
+
+        right_text = "".join(r.text for r in right_runs).strip()
+
+        # Check if right side looks like a date or location
+        has_date_or_location = bool(re.search(
+            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|present|\d{4}|,\s*[A-Z]{2}\b)",
+            right_text, re.I
+        ))
+
+        if not right_text or not has_date_or_location:
+            # No meaningful right content — strip tabs, keep all non-tab runs
+            all_non_tab = [r for r in pf.runs if not r.is_tab]
+            pf.runs = all_non_tab
+            pf.tab_stops = []
+            return pf
+
+        # Strip trailing whitespace from left, leading from right
+        if left_runs and left_runs[-1].text:
+            left_runs[-1] = left_runs[-1].model_copy()
+            left_runs[-1].text = left_runs[-1].text.rstrip()
+        if right_runs and right_runs[0].text:
+            right_runs[0] = right_runs[0].model_copy()
+            right_runs[0].text = right_runs[0].text.lstrip()
+
+        # Build: left_runs + [single tab run] + right_runs
+        tab_fmt = right_runs[0] if right_runs else (left_runs[0] if left_runs else RunFormat())
+        tab_run = RunFormat(
+            text="",
+            is_tab=True,
+            font_family=tab_fmt.font_family,
+            font_size_half_pt=tab_fmt.font_size_half_pt,
+            bold=tab_fmt.bold,
+        )
+        pf.runs = left_runs + [tab_run] + right_runs
+        pf.tab_stops = [TabStop(
+            position_twips=self._content_width_twips,
+            alignment=TabAlignment.RIGHT,
+        )]
+        return pf
+
     def _replay_paragraph(self, pf: ParagraphFormat) -> Paragraph:
         """Create a paragraph that exactly replays captured formatting."""
         para = self._doc.add_paragraph()
@@ -339,8 +467,17 @@ class DocxRenderer:
             pf = el.paragraph_format
 
             if el.element_type == ElementType.SPACER:
-                # Replay spacer exactly — keep its font size
-                self._replay_paragraph(pf)
+                # Replay spacer as a clean empty paragraph.
+                # Strip all runs (some spacers have whitespace-only
+                # tab/text runs from the source that bloat the gap).
+                pf_copy = pf.model_copy(deep=True)
+                pf_copy.runs = []
+                pf_copy.tab_stops = []
+                if pf_copy.line_value is None:
+                    pf_copy.line_value = 240
+                    pf_copy.line_rule = "auto"
+                para = self._replay_paragraph(pf_copy)
+                self._set_paragraph_rPr(para, self._spacer_half_pt, self._font)
 
             elif el.element_type in (ElementType.NAME, ElementType.CONTACT):
                 # Replay with potentially updated contact info
@@ -366,11 +503,10 @@ class DocxRenderer:
                 self._replay_paragraph(pf_copy)
 
             elif el.element_type == ElementType.ENTRY_HEADER:
-                # Replay with current text structure
-                self._replay_paragraph(pf)
+                self._replay_paragraph(self._clean_lr_paragraph(pf))
 
             elif el.element_type == ElementType.ENTRY_SUBHEADER:
-                self._replay_paragraph(pf)
+                self._replay_paragraph(self._clean_lr_paragraph(pf))
 
             elif el.element_type == ElementType.BULLET:
                 self._replay_paragraph(pf)

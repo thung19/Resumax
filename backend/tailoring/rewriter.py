@@ -37,70 +37,57 @@ class LLMCallRecord:
     error: Optional[str] = None
 
 
-REWRITE_SYSTEM = """You are an expert resume optimizer for Applicant Tracking Systems (ATS).
+REWRITE_SYSTEM = """You are an ATS resume optimizer. Make small, surgical keyword insertions.
 
-ATS scans for exact keyword matches against the job description. Maximize match rate while keeping the bullet truthful and professional.
+RULES:
+1. The rewritten bullet must be THE SAME LENGTH (±5%) as the original. NOT longer.
+2. Add JD keywords by REPLACING existing words, not by appending.
+3. Every word you add must replace a word you remove. Zero net growth.
+4. Prefer one-word swaps: "Built" → "Developed", "app" → "application", "API" → "RESTful API"
+5. Only add a descriptor if you remove something of equal length: "optimization engine" → "ML optimization system"
+6. Do NOT pad with filler: no "software system", "production environments", "integrated solutions"
+7. Do NOT add technology claims to non-tech bullets (EMT work is NOT software engineering)
+8. Do NOT invent numbers, metrics, or technologies
+9. If you cannot add JD keywords without making the bullet longer or less specific, return the original UNCHANGED
 
-APPROACH (smallest changes first):
-1. KEYWORD SWAPS: Replace synonyms with exact JD terms ("built" → "developed", "app" → "application")
-2. KEYWORD INSERTION: Add JD terms the work already implies ("API" → "RESTful API", add "full-stack" if the work was full-stack)
-3. VERB UPGRADES: Use action verbs from the JD responsibilities
-4. CLARIFYING TERMS: Add descriptors that common sense supports from the context
+GOOD EXAMPLES:
+- "Built a Python system" → "Developed a Python software system" (swap verb, add 1 word by dropping an article elsewhere)
+- "REST API" → "RESTful API" (1-word change, big ATS win)
+- "Gemini API" → "Gemini LLM API" (add "LLM" — 3 chars, high value)
+- "RAG app using SentenceTransformers" → "machine learning RAG app using SentenceTransformers" (adds "machine learning" to describe what it IS)
 
-USE COMMON SENSE — think in tiers:
-
-FREELY ADD (no evidence needed — these describe ANY software work):
-- "software" (before engineering, development, system, etc.)
-- "software engineer/development" framing
-- Action verbs: developed, implemented, designed, built, engineered, tested, debugged, deployed
-- Generic descriptors: scalable, production, end-to-end, cross-functional, technical
-- "application" instead of "app", "utilized" instead of "used"
-
-ADD IF THE WORK IMPLIES IT (reasonable inference from context):
-- "full-stack" if the bullet mentions both frontend and backend work
-- "RESTful" if the bullet mentions API
-- "data pipeline" if the bullet describes processing/transforming data
-- "CI/CD" if deployment is mentioned
-- "Agile" if the role context suggests it (most tech internships are Agile)
-- "collaboration" or "cross-functional" if working with other teams is described
-- "machine learning" if the bullet mentions embeddings, models, NLP, or training
-
-USE DISCRETION — only add if genuinely evidenced:
-- Specific frameworks (Kubernetes, Docker, Terraform) — only if the work clearly involved them
-- Specific databases — only if data storage/querying is part of the described work
-- Specific cloud providers (AWS, GCP) — only if deployment or cloud services are mentioned
-- Programming languages — only if the language was plausibly used in the described work
-
-NEVER ADD:
-- Technologies the candidate clearly never used in this role
-- Metrics, numbers, or quantified results that don't exist
-- Responsibilities or projects that weren't part of this work
-- Company names, titles, or dates that aren't accurate
-
-LENGTH RULES:
-- The result MUST be approximately the same length as the original (within 10%)
-- Do NOT drop words just to shorten — every removal needs justification
-- NEVER remove metrics, numbers, or quantified results
-- If you can't meaningfully improve it, return the original text UNCHANGED
+BAD EXAMPLES (do NOT do these):
+- Adding "using integrated software systems and mobile applications" to an EMT bullet — fabrication
+- "optimization engine" → "mathematical optimization software system using SciPy MILP algorithms" — bloating
+- Adding "cross-functional" to a bullet about solo coding work — misleading
 
 Return ONLY a JSON object, no markdown."""
 
 
 REWRITE_USER_TEMPLATE = """Optimize this resume bullet for ATS matching.
 
+CONTEXT FOR THIS ENTRY:
+{entry_context}
+
+OVERALL RESUME STRATEGY:
+{strategy_context}
+
 ORIGINAL BULLET ({orig_chars} chars):
 {bullet_text}
 
-SOURCE FACTS (the ONLY claims you may use):
+SOURCE FACTS (the claims you may draw from):
 {facts_text}
 
-PLANNING CONTEXT:
+REWRITE BRIEF:
 {planning_context}
 
-TARGET KEYWORDS (use EXACT JD spelling when adding):
+TARGET KEYWORDS TO ADD (use EXACT JD spelling):
 {keywords}
 
-NEARBY BULLETS (for context — do NOT duplicate their content):
+KEYWORDS ALREADY COVERED BY OTHER BULLETS (don't duplicate these excessively):
+{covered_keywords}
+
+NEARBY BULLETS FROM SAME ENTRY (don't duplicate):
 {nearby_bullets}
 
 {length_constraint}
@@ -163,6 +150,9 @@ class BulletRewriter:
         planning_reason: str = "",
         rewrite_guidance: str = "",
         nearby_bullets: list[str] | None = None,
+        entry_context: str = "",
+        strategy_context: str = "",
+        covered_keywords: list[str] | None = None,
     ) -> BulletChange:
         """Rewrite a single bullet using planning context."""
         record = LLMCallRecord(stage="rewrite", model=self._model, bullet_id=bullet_id)
@@ -178,12 +168,12 @@ class BulletRewriter:
             target_keywords = [s.name for s in jd.all_skills_flat()[:15]]
         keywords_text = ", ".join(target_keywords[:15])
 
-        # Build planning context
+        # Build planning context (the rewrite brief from the planner)
         planning_parts = []
         if planning_reason:
-            planning_parts.append(f"Reason for rewrite: {planning_reason}")
+            planning_parts.append(planning_reason)
         if rewrite_guidance:
-            planning_parts.append(f"Guidance: {rewrite_guidance}")
+            planning_parts.append(rewrite_guidance)
         planning_context = "\n".join(planning_parts) or "General ATS optimization"
 
         # Build nearby bullets context
@@ -191,17 +181,29 @@ class BulletRewriter:
         if nearby_bullets:
             nearby_text = "\n".join(f"- {b}" for b in nearby_bullets[:3])
 
-        # Build length constraint
-        length_constraint = ""
-        if max_chars:
-            length_constraint = f"LENGTH CONSTRAINT: The rewritten bullet MUST be {max_chars} characters or fewer. Current is {len(bullet_text)} chars."
+        # Build covered keywords
+        covered_text = ", ".join(covered_keywords[:15]) if covered_keywords else "None tracked"
+
+        # Build length constraint from layout measurement
+        orig_len = len(bullet_text)
+        if max_chars and max_chars != orig_len:
+            floor = int(orig_len * 0.80)
+            ceiling = max_chars
+            length_constraint = f"LENGTH: Original is {orig_len} chars. Line capacity is {ceiling} chars. Your rewrite MUST be {floor}-{ceiling} chars. Do not go shorter than {floor}."
+        else:
+            floor = int(orig_len * 0.80)
+            ceiling = int(orig_len * 1.05)
+            length_constraint = f"LENGTH: Original is {orig_len} chars. Your rewrite MUST be {floor}-{ceiling} chars."
 
         user_msg = REWRITE_USER_TEMPLATE.format(
             bullet_text=bullet_text,
             orig_chars=len(bullet_text),
             facts_text=facts_text,
             planning_context=planning_context,
+            entry_context=entry_context or "Not specified",
+            strategy_context=strategy_context or "Not specified",
             keywords=keywords_text,
+            covered_keywords=covered_text,
             nearby_bullets=nearby_text,
             length_constraint=length_constraint,
         )

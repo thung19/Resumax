@@ -59,10 +59,12 @@ class TailoringService:
         jd: JobAnalysis,
         bank: Optional[ResumeBank] = None,
         max_bullets_per_entry: int = 4,
+        one_line_bullets: bool = True,
         enforce_single_line: bool = True,
         max_bullet_chars: int = 115,
     ) -> TailoringResult:
         """Run the full two-stage tailoring pipeline."""
+        self._one_line_bullets = one_line_bullets
         self._enforce_single_line = enforce_single_line
         self._max_bullet_chars = max_bullet_chars
         self._max_bullets = max_bullets_per_entry
@@ -94,9 +96,16 @@ class TailoringService:
         # Merge planning decisions with deterministic selections
         merged_selections = self._merge_plan_with_selection(selection, plan, match_result)
 
+        # Store plan for rewriter access
+        self._plan = plan
+
         # === STAGE 3: Rewrite selected bullets ===
         result = TailoringResult(resume_id="", job_title=jd.job_title)
         validator = ClaimValidator()
+
+        # Create measurer once — all rewrites use it for layout-accurate limits
+        from backend.tailoring.bullet_measurer import BulletMeasurer
+        self._measurer = BulletMeasurer(ir.layout)
 
         # Collect nearby bullets per entry for context
         entry_bullets = self._collect_entry_bullets(ir.content)
@@ -138,8 +147,31 @@ class TailoringService:
                     target_keywords=sel.get("target_keywords", [])[:5],
                 ))
 
-        # === STAGE 4: Enforce single-line bullets ===
-        if self._enforce_single_line:
+        # === STAGE 4: Enforce bullet line constraints ===
+        if self._one_line_bullets:
+            from backend.tailoring.bullet_fitter import BulletFitter
+            fitter = BulletFitter(
+                layout=ir.layout,
+                bank=bank,
+                use_llm=self._use_llm,
+            )
+            fit_report = fitter.fit_bullets(result)
+            result.fitting_report = {
+                "total": fit_report.total_bullets,
+                "overflows": fit_report.overflows_detected,
+                "fitted": fit_report.successfully_fitted,
+                "failed": fit_report.failed_to_fit,
+                "unchanged": fit_report.unchanged,
+                "all_fit": fit_report.all_fit,
+            }
+
+            # Final hard constraint validation
+            violations = fitter.validate_all_fit(result)
+            if violations:
+                result.fitting_violations = violations
+                logger.warning(f"Bullet fitting violations: {violations}")
+        elif self._enforce_single_line:
+            # Legacy character-based enforcement (fallback)
             self._enforce_bullet_length(result, bank, jd)
 
         # === STAGE 5: Keyword coverage report ===
@@ -283,7 +315,7 @@ class TailoringService:
         validator: ClaimValidator,
         entry_bullets: dict[str, list[str]],
     ) -> BulletChange:
-        """Rewrite a single bullet using planning context."""
+        """Rewrite a single bullet using full strategic context."""
         bullet_id = sel["bullet_id"]
         entry_id = sel.get("entry_id", "")
         text = sel["text"]
@@ -294,21 +326,59 @@ class TailoringService:
         # Get source facts
         facts = self._get_facts_for_bullet(bullet_id, entry_id, bank)
 
-        # Get nearby bullets for context (but don't duplicate)
+        # Get nearby bullets for context
         nearby = [b for b in entry_bullets.get(entry_id, []) if b != text][:3]
+
+        # Build strategic context from planner
+        strategy_context = ""
+        entry_context = ""
+        covered_keywords: list[str] = []
+
+        plan = getattr(self, "_plan", None)
+        if plan and plan.llm_used:
+            s = plan.strategy
+            strategy_parts = []
+            if s.jd_narrative:
+                strategy_parts.append(f"What they want: {s.jd_narrative}")
+            if s.candidate_strengths:
+                strategy_parts.append(f"Your strengths: {s.candidate_strengths}")
+            if s.gaps_to_address:
+                strategy_parts.append(f"Gaps to fill: {s.gaps_to_address}")
+            if s.tone_guidance:
+                strategy_parts.append(f"Tone: {s.tone_guidance}")
+            strategy_context = "\n".join(strategy_parts)
+
+            covered_keywords = s.keywords_already_covered or []
+
+            # Entry-specific context
+            ec = plan.entry_contexts.get(entry_id)
+            if ec:
+                entry_context = f"{ec.company} — {ec.role}\n{ec.entry_purpose}"
 
         try:
             rewriter = self._get_rewriter()
+
+            # Measure original bullet with layout engine to get real capacity
+            measurement = self._measurer.measure(text)
+            # The max chars = what fits on one line at this font/width
+            # Use the original length as floor (don't go shorter)
+            # and measure-derived capacity as ceiling (don't wrap)
+            max_single_line_chars = self._estimate_max_chars_for_one_line()
+            length_budget = min(max_single_line_chars, max(len(text), max_single_line_chars))
+
             change = rewriter.rewrite_bullet(
                 bullet_id=bullet_id,
                 bullet_text=text,
                 facts=facts,
                 jd=jd,
                 target_keywords=target_kws[:10],
-                max_chars=self._max_bullet_chars if self._enforce_single_line else None,
+                max_chars=length_budget,
                 planning_reason=planning_reason,
                 rewrite_guidance=rewrite_guidance,
                 nearby_bullets=nearby,
+                entry_context=entry_context,
+                strategy_context=strategy_context,
+                covered_keywords=covered_keywords,
             )
 
             # Validate
@@ -320,23 +390,64 @@ class TailoringService:
             elif change.tailored_text.strip() == change.original_text.strip():
                 change.action = "keep"
                 change.reason = "No improvement found"
-            elif (
-                not change.target_keywords
-                and len(change.tailored_text) < len(change.original_text) * 0.85
-            ):
+            elif len(change.tailored_text) > len(change.original_text) * 1.10:
+                # Rewrite is >10% longer — padding
                 change.tailored_text = change.original_text
                 change.action = "keep"
-                change.reason = "Rewrite shortened without adding keywords — kept original"
+                change.reason = f"Rewrite too long ({len(change.tailored_text)} vs {len(change.original_text)} chars) — reverted"
+            elif len(change.tailored_text) < len(change.original_text) * 0.80:
+                # Rewrite is >20% shorter — destructive, lost content
+                change.tailored_text = change.original_text
+                change.action = "keep"
+                change.reason = f"Rewrite too short ({len(change.tailored_text)} vs {len(change.original_text)} chars) — lost content, reverted"
             else:
-                # Validate source_fact_ids actually exist
-                fact_ids = {f["id"] for f in facts}
-                valid_ids = [fid for fid in change.source_fact_ids if fid in fact_ids]
-                change.source_fact_ids = valid_ids
+                # Check if the rewrite actually added any new words
+                orig_words = set(change.original_text.lower().split())
+                new_words = set(change.tailored_text.lower().split())
+                added_words = new_words - orig_words
+                removed_words = orig_words - new_words
 
-                # Validate target keywords are in the text
-                text_lower = change.tailored_text.lower()
-                present_kws = [kw for kw in change.target_keywords if kw.lower() in text_lower]
-                change.target_keywords = present_kws
+                if len(removed_words) > len(added_words) + 3:
+                    # Removed significantly more words than added — net loss
+                    change.tailored_text = change.original_text
+                    change.action = "keep"
+                    change.reason = f"Rewrite removed {len(removed_words)} words but only added {len(added_words)} — net loss, reverted"
+
+                # Check if the rewrite actually adds ATS value
+                # Compare JD keywords in original vs rewrite
+                if change.action != "keep":
+                    jd_kws_lower = {kw.lower() for kw in target_kws}
+                    orig_lower = change.original_text.lower()
+                    new_lower = change.tailored_text.lower()
+
+                    orig_jd_hits = {kw for kw in jd_kws_lower if kw in orig_lower}
+                    new_jd_hits = {kw for kw in jd_kws_lower if kw in new_lower}
+                    new_kw_additions = new_jd_hits - orig_jd_hits
+
+                    if len(new_kw_additions) == 0:
+                        # Rewrite doesn't add any JD keywords — pointless change
+                        change.tailored_text = change.original_text
+                        change.action = "keep"
+                        change.reason = "Rewrite adds no new JD keywords — original is better"
+
+                # Validate source_fact_ids actually exist
+                if change.action != "keep":
+                    fact_ids = {f["id"] for f in facts}
+                    valid_ids = [fid for fid in change.source_fact_ids if fid in fact_ids]
+                    change.source_fact_ids = valid_ids
+
+                    # Validate target keywords are in the text
+                    text_lower = change.tailored_text.lower()
+                    present_kws = [kw for kw in change.target_keywords if kw.lower() in text_lower]
+                    change.target_keywords = present_kws
+
+                    # Final layout check: does the rewrite fit on one line?
+                    if self._one_line_bullets:
+                        post_measurement = self._measurer.measure(change.tailored_text)
+                        if not post_measurement.fits_one_line:
+                            change.tailored_text = change.original_text
+                            change.action = "keep"
+                            change.reason = f"Rewrite wraps to {post_measurement.line_count} lines — reverted to original"
 
             return change
 
@@ -353,6 +464,39 @@ class TailoringService:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _estimate_max_chars_for_one_line(self) -> int:
+        """Use the measurer to find how many characters fit on one line.
+
+        Uses a representative English text sample (proportional font widths
+        vary by letter — 'i' is narrower than 'M') and binary searches
+        until the measurer reports wrapping.
+        Cached after first call.
+        """
+        if hasattr(self, "_max_chars_cache"):
+            return self._max_chars_cache
+
+        measurer = self._measurer
+
+        # Representative resume text with typical letter distribution
+        sample = (
+            "Developed and deployed a full-stack Python software application "
+            "with RESTful API data pipeline processing and automated testing "
+            "across multiple production environments for enterprise clients "
+        )
+
+        low, high = 80, 200
+        while low < high:
+            mid = (low + high + 1) // 2
+            test_text = (sample * 3)[:mid]
+            m = measurer.measure(test_text)
+            if m.fits_one_line:
+                low = mid
+            else:
+                high = mid - 1
+
+        self._max_chars_cache = low
+        return low
 
     def _collect_entry_bullets(self, content: ResumeContent) -> dict[str, list[str]]:
         """Build a map of entry_id -> [bullet texts] for nearby-bullet context."""
@@ -455,7 +599,7 @@ class TailoringService:
                     if change.action == "keep":
                         change.action = "rewrite"
 
-    def apply_tailoring(self, ir: ResumeIR, result: TailoringResult) -> ResumeIR:
+    def apply_tailoring(self, ir: ResumeIR, result: TailoringResult, fit_skills: bool = True) -> ResumeIR:
         """Apply tailoring result to produce a new ResumeIR."""
         new_ir = copy.deepcopy(ir)
 
@@ -503,22 +647,73 @@ class TailoringService:
 
             elif section.type == SectionType.SKILLS:
                 for cat in section.skill_categories:
+                    # Add new skills (only if accepted or not yet resolved)
                     if cat.category in result.added_skills:
                         existing = {s.lower() for s in cat.skills}
                         for new_skill in result.added_skills[cat.category]:
-                            if new_skill.lower() not in existing:
+                            key = f"{cat.category}:{new_skill}"
+                            accepted = result.additions_accepted.get(key, True)
+                            if accepted and new_skill.lower() not in existing:
                                 cat.skills.append(new_skill)
                                 existing.add(new_skill.lower())
+
+                    # Reorder skills (only if accepted or not yet resolved)
                     if cat.category in result.reordered_skills:
-                        reordered = list(result.reordered_skills[cat.category])
-                        existing_reordered = {s.lower() for s in reordered}
-                        for s in cat.skills:
-                            if s.lower() not in existing_reordered:
-                                reordered.append(s)
-                        cat.skills = reordered
+                        accepted = result.reorder_accepted.get(cat.category, True)
+                        if accepted:
+                            reordered = list(result.reordered_skills[cat.category])
+                            existing_reordered = {s.lower() for s in reordered}
+                            for s in cat.skills:
+                                if s.lower() not in existing_reordered:
+                                    reordered.append(s)
+                            cat.skills = reordered
+
+        # Ensure skills rows fit on one line — also prune the result
+        # so the UI doesn't show suggestions that got trimmed.
+        if fit_skills:
+            self._fit_skills_to_line(new_ir, result)
 
         self._sync_elements_with_content(new_ir, accepted_changes, result.reordered_skills)
         return new_ir
+
+    def _fit_skills_to_line(
+        self, ir: ResumeIR, result: Optional[TailoringResult] = None,
+    ):
+        """Trim skills rows so each fits on a single rendered line.
+
+        Skills are already ordered by relevance (most relevant first
+        after the reorder step), so we drop from the end.  Also marks
+        trimmed additions as rejected in the TailoringResult so the
+        UI stays in sync.
+        """
+        from backend.tailoring.bullet_measurer import BulletMeasurer
+
+        try:
+            measurer = BulletMeasurer(ir.layout)
+        except Exception:
+            return
+
+        for section in ir.content.sections:
+            if section.type != SectionType.SKILLS:
+                continue
+            for cat in section.skill_categories:
+                row_text = f"{cat.category}: {', '.join(cat.skills)}"
+                m = measurer.measure_line(row_text)
+                if m.fits_one_line:
+                    continue
+
+                # Remove skills from the end until it fits
+                while len(cat.skills) > 1:
+                    removed = cat.skills.pop()
+                    # Mark this addition as rejected so UI doesn't show it
+                    if result:
+                        key = f"{cat.category}:{removed}"
+                        if key not in result.additions_accepted:
+                            result.additions_accepted[key] = False
+                    row_text = f"{cat.category}: {', '.join(cat.skills)}"
+                    m = measurer.measure_line(row_text)
+                    if m.fits_one_line:
+                        break
 
     def _sync_elements_with_content(
         self, ir: ResumeIR, changes: dict[str, BulletChange],

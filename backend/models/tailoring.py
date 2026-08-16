@@ -116,13 +116,19 @@ class TailoringResult(BaseModel):
     responsibility_coverage: float = 0.0
     preferred_skill_coverage: float = 0.0
 
-    # Skills reordering
+    # Skills reordering: category -> [reordered skills]
     reordered_skills: dict[str, list[str]] = Field(default_factory=dict)
+    reorder_accepted: dict[str, bool] = Field(default_factory=dict)  # category -> accepted
 
     # Skills additions: category -> [new skills to add]
     added_skills: dict[str, list[str]] = Field(default_factory=dict)
+    additions_accepted: dict[str, bool] = Field(default_factory=dict)  # "cat:skill" -> accepted
 
     # Planning pass metadata
     planning_used: bool = False
     planning_error: Optional[str] = None
     planning_duration_ms: int = 0
+
+    # Bullet fitting report
+    fitting_report: Optional[dict] = None
+    fitting_violations: list[str] = Field(default_factory=list)

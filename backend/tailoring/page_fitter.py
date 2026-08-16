@@ -120,8 +120,18 @@ class PageFitter:
         if self._allow_removal:
             # Re-sort by relevance (lowest first)
             bullets.sort(key=lambda b: b.relevance)
+
+            # Build entry bullet counts so we never remove the last bullet
+            entry_bullet_counts = self._count_entry_bullets()
+
             for b_info in bullets:
+                entry_key = (b_info.section_idx, b_info.entry_idx, b_info.entry_type)
+                if entry_bullet_counts.get(entry_key, 0) <= 1:
+                    # Don't remove the only bullet — entry would be empty
+                    continue
+
                 self._remove_bullet(b_info)
+                entry_bullet_counts[entry_key] -= 1
                 self._report.bullets_removed.append(b_info.bullet_id)
                 self._report.actions_taken.append(
                     f"Removed bullet {b_info.bullet_id} (relevance={b_info.relevance:.2f})"
@@ -218,6 +228,18 @@ class PageFitter:
 
         return bullets
 
+    def _count_entry_bullets(self) -> dict[tuple, int]:
+        """Count current bullets per entry so we can protect single-bullet entries."""
+        counts: dict[tuple, int] = {}
+        for si, section in enumerate(self._ir.content.sections):
+            if section.type in (SectionType.EXPERIENCE, SectionType.VOLUNTEER):
+                for ei, entry in enumerate(section.experience_entries):
+                    counts[(si, ei, "experience")] = len(entry.bullets)
+            elif section.type == SectionType.PROJECTS:
+                for ei, entry in enumerate(section.project_entries):
+                    counts[(si, ei, "project")] = len(entry.bullets)
+        return counts
+
     def _shorten_text(self, text: str, target_chars: int) -> str:
         """Deterministically shorten text to target character count."""
         if len(text) <= target_chars:
@@ -242,14 +264,47 @@ class PageFitter:
         b_info.text = new_text
 
     def _remove_bullet(self, b_info: BulletInfo):
-        """Remove a bullet from the IR."""
+        """Remove a bullet from both content and layout elements."""
         section = self._ir.content.sections[b_info.section_idx]
         if b_info.entry_type == "experience":
             bullets = section.experience_entries[b_info.entry_idx].bullets
+            # Get the text before removing so we can match layout elements
+            removed_text = None
+            for b in bullets:
+                if b.id == b_info.bullet_id:
+                    removed_text = b.text
+                    break
             bullets[:] = [b for b in bullets if b.id != b_info.bullet_id]
         elif b_info.entry_type == "project":
             bullets = section.project_entries[b_info.entry_idx].bullets
+            removed_text = None
+            for b in bullets:
+                if b.id == b_info.bullet_id:
+                    removed_text = b.text
+                    break
             bullets[:] = [b for b in bullets if b.id != b_info.bullet_id]
+        else:
+            removed_text = None
+
+        # Also remove from layout elements so renderers stay in sync
+        if removed_text and self._ir.layout.elements:
+            from backend.models.resume_layout import ElementType
+            clean_prefix = removed_text[:30]
+            new_elements = []
+            removed_one = False
+            for el in self._ir.layout.elements:
+                if (
+                    not removed_one
+                    and el.element_type == ElementType.BULLET
+                ):
+                    el_text = "".join(
+                        r.text for r in el.paragraph_format.runs if not r.is_tab
+                    ).lstrip("\u2022 ").strip()
+                    if el_text[:30] == clean_prefix:
+                        removed_one = True
+                        continue
+                new_elements.append(el)
+            self._ir.layout.elements = new_elements
 
     def _compress_spacing(self):
         """Reduce spacing in layout styles."""

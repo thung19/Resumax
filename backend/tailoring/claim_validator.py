@@ -25,14 +25,29 @@ class ValidationResult:
 
 # Words that can be freely added to any software bullet — never flag these
 ALWAYS_ALLOWED = {
+    # Generic software descriptors
     "software", "application", "applications", "system", "systems",
+    "web", "web application", "web service", "web services",
+    # Action verbs
     "developed", "development", "implemented", "implementation",
     "designed", "engineered", "built", "deployed", "tested", "testing",
     "debugged", "debugging", "automated", "optimized", "maintained",
+    "architected", "integrated", "configured", "managed",
+    # Architecture / methodology
     "scalable", "production", "end-to-end", "cross-functional",
     "technical", "agile", "scrum", "utilized", "leveraged",
     "full-stack", "fullstack", "backend", "frontend",
+    "ci/cd", "devops", "microservices", "serverless",
+    # AI / ML descriptors (these describe the type of work, not a specific tool)
+    "machine learning", "ml", "ai", "llm", "llms",
+    "nlp", "natural language processing",
+    "deep learning", "neural", "embeddings", "embedding",
+    # API descriptors
+    "restful", "rest", "api", "apis", "rest api", "restful api",
+    "data pipeline", "data engineering", "etl",
+    # Collaboration
     "collaborated", "collaboration", "stakeholder",
+    "cross-functional", "team",
 }
 
 # Specific technologies that need evidence — flag if added without source support

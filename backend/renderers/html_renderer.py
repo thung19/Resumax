@@ -1,16 +1,14 @@
 """HTML Renderer.
 
 Converts a ResumeIR into an HTML/CSS page for live preview.
-Replicates the Layout Schema's exact formatting:
-- Uses detected fonts and sizes
-- Zero line spacing padding — spacers are explicit elements
-- Left/right rows via flexbox
-- Inline bullet characters, no list markup
+Derives spacing and font values from the shared element_styles module
+so the preview matches the DOCX and PDF outputs.
 """
 
 from __future__ import annotations
 
 import re
+from collections import Counter
 from html import escape
 from typing import Optional
 
@@ -20,8 +18,14 @@ from backend.models.resume_content import (
     SectionType,
 )
 from backend.models.resume_ir import ResumeIR
-from backend.models.resume_layout import ResumeLayout, StyleDef
+from backend.models.resume_layout import ElementType, ResumeLayout, StyleDef
 from backend.models.tailoring import BulletChange, TailoringResult
+from backend.renderers.element_styles import (
+    default_font_from_layout,
+    default_size_from_layout,
+    extract_formatting,
+    spacer_height_pt,
+)
 
 
 def _px(pt: float) -> str:
@@ -35,14 +39,13 @@ def _in_css(inches: float) -> str:
 def _word_diff_html(original: str, tailored: str) -> str:
     """Produce inline HTML showing word-level changes on the resume itself.
 
-    Removed words: red background + strikethrough
-    Added words: green background
+    Removed words: strikethrough with muted styling
+    Added words: highlighted background
     Unchanged words: normal
     """
     orig_words = original.split()
     tail_words = tailored.split()
 
-    # LCS to find common subsequence
     m, n = len(orig_words), len(tail_words)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
@@ -52,8 +55,6 @@ def _word_diff_html(original: str, tailored: str) -> str:
             else:
                 dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
 
-    # Backtrack to find diff
-    parts: list[str] = []
     i, j = m, n
     ops: list[tuple[str, str]] = []
     while i > 0 or j > 0:
@@ -70,6 +71,7 @@ def _word_diff_html(original: str, tailored: str) -> str:
 
     ops.reverse()
 
+    parts: list[str] = []
     for op, word in ops:
         ew = escape(word)
         if op == "keep":
@@ -90,34 +92,87 @@ class HtmlRenderer:
         self._content = ir.content
         self._layout = ir.layout
         self._styles = ir.layout.styles
+
+        # Derive values from element_styles (single source of truth)
+        self._doc_font = default_font_from_layout(ir.layout)
+        self._doc_size = default_size_from_layout(ir.layout)
+        self._spacer_pt = self._detect_spacer_height()
+        self._line_height = self._detect_line_height()
+
         # Build a bullet_id -> BulletChange map for diff highlighting
-        # Only UNRESOLVED rewrites get diff highlighting.
-        # Resolved ones (accepted or rejected) show clean text.
         self._diffs: dict[str, BulletChange] = {}
+        self._added_skills: dict[str, list[str]] = {}
+        self._reordered_categories: set[str] = set()
         if diff_changes:
             for c in diff_changes.bullet_changes:
                 if c.action == "rewrite" and not c.resolved:
                     self._diffs[c.bullet_id] = c
+            # Only highlight skills that are still pending (unresolved).
+            # Once accepted, remove the green highlight — the skill is
+            # now part of the resume and shouldn't look like a diff.
+            for cat, skills in (diff_changes.added_skills or {}).items():
+                pending_skills = []
+                for skill in skills:
+                    key = f"{cat}:{skill}"
+                    if key not in diff_changes.additions_accepted:
+                        pending_skills.append(skill)
+                if pending_skills:
+                    self._added_skills[cat] = pending_skills
+            for cat in diff_changes.reordered_skills:
+                if cat not in diff_changes.reorder_accepted:
+                    self._reordered_categories.add(cat)
+
+    # ----------------------------------------------------------
+    # Element-derived formatting (shared source of truth)
+    # ----------------------------------------------------------
+
+    def _detect_spacer_height(self) -> float:
+        """Normalised spacer height in pt, matching DOCX/PDF renderers."""
+        heights: Counter = Counter()
+        for el in self._layout.elements:
+            if el.element_type == ElementType.SPACER:
+                h = spacer_height_pt(el, self._doc_size)
+                h = round(h * 2) / 2
+                heights[h] += 1
+        if heights:
+            return heights.most_common(1)[0][0]
+        # Fallback: 5pt font single-spaced
+        return 5.0 * 1.2
+
+    def _detect_line_height(self) -> float:
+        """Line-height ratio derived from elements."""
+        for el in self._layout.elements:
+            if el.element_type in (ElementType.BULLET, ElementType.ENTRY_HEADER):
+                fmt = extract_formatting(el, self._doc_font, self._doc_size)
+                if fmt.font_size_pt > 0:
+                    return round(fmt.line_height_pt / fmt.font_size_pt, 2)
+        return 1.2
 
     def _font(self) -> str:
-        """Get primary font family."""
-        for role in ["name", "entry_header", "bullet"]:
-            s = self._styles.get(role)
-            if s and s.font.family and s.font.family.lower() not in ("arial", "minorhansi"):
-                return s.font.family
-        return "Garamond"
+        return self._doc_font
 
     def _name_size(self) -> float:
+        for el in self._layout.elements:
+            if el.element_type == ElementType.NAME:
+                fmt = extract_formatting(el, self._doc_font, self._doc_size)
+                return fmt.font_size_pt
         s = self._styles.get("name")
         return s.font.size_pt if s else 26.0
 
     def _heading_size(self) -> float:
+        for el in self._layout.elements:
+            if el.element_type == ElementType.SECTION_HEADING:
+                fmt = extract_formatting(el, self._doc_font, self._doc_size)
+                return fmt.font_size_pt
         s = self._styles.get("section_heading_with_rule") or self._styles.get("section_heading")
         return s.font.size_pt if s else 12.0
 
     def _body_size(self) -> float:
-        s = self._styles.get("bullet") or self._styles.get("entry_header")
-        return s.font.size_pt if s else 10.0
+        return self._doc_size
+
+    # ----------------------------------------------------------
+    # Render
+    # ----------------------------------------------------------
 
     def render(self) -> str:
         page = self._layout.page
@@ -125,6 +180,8 @@ class HtmlRenderer:
         body_sz = _px(self._body_size())
         name_sz = _px(self._name_size())
         heading_sz = _px(self._heading_size())
+        spacer_h = _px(self._spacer_pt)
+        lh = self._line_height
 
         css = f"""
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -142,54 +199,53 @@ body {{
   padding: {_in_css(page.margin_top_in)} {_in_css(page.margin_right_in)} {_in_css(page.margin_bottom_in)} {_in_css(page.margin_left_in)};
   font-family: '{font}', 'Times New Roman', serif;
   font-size: {body_sz};
-  line-height: 1.15;
+  line-height: {lh};
   color: #000;
 }}
 .name {{
   font-size: {name_sz};
   font-weight: bold;
   text-align: center;
-  line-height: 1.15;
+  line-height: {lh};
 }}
 .contact {{
   text-align: center;
-  line-height: 1.15;
+  line-height: {lh};
 }}
-.spacer {{ height: {_px(5)}; }}
-.spacer-sm {{ height: {_px(3)}; }}
+.spacer {{ height: {spacer_h}; }}
 .heading {{
   font-size: {heading_sz};
   font-weight: bold;
   border-bottom: 0.75pt solid #000;
   padding-bottom: 1px;
-  line-height: 1.15;
+  line-height: {lh};
 }}
 .lr {{
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  line-height: 1.15;
+  line-height: {lh};
 }}
 .lr .l {{ flex-shrink: 1; }}
 .lr .r {{ flex-shrink: 0; text-align: right; white-space: nowrap; padding-left: 8px; }}
 .bold {{ font-weight: bold; }}
 .italic {{ font-style: italic; }}
 .bullet {{
-  line-height: 1.15;
+  line-height: {lh};
 }}
 .label {{ font-weight: bold; }}
 a.hl {{ color: #1a0dab; text-decoration: underline; }}
 .diff-add {{
-  background: #d1fae5;
+  background: #c1d4c6;
   border-radius: 2px;
   padding: 0 2px;
 }}
 .diff-del {{
-  background: #fee2e2;
+  background: #d9c2c2;
   text-decoration: line-through;
   border-radius: 2px;
   padding: 0 2px;
-  color: #991b1b;
+  color: #7a5a5a;
   opacity: 0.7;
 }}
 """
@@ -208,6 +264,10 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
 </div>
 </body>
 </html>"""
+
+    # ----------------------------------------------------------
+    # Body builder
+    # ----------------------------------------------------------
 
     def _build_body(self) -> str:
         parts: list[str] = []
@@ -317,10 +377,8 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
         if e.start_date and e.end_date:
             date = f"{e.start_date} \u2013 {e.end_date}"
 
-        # Build name with optional hyperlink
         name_html = escape(e.name)
         if hasattr(e, 'url') and e.url:
-            # The name might contain "| GitHub" — make "GitHub" the link
             if "|" in e.name:
                 name_part, link_text = e.name.rsplit("|", 1)
                 link_text = link_text.strip()
@@ -342,7 +400,21 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
         return "\n".join(parts)
 
     def _render_skill(self, cat) -> str:
-        return f'<div><span class="label">{escape(cat.category)}:</span> {escape(", ".join(cat.skills))}</div>'
+        added_set = {s.lower() for s in self._added_skills.get(cat.category, [])}
+        is_reordered = cat.category in self._reordered_categories
+
+        if not added_set and not is_reordered:
+            return f'<div><span class="label">{escape(cat.category)}:</span> {escape(", ".join(cat.skills))}</div>'
+
+        skill_parts = []
+        for i, skill in enumerate(cat.skills):
+            prefix = ", " if i > 0 else ""
+            if skill.lower() in added_set:
+                skill_parts.append(f'{prefix}<span class="diff-add">{escape(skill)}</span>')
+            else:
+                skill_parts.append(f'{prefix}{escape(skill)}')
+
+        return f'<div><span class="label">{escape(cat.category)}:</span> {"".join(skill_parts)}</div>'
 
     def _render_generic(self, e) -> str:
         parts: list[str] = []
@@ -356,7 +428,6 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
         return "\n".join(parts)
 
     def _render_bullet(self, b) -> str:
-        """Render a bullet, with inline diff highlighting if a change exists."""
         change = self._diffs.get(b.id)
         if change and change.original_text != change.tailored_text:
             diff_html = _word_diff_html(change.original_text, change.tailored_text)

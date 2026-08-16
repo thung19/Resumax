@@ -238,6 +238,12 @@ class Selector:
         "strong", "good", "excellent", "proven", "demonstrated",
         "lean", "clean", "secure", "documented", "scalable",
         "modern", "new", "high", "large", "small", "fast",
+        # Soft skills — should be shown through bullet content, not listed
+        "problem-solving", "problem solving", "communication",
+        "collaboration", "team collaboration", "teamwork",
+        "leadership", "time management", "critical thinking",
+        "adaptability", "attention to detail", "interpersonal",
+        "mentoring", "analytical",
     }
 
     def _find_addable_skills(self) -> list[SkillAddition]:
@@ -347,21 +353,96 @@ class Selector:
         }
         return PROPER.get(skill.lower().strip(), skill)
 
-    def _categorize_skill(self, skill: str) -> str:
-        """Determine which skills category a new skill belongs in."""
-        sl = skill.lower()
-        lang_terms = {"python", "java", "javascript", "typescript", "c++", "sql", "r", "go", "rust"}
-        tool_terms = {"git", "docker", "jira", "postman", "vercel"}
-        infra_terms = {"aws", "gcp", "azure", "docker", "kubernetes"}
+    # Soft skills / concepts that must NOT go in Technologies
+    _SOFT_SKILLS = {
+        "problem-solving", "problem solving", "communication", "collaboration",
+        "team collaboration", "teamwork", "leadership", "time management",
+        "critical thinking", "adaptability", "attention to detail",
+        "analytical thinking", "interpersonal", "mentoring",
+        "project management", "agile", "scrum",
+    }
 
+    _CONCEPT_SKILLS = {
+        "debugging", "testing", "ci/cd", "devops", "microservices",
+        "rest apis", "rest api", "graphql", "oop", "data structures",
+        "algorithms", "design patterns", "system design",
+        "cloud computing", "distributed systems", "database design",
+        "machine learning", "deep learning", "ai/ml", "nlp",
+        "data analysis", "data engineering", "data modeling",
+        "web services", "api design",
+    }
+
+    def _categorize_skill(self, skill: str) -> str:
+        """Determine which skills category a new skill belongs in.
+
+        Matches against the candidate's existing category names,
+        and classifies soft skills away from Technologies.
+        """
+        sl = skill.lower().strip()
+
+        if sl in self._SOFT_SKILLS or sl in self._CONCEPT_SKILLS:
+            return self._find_best_category(sl, prefer="Concepts")
+
+        lang_terms = {
+            "python", "java", "javascript", "typescript", "c++", "c",
+            "sql", "r", "go", "rust", "ruby", "swift", "kotlin",
+            "html", "css", "bash", "shell", "scala", "php",
+        }
         if sl in lang_terms:
-            return "Languages"
-        if sl in infra_terms:
-            return "Tools"
-        if sl in tool_terms:
-            return "Tools"
-        # Default: Technologies for frameworks, ML, etc.
-        return "Technologies"
+            return self._find_best_category(sl, prefer="Languages")
+
+        infra_terms = {"aws", "gcp", "azure", "docker", "kubernetes", "terraform"}
+        tool_terms = {"git", "jira", "postman", "vercel", "heroku", "jenkins", "linux"}
+        if sl in infra_terms or sl in tool_terms:
+            return self._find_best_category(sl, prefer="Tools")
+
+        db_terms = {"postgresql", "mongodb", "mysql", "sqlite", "redis", "dynamodb"}
+        if sl in db_terms:
+            return self._find_best_category(sl, prefer="Databases")
+
+        return self._find_best_category(sl, prefer="Technologies")
+
+    def _find_best_category(self, skill_lower: str, prefer: str) -> str:
+        """Find the best existing category for a skill.
+
+        Checks the candidate's actual category names and picks the
+        closest match to the preferred category keyword.
+        """
+        existing_cats: list[str] = []
+        for section in self._content.sections:
+            for cat in section.skill_categories:
+                existing_cats.append(cat.category)
+
+        if not existing_cats:
+            return prefer
+
+        # Exact match
+        for cat in existing_cats:
+            if cat.lower() == prefer.lower():
+                return cat
+
+        # Fuzzy: prefer keyword in category name
+        prefer_lower = prefer.lower()
+        for cat in existing_cats:
+            cl = cat.lower()
+            if prefer_lower in cl or cl in prefer_lower:
+                return cat
+
+        # For Concepts, also try "Skills", "Technical"
+        if prefer_lower == "concepts":
+            for cat in existing_cats:
+                cl = cat.lower()
+                if any(kw in cl for kw in ("concept", "skill", "technical", "competenc")):
+                    return cat
+
+        # For Tools/Databases, try combined categories
+        if prefer_lower in ("tools", "databases"):
+            for cat in existing_cats:
+                cl = cat.lower()
+                if any(kw in cl for kw in ("tool", "database", "infrastructure")):
+                    return cat
+
+        return prefer
 
 
 def _expand_aliases_simple(keyword: str) -> set[str]:

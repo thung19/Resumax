@@ -394,14 +394,26 @@ class TailorRequest(BaseModel):
     use_llm: bool = True
     max_bullets_per_entry: int = 4
     enforce_one_page: bool = True
-    enforce_single_line_bullets: bool = True
-    max_bullet_chars: int = 0  # 0 = auto-detect from resume layout
+    one_line_bullets: bool = True  # layout-accurate one-line enforcement
+    enforce_single_line_bullets: bool = False  # legacy char-count fallback
+    max_bullet_chars: int = 0  # 0 = auto-detect (only used with legacy mode)
 
 
 class AcceptRejectRequest(BaseModel):
     bullet_id: str
     accepted: bool
     resolved: bool = True  # set to False to undo/unresolve
+
+
+class SkillChangeRequest(BaseModel):
+    change_type: str  # "reorder" | "addition"
+    category: str
+    skill: str = ""  # only for additions
+    accepted: bool
+
+
+class SkillBatchAcceptRequest(BaseModel):
+    accepted: bool = True
 
 
 @app.post("/analyze-jd")
@@ -463,6 +475,7 @@ async def tailor_resume(resume_id: str, req: TailorRequest):
     result = service.tailor(
         ir, jd, bank,
         max_bullets_per_entry=req.max_bullets_per_entry,
+        one_line_bullets=req.one_line_bullets,
         enforce_single_line=req.enforce_single_line_bullets,
         max_bullet_chars=max_chars,
     )
@@ -531,6 +544,56 @@ async def accept_reject_bullet(resume_id: str, req: AcceptRejectRequest):
     # Save updated tailored IR
     ir_path = GENERATED_DIR / f"{resume_id}_tailored_ir.json"
     ir_path.write_text(tailored_ir.model_dump_json(indent=2))
+
+    return result.model_dump()
+
+
+@app.post("/tailor/{resume_id}/skill")
+async def accept_reject_skill(resume_id: str, req: SkillChangeRequest):
+    """Accept or reject a skill change (reorder or addition)."""
+    result = _tailoring_store.get(resume_id)
+    if result is None:
+        raise HTTPException(404, "No tailoring result found")
+
+    if req.change_type == "reorder":
+        result.reorder_accepted[req.category] = req.accepted
+    elif req.change_type == "addition":
+        key = f"{req.category}:{req.skill}"
+        result.additions_accepted[key] = req.accepted
+
+    # Re-apply tailoring
+    ir = _load_ir(resume_id)
+    service = TailoringService(use_llm=False)
+    tailored_ir = service.apply_tailoring(ir, result)
+    _tailored_ir_store[resume_id] = tailored_ir
+
+    return result.model_dump()
+
+
+@app.post("/tailor/{resume_id}/skills/accept-all")
+async def accept_all_skills(resume_id: str, req: SkillBatchAcceptRequest):
+    """Accept or reject all pending skill additions and reorders at once."""
+    result = _tailoring_store.get(resume_id)
+    if result is None:
+        raise HTTPException(404, "No tailoring result found")
+
+    # Accept/reject all pending additions
+    for cat, skills in (result.added_skills or {}).items():
+        for skill in skills:
+            key = f"{cat}:{skill}"
+            if key not in result.additions_accepted:
+                result.additions_accepted[key] = req.accepted
+
+    # Accept/reject all pending reorders
+    for cat in result.reordered_skills:
+        if cat not in result.reorder_accepted:
+            result.reorder_accepted[cat] = req.accepted
+
+    # Re-apply tailoring
+    ir = _load_ir(resume_id)
+    service = TailoringService(use_llm=False)
+    tailored_ir = service.apply_tailoring(ir, result)
+    _tailored_ir_store[resume_id] = tailored_ir
 
     return result.model_dump()
 

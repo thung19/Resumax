@@ -731,9 +731,12 @@ class DocxImporter:
             role = self._classify_paragraph_role(fmt)
 
             if fmt.is_empty:
-                # Spacer paragraph — capture its font size
-                spacer_sz = None
-                if pf.runs:
+                # Spacer paragraph — capture its font size.
+                # Word stores the controlling size in pPr/rPr/w:sz
+                # (paragraph-level default run props), NOT in run elements.
+                spacer_sz = self._extract_pPr_font_size(p_elem)
+                # Fallback: check actual run elements
+                if spacer_sz is None and pf.runs:
                     for run in pf.runs:
                         if run.font_size_half_pt is not None:
                             spacer_sz = run.font_size_half_pt
@@ -785,6 +788,25 @@ class DocxImporter:
                 ))
 
         return elements
+
+    def _extract_pPr_font_size(self, p_elem: etree._Element) -> Optional[int]:
+        """Extract font size (half-points) from pPr/rPr/w:sz.
+
+        Word stores the paragraph-level default run properties here.
+        This is the controlling font size for empty (spacer) paragraphs —
+        it determines their visual height.
+        """
+        pPr = p_elem.find(qn("w:pPr"))
+        if pPr is None:
+            return None
+        rPr = pPr.find(qn("w:rPr"))
+        if rPr is None:
+            return None
+        sz = rPr.find(qn("w:sz"))
+        if sz is None:
+            return None
+        v = sz.get(qn("w:val"))
+        return int(v) if v else None
 
     def _capture_paragraph_format(
         self, p_elem: etree._Element, hyperlinks: dict[str, str]
