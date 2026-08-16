@@ -1,16 +1,16 @@
 """Claim Validator.
 
 Validates that rewritten bullets don't contain unsupported claims.
-Rejects bullets whose claims cannot be traced to source facts.
+Rejects bullets with fabricated technologies or metrics.
+Warns (but doesn't reject) when original metrics are dropped.
 
-Uses deterministic checks first, then optionally Claude for deeper validation.
+This is a thin safety net — not a quality gate.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 from backend.models.tailoring import BulletChange
 
@@ -20,6 +20,7 @@ class ValidationResult:
     """Result of validating a rewritten bullet."""
     valid: bool = True
     issues: list[str] = field(default_factory=list)
+    metric_warnings: list[str] = field(default_factory=list)
     severity: str = "ok"  # ok | warning | reject
 
 
@@ -33,12 +34,13 @@ ALWAYS_ALLOWED = {
     "designed", "engineered", "built", "deployed", "tested", "testing",
     "debugged", "debugging", "automated", "optimized", "maintained",
     "architected", "integrated", "configured", "managed",
+    "communicated", "collaborated", "coordinated",
     # Architecture / methodology
     "scalable", "production", "end-to-end", "cross-functional",
     "technical", "agile", "scrum", "utilized", "leveraged",
     "full-stack", "fullstack", "backend", "frontend",
     "ci/cd", "devops", "microservices", "serverless",
-    # AI / ML descriptors (these describe the type of work, not a specific tool)
+    # AI / ML descriptors
     "machine learning", "ml", "ai", "llm", "llms",
     "nlp", "natural language processing",
     "deep learning", "neural", "embeddings", "embedding",
@@ -46,11 +48,11 @@ ALWAYS_ALLOWED = {
     "restful", "rest", "api", "apis", "rest api", "restful api",
     "data pipeline", "data engineering", "etl",
     # Collaboration
-    "collaborated", "collaboration", "stakeholder",
+    "collaboration", "stakeholder",
     "cross-functional", "team",
 }
 
-# Specific technologies that need evidence — flag if added without source support
+# Specific technologies that need evidence
 TECH_TERMS = {
     "python", "java", "javascript", "typescript", "c++", "c#", "go", "rust",
     "ruby", "php", "swift", "kotlin", "scala", "r", "matlab",
@@ -75,7 +77,7 @@ class ClaimValidator:
     def validate(
         self,
         change: BulletChange,
-        source_facts: list[dict],  # [{id, text}]
+        source_facts: list[dict],
     ) -> ValidationResult:
         """Validate a bullet change."""
         result = ValidationResult()
@@ -88,17 +90,14 @@ class ClaimValidator:
         facts_text = " ".join(f["text"].lower() for f in source_facts)
         all_source = f"{original} {facts_text}"
 
-        # Check 1: No new technologies
+        # Check 1: No fabricated technologies
         self._check_new_technologies(rewritten, all_source, result)
 
         # Check 2: No fabricated metrics
         self._check_fabricated_metrics(rewritten, all_source, result)
 
-        # Check 3: Preserved key claims
-        self._check_preserved_claims(original, rewritten, result)
-
-        # Check 4: Reasonable length
-        self._check_length(rewritten, result)
+        # Check 3: Metric preservation (warning only, no rejection)
+        self._check_metric_preservation(original, rewritten, result)
 
         # Set severity
         if result.issues:
@@ -112,16 +111,10 @@ class ClaimValidator:
         return result
 
     def _check_new_technologies(
-        self, rewritten: str, source: str, result: ValidationResult
+        self, rewritten: str, source: str, result: ValidationResult,
     ):
-        """Check if rewritten text introduces specific technologies not in source.
-
-        Generic software terms (developed, tested, software, agile, etc.)
-        are always allowed. Only specific named technologies (Docker,
-        Kubernetes, React, etc.) are flagged when added without evidence.
-        """
+        """Reject if rewrite introduces specific technologies not in source."""
         for tech in TECH_TERMS:
-            # Skip terms that are always allowed
             if tech.lower() in ALWAYS_ALLOWED:
                 continue
 
@@ -135,43 +128,35 @@ class ClaimValidator:
 
             if in_rewrite and not in_source:
                 result.issues.append(
-                    f"[REJECT] Technology '{tech}' appears in rewrite but not in source facts"
+                    f"[REJECT] Technology '{tech}' appears in rewrite "
+                    "but not in source facts"
                 )
 
     def _check_fabricated_metrics(
-        self, rewritten: str, source: str, result: ValidationResult
+        self, rewritten: str, source: str, result: ValidationResult,
     ):
-        """Check if rewritten text introduces new metrics not in source."""
-        # Extract all numbers from rewritten
-        rewrite_numbers = set(re.findall(r"\b(\d[\d,]*)\b", rewritten))
-        source_numbers = set(re.findall(r"\b(\d[\d,]*)\b", source))
+        """Reject if rewrite introduces new metrics not in source."""
+        rewrite_numbers = set(re.findall(r"(?<!\w)(\d[\d,]*)", rewritten))
+        source_numbers = set(re.findall(r"(?<!\w)(\d[\d,]*)", source))
 
         for num in rewrite_numbers:
-            # Normalize: remove commas
             norm_num = num.replace(",", "")
-            found = False
-            for src_num in source_numbers:
-                if norm_num == src_num.replace(",", ""):
-                    found = True
-                    break
-            if not found and int(norm_num) > 1:
-                # Allow small numbers (could be generic)
-                if int(norm_num) > 10:
-                    result.issues.append(
-                        f"[REJECT] Metric '{num}' appears in rewrite but not in source facts"
-                    )
-                else:
-                    result.issues.append(
-                        f"[WARNING] Number '{num}' in rewrite not found in source — verify"
-                    )
+            found = any(
+                norm_num == src_num.replace(",", "")
+                for src_num in source_numbers
+            )
+            if not found and int(norm_num) > 10:
+                result.issues.append(
+                    f"[REJECT] Metric '{num}' appears in rewrite "
+                    "but not in source facts"
+                )
 
-    def _check_preserved_claims(
-        self, original: str, rewritten: str, result: ValidationResult
+    def _check_metric_preservation(
+        self, original: str, rewritten: str, result: ValidationResult,
     ):
-        """Warn if key claims from the original were dropped."""
-        # Check that numbers from original are preserved
-        orig_numbers = set(re.findall(r"\b(\d[\d,]*)\b", original))
-        rewrite_numbers = set(re.findall(r"\b(\d[\d,]*)\b", rewritten))
+        """Warn if key metrics from original were dropped (not a rejection)."""
+        orig_numbers = set(re.findall(r"(?<!\w)(\d[\d,]*)", original))
+        rewrite_numbers = set(re.findall(r"(?<!\w)(\d[\d,]*)", rewritten))
 
         for num in orig_numbers:
             norm = num.replace(",", "")
@@ -180,13 +165,6 @@ class ClaimValidator:
                     norm == rn.replace(",", "") for rn in rewrite_numbers
                 )
                 if not found:
-                    result.issues.append(
-                        f"[WARNING] Original metric '{num}' was dropped in rewrite"
+                    result.metric_warnings.append(
+                        f"Original metric '{num}' was dropped in rewrite"
                     )
-
-    def _check_length(self, rewritten: str, result: ValidationResult):
-        """Check if rewritten bullet is unreasonably long or short."""
-        if len(rewritten) < 20:
-            result.issues.append("[WARNING] Rewritten bullet is very short")
-        elif len(rewritten) > 300:
-            result.issues.append("[WARNING] Rewritten bullet is very long (>300 chars)")

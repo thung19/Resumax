@@ -147,11 +147,11 @@ Return a JSON object with these fields:
 
 RULES:
 - importance: 1.0 = explicitly required/emphasized, 0.7 = strongly implied, 0.4 = nice-to-have, 0.2 = barely mentioned
-- For skills: capture EVERYTHING mentioned — programming languages, frameworks, databases, cloud platforms, tools, methodologies, soft skills
+- For skills: capture named technologies, specific tools, frameworks, languages, databases, cloud platforms, and methodologies. Do NOT extract generic activity descriptions (debugging, testing, building), soft skills (communication, collaboration, problem-solving, leadership, teamwork), or common verbs as skills. If it wouldn't appear as a listed skill on a resume's Skills section, don't include it.
 - For responsibilities: extract the actual duties, not just section headers. Include responsibilities from narrative paragraphs, not only bullet points
 - For required vs preferred: classify based on the SECTION they appear in and the language used ("must have" vs "nice to have" vs "bonus")
 - For domain_knowledge: capture industry-specific knowledge (e.g., "financial services", "healthcare", "e-commerce")
-- For ats_phrases: include the exact compound phrases an ATS would scan for (e.g., "full-stack development", "RESTful APIs", "CI/CD pipelines")
+- For ats_phrases: include the exact compound phrases an ATS would scan for (e.g., "full-stack development", "RESTful APIs", "CI/CD pipelines"). Do NOT include soft skills or generic verbs as ATS phrases.
 - For key_themes: what does this role REALLY care about? (e.g., "shipping quickly", "code quality", "cross-team collaboration")
 
 Return ONLY valid JSON, no markdown code blocks."""

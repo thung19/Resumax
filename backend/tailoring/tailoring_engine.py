@@ -162,7 +162,7 @@ class TailoringEngine:
 
     def __init__(self, model: Optional[str] = None):
         self._model = model or os.environ.get(
-            "ANTHROPIC_MODEL", "claude-sonnet-4-5-20241022"
+            "ANTHROPIC_MODEL", "claude-sonnet-4-6"
         )
 
     def tailor(

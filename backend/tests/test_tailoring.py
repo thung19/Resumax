@@ -1,6 +1,7 @@
-"""Tests for the two-stage tailoring pipeline.
+"""Tests for the tailoring pipeline.
 
-Covers: planning, rewriting, validation, score merging, edge cases.
+Covers: claim validation, matcher scoring, deterministic fallback,
+user rejection, tailoring engine parsing.
 """
 
 import json
@@ -13,7 +14,6 @@ from backend.models.resume_content import (
 from backend.models.job_description import JobAnalysis, Responsibility, WeightedItem
 from backend.models.tailoring import BulletChange, ResumeBank, ExperienceBank, Fact, TailoringResult
 from backend.tailoring.claim_validator import ClaimValidator
-from backend.tailoring.planner import BulletPlan, PlanResult, ResumePlanner
 from backend.tailoring.matcher import Matcher
 
 
@@ -97,123 +97,6 @@ def _make_bank():
     )
 
 
-# --- Test: Low-keyword bullet with strong metrics is preserved ---
-
-class TestMetricsBulletPreserved:
-    def test_high_strategic_value_protects_from_removal(self):
-        """A bullet with $250M and 15% should not be removed even if keyword overlap is low."""
-        plan = PlanResult(
-            llm_used=True,
-            bullet_plans={
-                "b1": BulletPlan(
-                    bullet_id="b1",
-                    decision="remove",  # LLM suggests removal
-                    strategic_value=0.9,  # but high strategic value
-                    job_relevance=0.3,
-                    reason="Low keyword match",
-                ),
-            },
-        )
-
-        from backend.tailoring.selector import BulletSelection
-        # Simulate the merge logic
-        from backend.services.tailoring_service import TailoringService
-        service = TailoringService(use_llm=False)
-
-        from backend.tailoring.selector import SelectionResult, SkillReorder
-        sel = SelectionResult(
-            bullet_selections=[
-                BulletSelection(bullet_id="b1", entry_id="exp_1",
-                                text="Engineered a Python optimization system processing $250M+",
-                                action="rewrite", relevance_score=0.3),
-            ],
-        )
-
-        from backend.tailoring.matcher import MatchResult
-        merged = service._merge_plan_with_selection(sel, plan, MatchResult())
-
-        # Should be protected (strategic_value >= 0.6)
-        assert merged[0]["action"] == "keep"
-        assert "Protected" in merged[0]["reason"]
-
-
-# --- Test: Leadership bullet with weak keyword overlap ---
-
-class TestLeadershipBulletKept:
-    def test_leadership_bullet_not_removed(self):
-        """'Led a team of 4 engineers' shows leadership — should not be removed."""
-        content = _make_content()
-        jd = _make_jd()
-        bank = _make_bank()
-
-        matcher = Matcher(jd, content, bank)
-        match_result = matcher.match()
-
-        # b2 has "led", "team", "engineers", "deliver" — low exact keyword match
-        # but it demonstrates leadership and impact
-        b2_score = None
-        for entry_score in match_result.entry_scores:
-            for bs in entry_score.bullet_scores:
-                if bs.bullet_id == "b2":
-                    b2_score = bs
-                    break
-
-        # The bullet should have some relevance from responsibility matching
-        assert b2_score is not None
-        assert b2_score.has_metrics  # "4 engineers", "2 weeks"
-
-
-# --- Test: Irrelevant bullet removed only when over limit ---
-
-class TestIrrelevantBulletRemoval:
-    def test_irrelevant_bullet_only_removed_when_over_limit(self):
-        """'Organized office birthday parties' is irrelevant but should only be
-        removed if the entry has more bullets than max_bullets_per_entry."""
-        from backend.tailoring.selector import Selector
-
-        content = _make_content()
-        jd = _make_jd()
-        bank = _make_bank()
-
-        matcher = Matcher(jd, content, bank)
-        match_result = matcher.match()
-
-        # With max_bullets=3 (same as entry count), nothing should be removed
-        selector = Selector(jd, content, match_result, bank, max_bullets_per_entry=3)
-        result = selector.select()
-        removed = [s for s in result.bullet_selections if s.action == "remove"]
-        assert len(removed) == 0
-
-        # With max_bullets=2, the least relevant should be removed
-        selector2 = Selector(jd, content, match_result, bank, max_bullets_per_entry=2)
-        result2 = selector2.select()
-        removed2 = [s for s in result2.bullet_selections if s.action == "remove"]
-        assert len(removed2) == 1
-        assert removed2[0].bullet_id == "b3"  # the party organizer bullet
-
-
-# --- Test: Rewrite uses only supported source facts ---
-
-class TestRewriteUsesSourceFacts:
-    def test_source_fact_ids_validated(self):
-        """Rewrite output should only reference facts that actually exist."""
-        change = BulletChange(
-            bullet_id="b1",
-            original_text="Built a Python system",
-            tailored_text="Developed a Python system",
-            action="rewrite",
-            source_fact_ids=["f1", "f999_nonexistent"],
-        )
-
-        facts = [{"id": "f1", "text": "Built a Python optimization system"}]
-
-        # The service validates source_fact_ids
-        fact_ids = {f["id"] for f in facts}
-        valid_ids = [fid for fid in change.source_fact_ids if fid in fact_ids]
-        assert valid_ids == ["f1"]
-        assert "f999_nonexistent" not in valid_ids
-
-
 # --- Test: Hallucinated technology rejected ---
 
 class TestHallucinatedTechRejected:
@@ -236,120 +119,156 @@ class TestHallucinatedTechRejected:
         assert any("docker" in issue.lower() for issue in result.issues)
 
 
-# --- Test: Malformed LLM JSON falls back safely ---
+# --- Test: Fabricated metrics rejected ---
 
-class TestMalformedJsonFallback:
-    def test_truncated_json_recovery(self):
-        """Truncated JSON should be recovered via robust parsing."""
-        planner = ResumePlanner()
+class TestFabricatedMetrics:
+    def test_new_metric_rejected(self):
+        """Adding a metric not in source facts should be rejected."""
+        validator = ClaimValidator()
 
-        # Simulate truncated response
-        truncated = '[{"bullet_id": "b1", "decision": "keep", "strategic_value": 0.8, "job_relevance": 0.6, "reason": "good bullet'
-        plans = planner._parse_response(truncated)
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built a Python system",
+            tailored_text="Built a Python system serving 500 users",
+            action="rewrite",
+        )
 
-        # Should recover at least something
-        assert len(plans) >= 1
-        assert plans[0].bullet_id == "b1"
-        assert plans[0].decision == "keep"
+        facts = [{"id": "f1", "text": "Built a Python system"}]
+        result = validator.validate(change, facts)
 
-    def test_completely_broken_json(self):
-        """Completely broken JSON should return empty list."""
-        planner = ResumePlanner()
-        plans = planner._parse_response("this is not json at all")
-        assert plans == []
+        assert not result.valid
+        assert any("500" in issue for issue in result.issues)
 
 
-# --- Test: Missing API key uses deterministic analysis ---
+# --- Test: Metric preservation warning ---
 
-class TestMissingApiKey:
-    def test_planning_returns_empty_on_missing_key(self, monkeypatch):
-        """No API key should return PlanResult with error, not crash."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+class TestMetricPreservation:
+    def test_dropped_metric_warns(self):
+        """Dropping a metric from original should produce a warning, not rejection."""
+        validator = ClaimValidator()
 
-        planner = ResumePlanner()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Processed $250M in portfolios reducing risk by 15%",
+            tailored_text="Processed portfolios and reduced risk significantly",
+            action="rewrite",
+        )
+
+        facts = [{"id": "f1", "text": "Processed $250M in portfolios, reduced risk by 15%"}]
+        result = validator.validate(change, facts)
+
+        # Should be valid (no fabrication) but have warnings
+        assert result.valid
+        assert len(result.metric_warnings) > 0
+        assert any("250" in w for w in result.metric_warnings)
+
+
+# --- Test: Allowed terms don't trigger rejection ---
+
+class TestAllowedTerms:
+    def test_generic_descriptors_allowed(self):
+        """Generic terms like 'software', 'developed', 'RESTful' should never be flagged."""
+        validator = ClaimValidator()
+
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built a Python system",
+            tailored_text="Developed a Python software system with RESTful API",
+            action="rewrite",
+        )
+
+        facts = [{"id": "f1", "text": "Built a Python system with API"}]
+        result = validator.validate(change, facts)
+
+        assert result.valid
+
+
+# --- Test: Matcher direct scoring (no IMPLIES inflation) ---
+
+class TestMatcherScoring:
+    def test_bullet_with_exact_keyword_scores_high(self):
+        """A bullet containing exact JD keywords should score well."""
         content = _make_content()
         jd = _make_jd()
         bank = _make_bank()
 
-        result = planner.plan(content, jd, bank)
-        assert not result.llm_used
-        assert result.llm_error is not None
-        assert "API_KEY" in result.llm_error
-        assert len(result.bullet_plans) == 0
+        matcher = Matcher(jd, content, bank)
+        match_result = matcher.match()
 
+        # b1 mentions "Python" directly
+        b1_score = None
+        for entry_score in match_result.entry_scores:
+            for bs in entry_score.bullet_scores:
+                if bs.bullet_id == "b1":
+                    b1_score = bs
+                    break
 
-# --- Test: Planning output merged with deterministic scores ---
+        assert b1_score is not None
+        assert "python" in [k.lower() for k in b1_score.keyword_matches]
 
-class TestScoreMerging:
-    def test_combined_score_formula(self):
-        """final_score = deterministic * 0.6 + llm_job_relevance * 0.4"""
-        from backend.services.tailoring_service import TailoringService
-        from backend.tailoring.selector import BulletSelection, SelectionResult
-        from backend.tailoring.matcher import MatchResult
+    def test_irrelevant_bullet_scores_low(self):
+        """'Organized office birthday parties' has no JD keywords."""
+        content = _make_content()
+        jd = _make_jd()
+        bank = _make_bank()
 
-        service = TailoringService(use_llm=False)
+        matcher = Matcher(jd, content, bank)
+        match_result = matcher.match()
 
-        sel = SelectionResult(
-            bullet_selections=[
-                BulletSelection(
-                    bullet_id="b1", entry_id="exp_1",
-                    text="test bullet",
-                    action="rewrite", relevance_score=0.4,
-                ),
-            ],
+        b3_score = None
+        for entry_score in match_result.entry_scores:
+            for bs in entry_score.bullet_scores:
+                if bs.bullet_id == "b3":
+                    b3_score = bs
+                    break
+
+        assert b3_score is not None
+        assert b3_score.relevance_score < 0.3
+
+    def test_coverage_report(self):
+        """Matcher should report which keywords are covered vs missing."""
+        content = _make_content()
+        jd = _make_jd()
+        bank = _make_bank()
+
+        matcher = Matcher(jd, content, bank)
+        match_result = matcher.match()
+
+        # Python should be matched
+        assert "python" in [k.lower() for k in match_result.matched_keywords]
+        # Docker should be missing (not in resume)
+        docker_missing = any(
+            "docker" in k.lower()
+            for k in match_result.missing_keywords
         )
-
-        plan = PlanResult(
-            llm_used=True,
-            bullet_plans={
-                "b1": BulletPlan(
-                    bullet_id="b1",
-                    decision="rewrite",
-                    strategic_value=0.7,
-                    job_relevance=0.8,
-                    reason="Can add Python keyword",
-                    supported_target_keywords=["Python"],
-                ),
-            },
+        docker_bankable = any(
+            "docker" in k.lower()
+            for k in match_result.bankable_keywords
         )
+        assert docker_missing or docker_bankable
 
-        merged = service._merge_plan_with_selection(sel, plan, MatchResult())
 
-        expected_combined = 0.4 * 0.6 + 0.8 * 0.4  # = 0.56
-        assert abs(merged[0]["combined_score"] - expected_combined) < 0.01
-        assert merged[0]["action"] == "rewrite"
-        assert "Python" in merged[0]["target_keywords"]
+# --- Test: Metrics bullet has has_metrics flag ---
 
-    def test_llm_keep_overrides_deterministic_rewrite(self):
-        """If LLM says keep and deterministic says rewrite, trust LLM."""
-        from backend.services.tailoring_service import TailoringService
-        from backend.tailoring.selector import BulletSelection, SelectionResult
-        from backend.tailoring.matcher import MatchResult
+class TestMetricsDetection:
+    def test_metrics_detected(self):
+        """Bullets with numbers should have has_metrics=True."""
+        content = _make_content()
+        jd = _make_jd()
 
-        service = TailoringService(use_llm=False)
+        matcher = Matcher(jd, content)
+        match_result = matcher.match()
 
-        sel = SelectionResult(
-            bullet_selections=[
-                BulletSelection(
-                    bullet_id="b1", entry_id="exp_1",
-                    text="test", action="rewrite", relevance_score=0.3,
-                ),
-            ],
-        )
+        # b1 has "$250M+" and "15%"
+        b1_score = None
+        for entry_score in match_result.entry_scores:
+            for bs in entry_score.bullet_scores:
+                if bs.bullet_id == "b1":
+                    b1_score = bs
+                    break
 
-        plan = PlanResult(
-            llm_used=True,
-            bullet_plans={
-                "b1": BulletPlan(
-                    bullet_id="b1", decision="keep",
-                    strategic_value=0.8, job_relevance=0.7,
-                    reason="Already well-written",
-                ),
-            },
-        )
-
-        merged = service._merge_plan_with_selection(sel, plan, MatchResult())
-        assert merged[0]["action"] == "keep"
+        assert b1_score is not None
+        assert b1_score.has_metrics
 
 
 # --- Test: User rejection of a suggested rewrite ---
@@ -378,9 +297,108 @@ class TestUserRejection:
         )
 
         service = TailoringService(use_llm=False)
-        # Override content bullet text to match
         ir.content.sections[0].experience_entries[0].bullets[0].text = "Original bullet text"
         new_ir = service.apply_tailoring(ir, result)
 
-        # Should keep original since accepted=False
         assert new_ir.content.sections[0].experience_entries[0].bullets[0].text == "Original bullet text"
+
+
+# --- Test: Deterministic fallback when LLM unavailable ---
+
+class TestDeterministicFallback:
+    def test_no_llm_keeps_all_bullets(self):
+        """Without LLM, all bullets should be kept unchanged."""
+        from backend.services.tailoring_service import TailoringService
+
+        service = TailoringService(use_llm=False)
+        content = _make_content()
+
+        changes = service._deterministic_fallback(content)
+
+        assert len(changes) == 4  # b1, b2, b3, b4
+        for change in changes:
+            assert change.action == "keep"
+            assert change.original_text == change.tailored_text
+
+
+# --- Test: Tailoring engine JSON parsing ---
+
+class TestEngineJsonParsing:
+    def test_parse_valid_response(self):
+        """Engine should parse well-formed JSON response."""
+        from backend.tailoring.tailoring_engine import TailoringEngine
+
+        engine = TailoringEngine()
+        content = _make_content()
+
+        response = json.dumps({
+            "bullet_changes": [
+                {
+                    "bullet_id": "b1",
+                    "action": "rewrite",
+                    "new_text": "Developed a Python optimization software system processing $250M+, reducing risk by 15%",
+                    "reason": "Added 'software' descriptor",
+                    "keywords_added": ["software"],
+                },
+                {
+                    "bullet_id": "b2",
+                    "action": "keep",
+                    "reason": "Already strong",
+                },
+                {
+                    "bullet_id": "b3",
+                    "action": "remove",
+                    "reason": "Irrelevant to JD",
+                },
+            ],
+            "skill_reorders": {
+                "Languages": ["Python", "SQL", "Java"],
+            },
+            "skill_additions": {
+                "Languages": ["React"],
+            },
+        })
+
+        parsed = engine._parse_response(response, content)
+
+        # All 4 bullets should have entries (b4 gets default keep)
+        assert len(parsed["bullet_changes"]) == 4
+
+        # Check specific actions
+        by_id = {c.bullet_id: c for c in parsed["bullet_changes"]}
+        assert by_id["b1"].action == "rewrite"
+        assert "software" in by_id["b1"].tailored_text.lower()
+        assert by_id["b2"].action == "keep"
+        assert by_id["b3"].action == "remove"
+        assert by_id["b4"].action == "keep"  # default
+
+        # Check skills
+        assert parsed["skill_reorders"]["Languages"] == ["Python", "SQL", "Java"]
+        assert parsed["skill_additions"]["Languages"] == ["React"]
+
+    def test_parse_truncated_json(self):
+        """Engine should handle truncated JSON gracefully."""
+        from backend.tailoring.tailoring_engine import TailoringEngine
+
+        engine = TailoringEngine()
+        content = _make_content()
+
+        # Truncated response
+        truncated = '{"bullet_changes": [{"bullet_id": "b1", "action": "keep", "reason": "good'
+        parsed = engine._parse_response(truncated, content)
+
+        # Should still return all bullets with defaults
+        assert len(parsed["bullet_changes"]) >= 1
+
+    def test_empty_response_returns_keeps(self):
+        """Empty/broken response should default all bullets to keep."""
+        from backend.tailoring.tailoring_engine import TailoringEngine
+
+        engine = TailoringEngine()
+        content = _make_content()
+
+        parsed = engine._parse_response("not json", content)
+
+        assert len(parsed["bullet_changes"]) == 4
+        for change in parsed["bullet_changes"]:
+            assert change.action == "keep"

@@ -139,9 +139,11 @@ def _expand_aliases(keyword: str) -> set[str]:
     return {kw_lower}
 
 
-def _text_contains_keyword(text_lower: str, keyword: str) -> bool:
-    """Check if text contains a keyword via aliases OR implication."""
-    # Direct alias match
+def _text_contains_keyword_direct(text_lower: str, keyword: str) -> bool:
+    """Check if text contains a keyword via direct/alias match only.
+
+    Used for bullet scoring — no IMPLIES inflation.
+    """
     for alias in _expand_aliases(keyword):
         if len(alias) <= 2:
             if re.search(rf"\b{re.escape(alias)}\b", text_lower):
@@ -149,6 +151,16 @@ def _text_contains_keyword(text_lower: str, keyword: str) -> bool:
         else:
             if alias in text_lower:
                 return True
+    return False
+
+
+def _text_contains_keyword(text_lower: str, keyword: str) -> bool:
+    """Check if text contains a keyword via aliases OR implication.
+
+    Used for overall coverage reporting (resume-wide, not per-bullet scoring).
+    """
+    if _text_contains_keyword_direct(text_lower, keyword):
+        return True
 
     # Implication match: does the text contain evidence that proves this skill?
     kw_lower = keyword.lower().strip()
@@ -342,10 +354,10 @@ class Matcher:
 
         text_lower = _normalize(bullet.text)
 
-        # Keyword matching
+        # Keyword matching — direct/alias only (no IMPLIES inflation)
         all_skills = self._jd.all_skills_flat()
         for skill in all_skills:
-            if _text_contains_keyword(text_lower, skill.name):
+            if _text_contains_keyword_direct(text_lower, skill.name):
                 bs.keyword_matches.append(skill.name)
 
         # Responsibility matching
@@ -357,7 +369,8 @@ class Matcher:
                 if len(word) > 4 and word in text_lower
             )
             if overlap >= 2 or any(
-                _text_contains_keyword(text_lower, kw) for kw in resp.keywords
+                _text_contains_keyword_direct(text_lower, kw)
+                for kw in resp.keywords
             ):
                 bs.responsibility_matches.append(resp.text[:60])
 

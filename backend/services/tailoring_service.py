@@ -1,12 +1,11 @@
 """Tailoring Service.
 
-Two-stage LLM pipeline:
-1. Planning pass: Full resume + JD → per-bullet decisions (keep/rewrite/remove)
-2. Rewrite pass: Focused per-bullet calls with planning context
-
-Deterministic matcher/selector run first as safety baseline.
-LLM scores are merged with deterministic scores, never replace them.
-Full fallback to deterministic if LLM unavailable.
+Simplified pipeline:
+1. JD Analysis (hybrid LLM + deterministic)
+2. Matcher (deterministic coverage report)
+3. Tailoring Engine (single LLM pass — rewrites, removals, skill changes)
+4. Safety Net (fabrication check + layout fit)
+5. Skills fitting + page fitting
 """
 
 from __future__ import annotations
@@ -28,25 +27,16 @@ from backend.models.tailoring import (
 from backend.services.resume_bank_service import generate_bank_from_ir
 from backend.tailoring.claim_validator import ClaimValidator
 from backend.tailoring.matcher import Matcher
-from backend.tailoring.planner import BulletPlan, PlanResult, ResumePlanner
-from backend.tailoring.selector import Selector
+from backend.tailoring.tailoring_engine import TailoringEngine
 
 logger = logging.getLogger(__name__)
 
 
 class TailoringService:
-    """Orchestrate resume tailoring with two-stage LLM pipeline."""
+    """Orchestrate resume tailoring with unified LLM pipeline."""
 
     def __init__(self, use_llm: bool = True):
         self._use_llm = use_llm
-        self._rewriter = None
-        self._plan_result: Optional[PlanResult] = None
-
-    def _get_rewriter(self):
-        if self._rewriter is None:
-            from backend.tailoring.rewriter import BulletRewriter
-            self._rewriter = BulletRewriter()
-        return self._rewriter
 
     def analyze_jd(self, jd_text: str) -> JobAnalysis:
         """Step 1: Analyze a job description (hybrid LLM + deterministic)."""
@@ -63,428 +53,134 @@ class TailoringService:
         enforce_single_line: bool = True,
         max_bullet_chars: int = 115,
     ) -> TailoringResult:
-        """Run the full two-stage tailoring pipeline."""
+        """Run the tailoring pipeline."""
         self._one_line_bullets = one_line_bullets
-        self._enforce_single_line = enforce_single_line
-        self._max_bullet_chars = max_bullet_chars
         self._max_bullets = max_bullets_per_entry
 
         if bank is None:
             bank = generate_bank_from_ir(ir)
 
-        # === STAGE 0: Deterministic matching (always runs) ===
+        # === STAGE 1: Deterministic matching (coverage report) ===
         matcher = Matcher(jd, ir.content, bank)
         match_result = matcher.match()
 
-        # === STAGE 1: LLM planning pass (full resume evaluation) ===
-        plan = PlanResult()
-        if self._use_llm:
-            try:
-                planner = ResumePlanner()
-                plan = planner.plan(ir.content, jd, bank)
-                self._plan_result = plan
-                if plan.llm_error:
-                    logger.warning(f"Planning pass error: {plan.llm_error}")
-            except Exception as e:
-                plan.llm_error = str(e)[:200]
-                logger.warning(f"Planning pass failed: {e}")
-
-        # === STAGE 2: Merge deterministic + LLM scores, select bullets ===
-        selector = Selector(jd, ir.content, match_result, bank, max_bullets_per_entry)
-        selection = selector.select()
-
-        # Merge planning decisions with deterministic selections
-        merged_selections = self._merge_plan_with_selection(selection, plan, match_result)
-
-        # Store plan for rewriter access
-        self._plan = plan
-
-        # === STAGE 3: Rewrite selected bullets ===
-        result = TailoringResult(resume_id="", job_title=jd.job_title)
-        validator = ClaimValidator()
-
-        # Create measurer once — all rewrites use it for layout-accurate limits
+        # === STAGE 2: Compute per-bullet character budgets ===
         from backend.tailoring.bullet_measurer import BulletMeasurer
-        self._measurer = BulletMeasurer(ir.layout)
+        try:
+            measurer = BulletMeasurer(ir.layout)
+            char_budgets = self._compute_char_budgets(ir.content, measurer)
+        except Exception:
+            # Fallback: use max_bullet_chars
+            char_budgets = self._fallback_char_budgets(ir.content, max_bullet_chars)
 
-        # Collect nearby bullets per entry for context
-        entry_bullets = self._collect_entry_bullets(ir.content)
+        # === STAGE 3: Unified LLM tailoring pass ===
+        result = TailoringResult(resume_id="", job_title=jd.job_title)
 
-        for sel in merged_selections:
-            if sel["action"] == "keep":
-                result.bullet_changes.append(BulletChange(
-                    bullet_id=sel["bullet_id"],
-                    original_text=sel["text"],
-                    tailored_text=sel["text"],
-                    action="keep",
-                    reason=sel.get("reason", "High relevance"),
-                ))
-                continue
-
-            if sel["action"] == "remove":
-                result.bullet_changes.append(BulletChange(
-                    bullet_id=sel["bullet_id"],
-                    original_text=sel["text"],
-                    tailored_text=sel["text"],
-                    action="remove",
-                    reason=sel.get("reason", "Low relevance, exceeds bullet limit"),
-                ))
-                continue
-
-            # Rewrite
-            if self._use_llm:
-                change = self._rewrite_with_planning(
-                    sel, bank, jd, validator, entry_bullets
-                )
-                result.bullet_changes.append(change)
-            else:
-                result.bullet_changes.append(BulletChange(
-                    bullet_id=sel["bullet_id"],
-                    original_text=sel["text"],
-                    tailored_text=sel["text"],
-                    action="keep",
-                    reason="LLM not available",
-                    target_keywords=sel.get("target_keywords", [])[:5],
-                ))
-
-        # === STAGE 4: Enforce bullet line constraints ===
-        if self._one_line_bullets:
-            from backend.tailoring.bullet_fitter import BulletFitter
-            fitter = BulletFitter(
-                layout=ir.layout,
+        if self._use_llm:
+            engine = TailoringEngine()
+            engine_result = engine.tailor(
+                content=ir.content,
+                jd=jd,
                 bank=bank,
-                use_llm=self._use_llm,
+                covered_keywords=match_result.matched_keywords,
+                missing_keywords=match_result.missing_keywords,
+                char_budgets=char_budgets,
+                max_bullets_per_entry=max_bullets_per_entry,
             )
-            fit_report = fitter.fit_bullets(result)
-            result.fitting_report = {
-                "total": fit_report.total_bullets,
-                "overflows": fit_report.overflows_detected,
-                "fitted": fit_report.successfully_fitted,
-                "failed": fit_report.failed_to_fit,
-                "unchanged": fit_report.unchanged,
-                "all_fit": fit_report.all_fit,
-            }
 
-            # Final hard constraint validation
-            violations = fitter.validate_all_fit(result)
-            if violations:
-                result.fitting_violations = violations
-                logger.warning(f"Bullet fitting violations: {violations}")
-        elif self._enforce_single_line:
-            # Legacy character-based enforcement (fallback)
-            self._enforce_bullet_length(result, bank, jd)
+            if engine_result.llm_used:
+                result.bullet_changes = engine_result.bullet_changes
+                result.planning_used = True
+                result.planning_duration_ms = engine_result.duration_ms
 
-        # === STAGE 5: Keyword coverage report ===
+                # Skill changes from engine
+                for cat, skills in engine_result.skill_reorders.items():
+                    result.reordered_skills[cat] = skills
+                for cat, skills in engine_result.skill_additions.items():
+                    result.added_skills[cat] = skills
+            else:
+                result.planning_error = engine_result.llm_error
+                logger.warning(
+                    f"Tailoring engine failed: {engine_result.llm_error}"
+                )
+
+        # If LLM didn't produce results, fall back to deterministic keep-all
+        if not result.bullet_changes:
+            result.bullet_changes = self._deterministic_fallback(ir.content)
+
+        # === STAGE 4: Safety net ===
+        validator = ClaimValidator()
+        self._run_safety_net(result, bank, ir, validator)
+
+        # === STAGE 5: Layout fitting ===
+        if one_line_bullets:
+            try:
+                measurer_obj = BulletMeasurer(ir.layout)
+                self._enforce_line_fit(result, measurer_obj, bank)
+            except Exception as e:
+                logger.warning(f"Layout fitting skipped: {e}")
+
+        # === STAGE 6: Keyword coverage report ===
         self._build_coverage_report(result, ir, jd, match_result)
-
-        # === STAGE 6: Skills reordering + additions ===
-        for reorder in selection.skill_reorders:
-            result.reordered_skills[reorder.category] = reorder.suggested_order
-        for addition in selection.skill_additions:
-            cat = addition.category
-            if cat not in result.added_skills:
-                result.added_skills[cat] = []
-            result.added_skills[cat].append(addition.skill)
-
-        # Add planning metadata
-        result.planning_used = plan.llm_used
-        result.planning_error = plan.llm_error
-        result.planning_duration_ms = plan.duration_ms
 
         return result
 
     # ------------------------------------------------------------------
-    # Score merging
+    # Character budgets
     # ------------------------------------------------------------------
 
-    def _merge_plan_with_selection(
+    def _compute_char_budgets(
         self,
-        selection,
-        plan: PlanResult,
-        match_result,
-    ) -> list[dict]:
-        """Merge deterministic selections with LLM planning decisions.
+        content: ResumeContent,
+        measurer,
+    ) -> dict[str, tuple[int, int]]:
+        """Compute per-bullet (floor, ceiling) character budgets.
 
-        Combined score: deterministic * 0.6 + llm_job_relevance * 0.4
-        High strategic_value bullets are protected from removal.
-        Removals only happen when an entry exceeds max_bullets_per_entry.
+        Floor = 80% of original length (don't lose content).
+        Ceiling = max chars that fit on one rendered line.
         """
-        det_scores: dict[str, dict] = {}
-        for sel in selection.bullet_selections:
-            det_scores[sel.bullet_id] = {
-                "bullet_id": sel.bullet_id,
-                "entry_id": sel.entry_id,
-                "text": sel.text,
-                "action": sel.action,
-                "det_score": sel.relevance_score,
-                "target_keywords": sel.target_keywords,
-                "reason": "",
-            }
+        # Find single-line capacity via binary search
+        max_line_chars = self._find_line_capacity(measurer)
 
-        # First pass: determine ideal action for each bullet
-        merged: list[dict] = []
+        budgets: dict[str, tuple[int, int]] = {}
+        for section in content.sections:
+            for entry in section.experience_entries:
+                for b in entry.bullets:
+                    floor = int(len(b.text) * 0.80)
+                    ceiling = max_line_chars
+                    budgets[b.id] = (floor, ceiling)
+            for entry in section.project_entries:
+                for b in entry.bullets:
+                    floor = int(len(b.text) * 0.80)
+                    ceiling = max_line_chars
+                    budgets[b.id] = (floor, ceiling)
+        return budgets
 
-        for bid, det in det_scores.items():
-            llm_plan = plan.bullet_plans.get(bid)
-
-            if llm_plan:
-                det_score = det["det_score"]
-                combined = det_score * 0.6 + llm_plan.job_relevance * 0.4
-
-                if llm_plan.decision == "keep" and det["action"] == "keep":
-                    action = "keep"
-                    reason = llm_plan.reason or "High relevance"
-                elif llm_plan.decision == "rewrite":
-                    action = "rewrite"
-                    reason = llm_plan.reason
-                elif llm_plan.decision == "keep" and det["action"] == "rewrite":
-                    action = "keep"
-                    reason = llm_plan.reason or "LLM: no improvement needed"
-                elif llm_plan.decision == "remove":
-                    # Mark as removal CANDIDATE — actual removal enforced below
-                    if llm_plan.strategic_value >= 0.6:
-                        action = "keep"
-                        reason = f"Protected: strategic_value={llm_plan.strategic_value:.1f}"
-                    else:
-                        action = "remove_candidate"
-                        reason = llm_plan.reason
-                else:
-                    action = det["action"]
-                    reason = llm_plan.reason or ""
-
-                merged.append({
-                    "bullet_id": bid,
-                    "entry_id": det["entry_id"],
-                    "text": det["text"],
-                    "action": action,
-                    "combined_score": combined,
-                    "strategic_value": llm_plan.strategic_value,
-                    "reason": reason,
-                    "target_keywords": llm_plan.supported_target_keywords or det["target_keywords"],
-                    "rewrite_guidance": llm_plan.rewrite_guidance,
-                    "planning_reason": llm_plan.reason,
-                })
-            else:
-                merged.append({
-                    "bullet_id": bid,
-                    "entry_id": det["entry_id"],
-                    "text": det["text"],
-                    "action": det["action"],
-                    "combined_score": det["det_score"],
-                    "strategic_value": 0.5,
-                    "reason": "Deterministic only",
-                    "target_keywords": det["target_keywords"],
-                    "rewrite_guidance": "",
-                    "planning_reason": "",
-                })
-
-        # Second pass: enforce per-entry removal limits
-        # Only actually remove if the entry has MORE bullets than max_bullets_per_entry
-        from collections import Counter
-        entry_counts: Counter = Counter()
-        for m in merged:
-            if m["action"] != "remove_candidate":
-                entry_counts[m["entry_id"]] += 1
-
-        entry_totals: Counter = Counter(m["entry_id"] for m in merged)
-
-        for m in merged:
-            if m["action"] == "remove_candidate":
-                entry_id = m["entry_id"]
-                non_removed = entry_counts[entry_id]
-                total = entry_totals[entry_id]
-                # Only remove if entry still has more bullets than needed
-                if total > self._max_bullets and non_removed > self._max_bullets:
-                    m["action"] = "remove"
-                else:
-                    # Downgrade to keep — entry doesn't have excess bullets
-                    m["action"] = "keep"
-                    m["reason"] = f"Kept (entry has {total} bullets, limit is {self._max_bullets})"
-
-        return merged
-
-    # ------------------------------------------------------------------
-    # Rewriting with planning context
-    # ------------------------------------------------------------------
-
-    def _rewrite_with_planning(
+    def _fallback_char_budgets(
         self,
-        sel: dict,
-        bank: ResumeBank,
-        jd: JobAnalysis,
-        validator: ClaimValidator,
-        entry_bullets: dict[str, list[str]],
-    ) -> BulletChange:
-        """Rewrite a single bullet using full strategic context."""
-        bullet_id = sel["bullet_id"]
-        entry_id = sel.get("entry_id", "")
-        text = sel["text"]
-        target_kws = sel.get("target_keywords", [])
-        planning_reason = sel.get("planning_reason", "")
-        rewrite_guidance = sel.get("rewrite_guidance", "")
+        content: ResumeContent,
+        max_chars: int,
+    ) -> dict[str, tuple[int, int]]:
+        """Fallback budgets when measurer is unavailable."""
+        budgets: dict[str, tuple[int, int]] = {}
+        for section in content.sections:
+            for entry in section.experience_entries:
+                for b in entry.bullets:
+                    floor = int(len(b.text) * 0.80)
+                    budgets[b.id] = (floor, max_chars)
+            for entry in section.project_entries:
+                for b in entry.bullets:
+                    floor = int(len(b.text) * 0.80)
+                    budgets[b.id] = (floor, max_chars)
+        return budgets
 
-        # Get source facts
-        facts = self._get_facts_for_bullet(bullet_id, entry_id, bank)
-
-        # Get nearby bullets for context
-        nearby = [b for b in entry_bullets.get(entry_id, []) if b != text][:3]
-
-        # Build strategic context from planner
-        strategy_context = ""
-        entry_context = ""
-        covered_keywords: list[str] = []
-
-        plan = getattr(self, "_plan", None)
-        if plan and plan.llm_used:
-            s = plan.strategy
-            strategy_parts = []
-            if s.jd_narrative:
-                strategy_parts.append(f"What they want: {s.jd_narrative}")
-            if s.candidate_strengths:
-                strategy_parts.append(f"Your strengths: {s.candidate_strengths}")
-            if s.gaps_to_address:
-                strategy_parts.append(f"Gaps to fill: {s.gaps_to_address}")
-            if s.tone_guidance:
-                strategy_parts.append(f"Tone: {s.tone_guidance}")
-            strategy_context = "\n".join(strategy_parts)
-
-            covered_keywords = s.keywords_already_covered or []
-
-            # Entry-specific context
-            ec = plan.entry_contexts.get(entry_id)
-            if ec:
-                entry_context = f"{ec.company} — {ec.role}\n{ec.entry_purpose}"
-
-        try:
-            rewriter = self._get_rewriter()
-
-            # Measure original bullet with layout engine to get real capacity
-            measurement = self._measurer.measure(text)
-            # The max chars = what fits on one line at this font/width
-            # Use the original length as floor (don't go shorter)
-            # and measure-derived capacity as ceiling (don't wrap)
-            max_single_line_chars = self._estimate_max_chars_for_one_line()
-            length_budget = min(max_single_line_chars, max(len(text), max_single_line_chars))
-
-            change = rewriter.rewrite_bullet(
-                bullet_id=bullet_id,
-                bullet_text=text,
-                facts=facts,
-                jd=jd,
-                target_keywords=target_kws[:10],
-                max_chars=length_budget,
-                planning_reason=planning_reason,
-                rewrite_guidance=rewrite_guidance,
-                nearby_bullets=nearby,
-                entry_context=entry_context,
-                strategy_context=strategy_context,
-                covered_keywords=covered_keywords,
-            )
-
-            # Validate
-            validation = validator.validate(change, facts)
-            if not validation.valid:
-                change.tailored_text = change.original_text
-                change.action = "keep"
-                change.reason = f"Rewrite rejected: {'; '.join(validation.issues)}"
-            elif change.tailored_text.strip() == change.original_text.strip():
-                change.action = "keep"
-                change.reason = "No improvement found"
-            elif len(change.tailored_text) > len(change.original_text) * 1.10:
-                # Rewrite is >10% longer — padding
-                change.tailored_text = change.original_text
-                change.action = "keep"
-                change.reason = f"Rewrite too long ({len(change.tailored_text)} vs {len(change.original_text)} chars) — reverted"
-            elif len(change.tailored_text) < len(change.original_text) * 0.80:
-                # Rewrite is >20% shorter — destructive, lost content
-                change.tailored_text = change.original_text
-                change.action = "keep"
-                change.reason = f"Rewrite too short ({len(change.tailored_text)} vs {len(change.original_text)} chars) — lost content, reverted"
-            else:
-                # Check if the rewrite actually added any new words
-                orig_words = set(change.original_text.lower().split())
-                new_words = set(change.tailored_text.lower().split())
-                added_words = new_words - orig_words
-                removed_words = orig_words - new_words
-
-                if len(removed_words) > len(added_words) + 3:
-                    # Removed significantly more words than added — net loss
-                    change.tailored_text = change.original_text
-                    change.action = "keep"
-                    change.reason = f"Rewrite removed {len(removed_words)} words but only added {len(added_words)} — net loss, reverted"
-
-                # Check if the rewrite actually adds ATS value
-                # Compare JD keywords in original vs rewrite
-                if change.action != "keep":
-                    jd_kws_lower = {kw.lower() for kw in target_kws}
-                    orig_lower = change.original_text.lower()
-                    new_lower = change.tailored_text.lower()
-
-                    orig_jd_hits = {kw for kw in jd_kws_lower if kw in orig_lower}
-                    new_jd_hits = {kw for kw in jd_kws_lower if kw in new_lower}
-                    new_kw_additions = new_jd_hits - orig_jd_hits
-
-                    if len(new_kw_additions) == 0:
-                        # Rewrite doesn't add any JD keywords — pointless change
-                        change.tailored_text = change.original_text
-                        change.action = "keep"
-                        change.reason = "Rewrite adds no new JD keywords — original is better"
-
-                # Validate source_fact_ids actually exist
-                if change.action != "keep":
-                    fact_ids = {f["id"] for f in facts}
-                    valid_ids = [fid for fid in change.source_fact_ids if fid in fact_ids]
-                    change.source_fact_ids = valid_ids
-
-                    # Validate target keywords are in the text
-                    text_lower = change.tailored_text.lower()
-                    present_kws = [kw for kw in change.target_keywords if kw.lower() in text_lower]
-                    change.target_keywords = present_kws
-
-                    # Final layout check: does the rewrite fit on one line?
-                    if self._one_line_bullets:
-                        post_measurement = self._measurer.measure(change.tailored_text)
-                        if not post_measurement.fits_one_line:
-                            change.tailored_text = change.original_text
-                            change.action = "keep"
-                            change.reason = f"Rewrite wraps to {post_measurement.line_count} lines — reverted to original"
-
-            return change
-
-        except Exception as e:
-            logger.warning(f"Rewrite failed for {bullet_id}: {e}")
-            return BulletChange(
-                bullet_id=bullet_id,
-                original_text=text,
-                tailored_text=text,
-                action="keep",
-                reason=f"Rewrite failed: {str(e)[:100]}",
-            )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _estimate_max_chars_for_one_line(self) -> int:
-        """Use the measurer to find how many characters fit on one line.
-
-        Uses a representative English text sample (proportional font widths
-        vary by letter — 'i' is narrower than 'M') and binary searches
-        until the measurer reports wrapping.
-        Cached after first call.
-        """
-        if hasattr(self, "_max_chars_cache"):
-            return self._max_chars_cache
-
-        measurer = self._measurer
-
-        # Representative resume text with typical letter distribution
+    def _find_line_capacity(self, measurer) -> int:
+        """Binary search for how many chars fit on one rendered line."""
         sample = (
             "Developed and deployed a full-stack Python software application "
             "with RESTful API data pipeline processing and automated testing "
             "across multiple production environments for enterprise clients "
         )
-
         low, high = 80, 200
         while low < high:
             mid = (low + high + 1) // 2
@@ -494,28 +190,144 @@ class TailoringService:
                 low = mid
             else:
                 high = mid - 1
-
-        self._max_chars_cache = low
         return low
 
-    def _collect_entry_bullets(self, content: ResumeContent) -> dict[str, list[str]]:
-        """Build a map of entry_id -> [bullet texts] for nearby-bullet context."""
-        result: dict[str, list[str]] = {}
+    # ------------------------------------------------------------------
+    # Safety net
+    # ------------------------------------------------------------------
+
+    def _run_safety_net(
+        self,
+        result: TailoringResult,
+        bank: ResumeBank,
+        ir: ResumeIR,
+        validator: ClaimValidator,
+    ):
+        """Check for fabrication and metric loss. Revert bad rewrites."""
+        for change in result.bullet_changes:
+            if change.action != "rewrite":
+                continue
+
+            # Get source facts for this bullet
+            facts = self._get_facts_for_bullet(
+                change.bullet_id, bank, ir.content,
+            )
+
+            # Fabrication check
+            validation = validator.validate(change, facts)
+            if not validation.valid:
+                change.tailored_text = change.original_text
+                change.action = "keep"
+                change.reason = (
+                    f"Rewrite rejected: {'; '.join(validation.issues)}"
+                )
+                continue
+
+            # Metric preservation warning
+            if validation.metric_warnings:
+                change.reason = (
+                    (change.reason or "") +
+                    f" | WARNING: {'; '.join(validation.metric_warnings)}"
+                )
+
+    # ------------------------------------------------------------------
+    # Layout fitting
+    # ------------------------------------------------------------------
+
+    def _enforce_line_fit(
+        self,
+        result: TailoringResult,
+        measurer,
+        bank: ResumeBank,
+    ):
+        """Check each rewritten bullet fits on one line. Shorten if needed."""
+        for change in result.bullet_changes:
+            if change.action not in ("rewrite", "keep"):
+                continue
+
+            text = change.tailored_text
+            measurement = measurer.measure(text)
+
+            if measurement.fits_one_line:
+                continue
+
+            # Try shortening via LLM
+            if change.action == "rewrite":
+                try:
+                    from backend.tailoring.rewriter import BulletRewriter
+                    rewriter = BulletRewriter()
+                    facts = [{"id": "original", "text": change.original_text}]
+                    shortened = rewriter.shorten_bullet(
+                        bullet_id=change.bullet_id,
+                        bullet_text=text,
+                        facts=facts,
+                        target_lines=1,
+                        chars_per_line=len(text) - 10,  # rough target
+                    )
+                    new_m = measurer.measure(shortened.tailored_text)
+                    if new_m.fits_one_line:
+                        change.tailored_text = shortened.tailored_text
+                        change.reason = (
+                            (change.reason or "") + " | Shortened to fit line"
+                        )
+                        continue
+                except Exception:
+                    pass
+
+                # LLM shortening failed — revert to original
+                change.tailored_text = change.original_text
+                change.action = "keep"
+                change.reason = (
+                    f"Rewrite overflows line ({measurement.line_count} lines)"
+                    " — reverted"
+                )
+
+    # ------------------------------------------------------------------
+    # Deterministic fallback
+    # ------------------------------------------------------------------
+
+    def _deterministic_fallback(
+        self, content: ResumeContent,
+    ) -> list[BulletChange]:
+        """When LLM is unavailable, keep all bullets unchanged."""
+        changes: list[BulletChange] = []
         for section in content.sections:
             for entry in section.experience_entries:
-                result[entry.id] = [b.text for b in entry.bullets]
+                for b in entry.bullets:
+                    changes.append(BulletChange(
+                        bullet_id=b.id,
+                        original_text=b.text,
+                        tailored_text=b.text,
+                        action="keep",
+                        reason="LLM not available",
+                    ))
             for entry in section.project_entries:
-                result[entry.id] = [b.text for b in entry.bullets]
-        return result
+                for b in entry.bullets:
+                    changes.append(BulletChange(
+                        bullet_id=b.id,
+                        original_text=b.text,
+                        tailored_text=b.text,
+                        action="keep",
+                        reason="LLM not available",
+                    ))
+        return changes
+
+    # ------------------------------------------------------------------
+    # Keyword coverage report
+    # ------------------------------------------------------------------
 
     def _build_coverage_report(
-        self, result: TailoringResult, ir: ResumeIR,
-        jd: JobAnalysis, match_result,
+        self,
+        result: TailoringResult,
+        ir: ResumeIR,
+        jd: JobAnalysis,
+        match_result,
     ):
         """Build keyword coverage report."""
         all_jd_keywords = jd.all_keywords()
         resume_text = " ".join(
-            c.tailored_text.lower() for c in result.bullet_changes
+            c.tailored_text.lower()
+            for c in result.bullet_changes
             if c.action != "remove"
         )
         for section in ir.content.sections:
@@ -524,82 +336,53 @@ class TailoringService:
 
         for kw in all_jd_keywords[:30]:
             skill_info = next(
-                (s for s in jd.all_skills_flat() if s.name.lower() == kw.lower()), None
+                (s for s in jd.all_skills_flat()
+                 if s.name.lower() == kw.lower()),
+                None,
             )
             importance = skill_info.importance if skill_info else 0.3
 
             if kw.lower() in resume_text:
-                orig_text = " ".join(c.original_text.lower() for c in result.bullet_changes)
+                orig_text = " ".join(
+                    c.original_text.lower() for c in result.bullet_changes
+                )
                 for section in ir.content.sections:
                     for cat in section.skill_categories:
-                        orig_text += " " + " ".join(s.lower() for s in cat.skills)
+                        orig_text += " " + " ".join(
+                            s.lower() for s in cat.skills
+                        )
 
                 status = "matched" if kw.lower() in orig_text else "added"
-                source = "present in resume" if status == "matched" else "added via rewrite"
+                source = (
+                    "present in resume"
+                    if status == "matched"
+                    else "added via rewrite"
+                )
             else:
                 status = "missing"
                 source = "not in resume bank"
 
             result.keyword_coverage.append(KeywordCoverage(
-                keyword=kw, importance=importance, status=status, source=source,
+                keyword=kw,
+                importance=importance,
+                status=status,
+                source=source,
             ))
 
         result.required_skill_coverage = match_result.required_coverage
         result.technical_keyword_coverage = match_result.technical_coverage
         result.responsibility_coverage = match_result.responsibility_coverage
 
-    def _enforce_bullet_length(
-        self, result: TailoringResult, bank: ResumeBank, jd: JobAnalysis,
-    ):
-        """Shorten bullets significantly over max_bullet_chars."""
-        max_chars = self._max_bullet_chars
-        grace = 8
+    # ------------------------------------------------------------------
+    # Apply tailoring
+    # ------------------------------------------------------------------
 
-        for change in result.bullet_changes:
-            if change.action == "remove":
-                continue
-            text = change.tailored_text
-            overage = len(text) - max_chars
-            if overage <= grace:
-                continue
-
-            if self._use_llm:
-                try:
-                    rewriter = self._get_rewriter()
-                    facts = self._get_facts_for_bullet(
-                        change.bullet_id, "", bank,
-                    )
-                    if not facts:
-                        facts = [{"id": "orig", "text": text}]
-                    shortened = rewriter.shorten_bullet(
-                        bullet_id=change.bullet_id,
-                        bullet_text=text,
-                        facts=facts,
-                        target_lines=1,
-                        chars_per_line=max_chars,
-                    )
-                    new_text = shortened.tailored_text
-                    if len(new_text) <= max_chars and len(new_text) >= max_chars * 0.7:
-                        change.tailored_text = new_text
-                        change.reason = (change.reason or "") + f" | Shortened to {len(new_text)} chars"
-                        if change.action == "keep":
-                            change.action = "rewrite"
-                        continue
-                except Exception:
-                    pass
-
-            # Deterministic fallback only if significantly over
-            if overage > 20:
-                truncated = text[:max_chars]
-                last_space = truncated.rfind(" ")
-                if last_space > max_chars * 0.7:
-                    truncated = truncated[:last_space].rstrip(",;: ")
-                    change.tailored_text = truncated
-                    change.reason = (change.reason or "") + f" | Trimmed to {len(truncated)} chars"
-                    if change.action == "keep":
-                        change.action = "rewrite"
-
-    def apply_tailoring(self, ir: ResumeIR, result: TailoringResult, fit_skills: bool = True) -> ResumeIR:
+    def apply_tailoring(
+        self,
+        ir: ResumeIR,
+        result: TailoringResult,
+        fit_skills: bool = True,
+    ) -> ResumeIR:
         """Apply tailoring result to produce a new ResumeIR."""
         new_ir = copy.deepcopy(ir)
 
@@ -647,7 +430,7 @@ class TailoringService:
 
             elif section.type == SectionType.SKILLS:
                 for cat in section.skill_categories:
-                    # Add new skills (only if accepted or not yet resolved)
+                    # Add new skills
                     if cat.category in result.added_skills:
                         existing = {s.lower() for s in cat.skills}
                         for new_skill in result.added_skills[cat.category]:
@@ -657,35 +440,38 @@ class TailoringService:
                                 cat.skills.append(new_skill)
                                 existing.add(new_skill.lower())
 
-                    # Reorder skills (only if accepted or not yet resolved)
+                    # Reorder skills
                     if cat.category in result.reordered_skills:
-                        accepted = result.reorder_accepted.get(cat.category, True)
+                        accepted = result.reorder_accepted.get(
+                            cat.category, True
+                        )
                         if accepted:
-                            reordered = list(result.reordered_skills[cat.category])
-                            existing_reordered = {s.lower() for s in reordered}
+                            reordered = list(
+                                result.reordered_skills[cat.category]
+                            )
+                            existing_reordered = {
+                                s.lower() for s in reordered
+                            }
                             for s in cat.skills:
                                 if s.lower() not in existing_reordered:
                                     reordered.append(s)
                             cat.skills = reordered
 
-        # Ensure skills rows fit on one line — also prune the result
-        # so the UI doesn't show suggestions that got trimmed.
+        # Ensure skills rows fit on one line
         if fit_skills:
             self._fit_skills_to_line(new_ir, result)
 
-        self._sync_elements_with_content(new_ir, accepted_changes, result.reordered_skills)
+        self._sync_elements_with_content(
+            new_ir, accepted_changes, result.reordered_skills,
+        )
         return new_ir
 
     def _fit_skills_to_line(
-        self, ir: ResumeIR, result: Optional[TailoringResult] = None,
+        self,
+        ir: ResumeIR,
+        result: Optional[TailoringResult] = None,
     ):
-        """Trim skills rows so each fits on a single rendered line.
-
-        Skills are already ordered by relevance (most relevant first
-        after the reorder step), so we drop from the end.  Also marks
-        trimmed additions as rejected in the TailoringResult so the
-        UI stays in sync.
-        """
+        """Trim skills rows so each fits on a single rendered line."""
         from backend.tailoring.bullet_measurer import BulletMeasurer
 
         try:
@@ -702,10 +488,8 @@ class TailoringService:
                 if m.fits_one_line:
                     continue
 
-                # Remove skills from the end until it fits
                 while len(cat.skills) > 1:
                     removed = cat.skills.pop()
-                    # Mark this addition as rejected so UI doesn't show it
                     if result:
                         key = f"{cat.category}:{removed}"
                         if key not in result.additions_accepted:
@@ -716,7 +500,9 @@ class TailoringService:
                         break
 
     def _sync_elements_with_content(
-        self, ir: ResumeIR, changes: dict[str, BulletChange],
+        self,
+        ir: ResumeIR,
+        changes: dict[str, BulletChange],
         reordered_skills: dict[str, list[str]],
     ):
         """Update layout element run text to match content changes."""
@@ -725,7 +511,9 @@ class TailoringService:
         skills_texts: dict[str, str] = {}
         for section in ir.content.sections:
             for cat in section.skill_categories:
-                skills_texts[cat.category] = f"{cat.category}: " + ", ".join(cat.skills)
+                skills_texts[cat.category] = (
+                    f"{cat.category}: " + ", ".join(cat.skills)
+                )
 
         new_elements = []
         for el in ir.layout.elements:
@@ -737,7 +525,11 @@ class TailoringService:
                 matched_change = None
                 for change in changes.values():
                     clean_orig = orig_text.lstrip("• ").strip()
-                    if clean_orig and change.original_text and clean_orig[:30] == change.original_text[:30]:
+                    if (
+                        clean_orig
+                        and change.original_text
+                        and clean_orig[:30] == change.original_text[:30]
+                    ):
                         matched_change = change
                         break
 
@@ -769,7 +561,9 @@ class TailoringService:
                 ).strip()
 
                 matched_cat = None
-                for cat_name in list(reordered_skills.keys()) + list(skills_texts.keys()):
+                for cat_name in (
+                    list(reordered_skills.keys()) + list(skills_texts.keys())
+                ):
                     if orig_text.startswith(cat_name + ":"):
                         matched_cat = cat_name
                         break
@@ -778,7 +572,11 @@ class TailoringService:
                     new_text = skills_texts[matched_cat]
                     if ":" in new_text:
                         label, value = new_text.split(":", 1)
-                        first_run = el.paragraph_format.runs[0] if el.paragraph_format.runs else RunFormat()
+                        first_run = (
+                            el.paragraph_format.runs[0]
+                            if el.paragraph_format.runs
+                            else RunFormat()
+                        )
                         el.paragraph_format.runs = [
                             RunFormat(
                                 text=label + ": ",
@@ -800,11 +598,35 @@ class TailoringService:
 
         ir.layout.elements = new_elements
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def _get_facts_for_bullet(
-        self, bullet_id: str, entry_id: str, bank: ResumeBank,
+        self,
+        bullet_id: str,
+        bank: ResumeBank,
+        content: ResumeContent,
     ) -> list[dict]:
         """Get source facts for a bullet from the bank."""
-        for source in [bank.find_experience(entry_id), bank.find_project(entry_id)]:
+        # Find which entry this bullet belongs to
+        entry_id = ""
+        for section in content.sections:
+            for entry in section.experience_entries:
+                for b in entry.bullets:
+                    if b.id == bullet_id:
+                        entry_id = entry.id
+                        break
+            for entry in section.project_entries:
+                for b in entry.bullets:
+                    if b.id == bullet_id:
+                        entry_id = entry.id
+                        break
+
+        for source in [
+            bank.find_experience(entry_id),
+            bank.find_project(entry_id),
+        ]:
             if source:
                 for ab in source.approved_bullets:
                     if ab.id == bullet_id:
@@ -813,6 +635,11 @@ class TailoringService:
                             for f in source.facts
                             if f.id in ab.source_fact_ids
                         ]
-                        return matched or [{"id": f.id, "text": f.text} for f in source.facts]
-                return [{"id": f.id, "text": f.text} for f in source.facts]
+                        return matched or [
+                            {"id": f.id, "text": f.text}
+                            for f in source.facts
+                        ]
+                return [
+                    {"id": f.id, "text": f.text} for f in source.facts
+                ]
         return []
