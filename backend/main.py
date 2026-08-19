@@ -837,6 +837,38 @@ async def get_format_template(template_id: str):
     return template.model_dump()
 
 
+@app.post("/templates/apply/{resume_id}/{template_id}")
+async def apply_format_template(resume_id: str, template_id: str):
+    """Apply a format template to a resume."""
+    from backend.services.template_service import load_template, apply_template
+
+    ir = _load_ir(resume_id)
+    template = load_template(template_id)
+    if template is None:
+        raise HTTPException(404, f"Template '{template_id}' not found")
+
+    apply_template(ir, template)
+
+    # Save updated IR
+    _store[resume_id] = ir
+    ir_path = GENERATED_DIR / f"{resume_id}_ir.json"
+    ir_path.write_text(ir.model_dump_json(indent=2))
+
+    # Also update tailored IR if it exists
+    if resume_id in _tailored_ir_store:
+        tailored = _tailored_ir_store[resume_id]
+        apply_template(tailored, template)
+        tailored_path = GENERATED_DIR / f"{resume_id}_tailored_ir.json"
+        tailored_path.write_text(tailored.model_dump_json(indent=2))
+
+    return {
+        "status": "applied",
+        "template": template_id,
+        "font": template.body_font_family,
+        "size": template.body_font_size_pt,
+    }
+
+
 @app.delete("/templates/{template_id}")
 async def delete_format_template(template_id: str):
     """Delete a format template."""

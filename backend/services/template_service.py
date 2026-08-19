@@ -109,3 +109,99 @@ def delete_template(template_id: str) -> bool:
         path.unlink()
         return True
     return False
+
+
+def apply_template(ir: ResumeIR, template: FormatTemplate) -> ResumeIR:
+    """Apply a formatting template to a resume IR.
+
+    Updates fonts, sizes, spacing, margins, and spacer sizes across
+    all elements and styles while preserving content.
+    """
+    from backend.models.resume_layout import ElementType
+
+    layout = ir.layout
+
+    # Page margins
+    layout.page = template.page.model_copy()
+
+    # Normal style
+    layout.normal_style = template.normal_style.model_copy()
+
+    # Body-level settings
+    layout.body_font_family = template.body_font_family
+    layout.body_font_size_pt = template.body_font_size_pt
+    layout.body_line_spacing_val = template.body_line_spacing_val
+    layout.spacer_size_half_pt = template.spacer_size_half_pt
+
+    # Update named styles
+    for role, entry in template.styles.items():
+        style = layout.styles.get(role)
+        if style:
+            style.font.family = entry.font_family
+            style.font.size_pt = entry.font_size_pt
+            style.font.bold = entry.bold
+            style.font.italic = entry.italic
+            if entry.line_spacing is not None:
+                style.spacing.line_spacing = entry.line_spacing
+            style.indent.left_in = entry.indent_left_in
+
+    # Update all elements
+    body_font = template.body_font_family
+    body_half_pt = int(template.body_font_size_pt * 2)
+    body_line = template.body_line_spacing_val
+
+    for el in layout.elements:
+        pf = el.paragraph_format
+
+        if el.element_type == ElementType.SPACER:
+            el.spacer_size_half_pt = template.spacer_size_half_pt
+            # Update pPr font
+            pf.ppr_font_family = body_font
+            pf.ppr_font_size_half_pt = template.spacer_size_half_pt
+            continue
+
+        # Get the template style for this element type
+        role_map = {
+            ElementType.NAME: "name",
+            ElementType.CONTACT: "contact",
+            ElementType.SECTION_HEADING: (
+                "section_heading_with_rule"
+                if "section_heading_with_rule" in template.styles
+                else "section_heading"
+            ),
+            ElementType.ENTRY_HEADER: "entry_header",
+            ElementType.ENTRY_SUBHEADER: "entry_subheader",
+            ElementType.BULLET: "bullet",
+            ElementType.SKILLS_ROW: "skills_row",
+        }
+        role = role_map.get(el.element_type)
+        style_entry = template.styles.get(role) if role else None
+
+        if style_entry:
+            target_half_pt = int(style_entry.font_size_pt * 2)
+            # Update run fonts
+            for run in pf.runs:
+                if run.font_family:
+                    run.font_family = style_entry.font_family
+                if run.font_size_half_pt:
+                    run.font_size_half_pt = target_half_pt
+
+            # Update pPr font
+            pf.ppr_font_family = style_entry.font_family
+            if pf.ppr_font_size_half_pt:
+                pf.ppr_font_size_half_pt = target_half_pt
+
+            # Update line spacing
+            if pf.line_value is not None:
+                pf.line_value = body_line
+        else:
+            # Generic: update font family on all runs
+            for run in pf.runs:
+                if run.font_family:
+                    run.font_family = body_font
+
+    # Update default font
+    layout.default_font.family = body_font
+    layout.default_font.size_pt = template.body_font_size_pt
+
+    return ir

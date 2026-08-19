@@ -132,3 +132,6 @@ class TailoringResult(BaseModel):
     # Bullet fitting report
     fitting_report: Optional[dict] = None
     fitting_violations: list[str] = Field(default_factory=list)
+
+    # Debug log — tracks what the LLM returned and what the safety net did
+    debug_log: list[str] = Field(default_factory=list)

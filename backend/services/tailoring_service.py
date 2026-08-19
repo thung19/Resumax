@@ -56,13 +56,13 @@ class TailoringService:
         if bank is None:
             bank = generate_bank_from_ir(ir)
 
-        # === STAGE 1: Compute line capacity from layout ===
+        # === STAGE 1: Set up calibrated measurer ===
+        # Calibrates against original bullets — the widest one that
+        # fits on one line defines the real line capacity.
         from backend.tailoring.bullet_measurer import BulletMeasurer
         measurer = None
-        line_capacity = max_bullet_chars or 120
         try:
-            measurer = BulletMeasurer(ir.layout)
-            line_capacity = self._find_line_capacity(measurer)
+            measurer = BulletMeasurer(ir.layout, content=ir.content)
         except Exception:
             pass
 
@@ -70,12 +70,23 @@ class TailoringService:
         result = TailoringResult(resume_id="", job_title=jd.job_title)
 
         if self._use_llm:
+            # Get calibrated max chars from measurer
+            max_chars = measurer.max_chars_for_line() if measurer else 120
+            result.debug_log.append(
+                f"Line capacity: {max_chars} chars"
+                + (f", calibrated width: {measurer._calibrated_width_pt:.0f}pt"
+                   f", font: {measurer.font_name}" if measurer else "")
+            )
+
             engine = TailoringEngine()
             engine_result = engine.tailor(
                 content=ir.content,
                 jd_raw_text=jd.raw_text,
-                max_chars_per_line=line_capacity,
+                max_chars_per_line=max_chars,
                 max_bullets_per_entry=max_bullets_per_entry,
+                available_width_pt=measurer.raw_width_pt if measurer else 0,
+                font_name=measurer.font_name if measurer else "",
+                font_size=measurer.font_size if measurer else 0,
             )
 
             if engine_result.llm_used:
@@ -83,12 +94,31 @@ class TailoringService:
                 result.planning_used = True
                 result.planning_duration_ms = engine_result.duration_ms
 
+                # Log what the LLM returned
+                llm_rewrites = sum(
+                    1 for c in result.bullet_changes if c.action == "rewrite"
+                )
+                llm_keeps = sum(
+                    1 for c in result.bullet_changes if c.action == "keep"
+                )
+                llm_removes = sum(
+                    1 for c in result.bullet_changes if c.action == "remove"
+                )
+                result.debug_log.append(
+                    f"LLM returned: {llm_rewrites} rewrites, "
+                    f"{llm_keeps} keeps, {llm_removes} removes "
+                    f"({engine_result.duration_ms}ms)"
+                )
+
                 for cat, skills in engine_result.skill_reorders.items():
                     result.reordered_skills[cat] = skills
                 for cat, skills in engine_result.skill_additions.items():
                     result.added_skills[cat] = skills
             else:
                 result.planning_error = engine_result.llm_error
+                result.debug_log.append(
+                    f"LLM FAILED: {engine_result.llm_error}"
+                )
                 logger.warning(
                     f"Tailoring engine failed: {engine_result.llm_error}"
                 )
@@ -110,28 +140,6 @@ class TailoringService:
         return result
 
     # ------------------------------------------------------------------
-    # Line capacity
-    # ------------------------------------------------------------------
-
-    def _find_line_capacity(self, measurer) -> int:
-        """Binary search for how many chars fit on one rendered line."""
-        sample = (
-            "Developed and deployed a full-stack Python software application "
-            "with RESTful API data pipeline processing and automated testing "
-            "across multiple production environments for enterprise clients "
-        )
-        low, high = 80, 200
-        while low < high:
-            mid = (low + high + 1) // 2
-            test_text = (sample * 3)[:mid]
-            m = measurer.measure(test_text)
-            if m.fits_one_line:
-                low = mid
-            else:
-                high = mid - 1
-        return low
-
-    # ------------------------------------------------------------------
     # Safety net
     # ------------------------------------------------------------------
 
@@ -147,7 +155,6 @@ class TailoringService:
         # Build full resume text so validator can check skills section too
         full_resume_text = self._build_full_resume_text(ir.content)
 
-        reverted_reasons: list[str] = []
         for change in result.bullet_changes:
             if change.action != "rewrite":
                 continue
@@ -157,7 +164,9 @@ class TailoringService:
                 change.tailored_text = change.original_text
                 change.action = "keep"
                 change.reason = "No meaningful change"
-                reverted_reasons.append(f"{change.bullet_id}: identical")
+                result.debug_log.append(
+                    f"REVERTED {change.bullet_id}: identical to original"
+                )
                 continue
 
             # Rewrite only removed words without adding anything
@@ -167,7 +176,10 @@ class TailoringService:
                 change.tailored_text = change.original_text
                 change.action = "keep"
                 change.reason = "Rewrite only removed words"
-                reverted_reasons.append(f"{change.bullet_id}: only removed words")
+                result.debug_log.append(
+                    f"REVERTED {change.bullet_id}: only removed words, "
+                    f"added nothing new"
+                )
                 continue
 
             # Validate claimed keywords are actually present
@@ -188,12 +200,15 @@ class TailoringService:
             ]
             validation = validator.validate(change, facts_with_resume)
             if not validation.valid:
+                result.debug_log.append(
+                    f"REVERTED {change.bullet_id}: {'; '.join(validation.issues)}"
+                    f" | new_text: \"{change.tailored_text[:60]}...\""
+                )
                 change.tailored_text = change.original_text
                 change.action = "keep"
                 change.reason = (
                     f"Rewrite rejected: {'; '.join(validation.issues)}"
                 )
-                reverted_reasons.append(f"{change.bullet_id}: fabrication")
                 continue
 
             # Metric preservation warning
@@ -203,27 +218,206 @@ class TailoringService:
                     + f" | WARNING: {'; '.join(validation.metric_warnings)}"
                 )
 
-            # Overflow check — revert to original, don't shorten
-            if measurer:
-                measurement = measurer.measure(change.tailored_text)
-                if not measurement.fits_one_line:
-                    change.tailored_text = change.original_text
-                    change.action = "keep"
-                    change.reason = (
-                        f"Rewrite overflows line "
-                        f"({measurement.line_count} lines) — reverted"
-                    )
-                    reverted_reasons.append(
-                        f"{change.bullet_id}: overflow "
-                        f"({measurement.line_count} lines, "
-                        f"{len(change.tailored_text)} chars)"
-                    )
+            # Passed all checks (overflow handled in batch below)
+            if change.action == "rewrite":
+                result.debug_log.append(
+                    f"VALIDATED {change.bullet_id}: "
+                    f"\"{change.tailored_text[:60]}...\""
+                )
 
-        if reverted_reasons:
-            logger.warning(
-                f"Safety net reverted {len(reverted_reasons)} rewrites: "
-                + "; ".join(reverted_reasons)
+        # === Batch overflow trimming ===
+        if measurer:
+            self._batch_trim_overflows(result, measurer)
+
+        # Dedup pass: check for repeated adjectives/descriptors
+        self._dedup_adjectives(result)
+
+    def _batch_trim_overflows(self, result: TailoringResult, measurer):
+        """Batch-trim all overflowing bullets in 1-2 LLM calls."""
+        from backend.tailoring.tailoring_engine import (
+            TailoringEngine,
+            _compute_char_cap,
+        )
+
+        # Collect overflowing rewrites
+        overflow_changes: list[BulletChange] = []
+        for change in result.bullet_changes:
+            if change.action != "rewrite":
+                continue
+            measurement = measurer.measure(change.tailored_text)
+            if not measurement.fits_one_line:
+                overflow_changes.append(change)
+
+        if not overflow_changes:
+            return
+
+        trimmer = TailoringEngine()
+
+        # Up to 3 batch rounds
+        for round_num in range(3):
+            # Build batch request
+            batch_items: list[dict] = []
+            for change in overflow_changes:
+                break_idx = measurer.find_line_break(change.tailored_text)
+                char_cap = _compute_char_cap(
+                    change.tailored_text,
+                    measurer.raw_width_pt,
+                    measurer.font_name,
+                    measurer.font_size,
+                )
+                overflow_text = change.tailored_text[break_idx:]
+                measurement = measurer.measure(change.tailored_text)
+
+                result.debug_log.append(
+                    f"TRIMMING {change.bullet_id} (round {round_num + 1}): "
+                    f"{len(change.tailored_text)} chars, "
+                    f"{measurement.rendered_width_pt:.0f}pt "
+                    f"> {measurement.available_width_pt:.0f}pt "
+                    f"(char cap: {char_cap}, "
+                    f"overflow: \"{overflow_text[:30]}\")"
+                )
+
+                batch_items.append({
+                    "bullet_id": change.bullet_id,
+                    "text": change.tailored_text,
+                    "break_index": break_idx,
+                    "max_chars": char_cap,
+                    "keywords": change.target_keywords or [],
+                })
+
+            # Single LLM call for all overflowing bullets
+            trim_results = trimmer.batch_trim_bullets(
+                batch_items, is_retry=(round_num > 0),
             )
+
+            # Validate each result individually
+            still_overflowing: list[BulletChange] = []
+            for change in overflow_changes:
+                trimmed = trim_results.get(change.bullet_id)
+
+                is_final = round_num == 2
+
+                if not trimmed:
+                    result.debug_log.append(
+                        f"TRIM FAIL {change.bullet_id}: "
+                        f"round {round_num + 1} returned nothing"
+                    )
+                    if is_final:
+                        result.debug_log.append(
+                            f"REVERTED {change.bullet_id}: trim failed"
+                        )
+                        change.tailored_text = change.original_text
+                        change.action = "keep"
+                        change.reason = "Rewrite too long, trim failed"
+                    else:
+                        still_overflowing.append(change)
+                    continue
+
+                trim_m = measurer.measure(trimmed)
+                if trim_m.fits_one_line:
+                    change.tailored_text = trimmed
+                    change.reason = (
+                        (change.reason or "") + " (trimmed to fit)"
+                    )
+                    result.debug_log.append(
+                        f"TRIMMED {change.bullet_id}: "
+                        f"{len(trimmed)} chars, "
+                        f"{trim_m.rendered_width_pt:.0f}pt "
+                        f"(round {round_num + 1})"
+                    )
+                elif len(trimmed) >= len(change.tailored_text):
+                    # Stuck — no progress
+                    result.debug_log.append(
+                        f"TRIM STUCK {change.bullet_id}: "
+                        f"{len(trimmed)} chars (no progress)"
+                    )
+                    if is_final:
+                        result.debug_log.append(
+                            f"REVERTED {change.bullet_id}: trim failed"
+                        )
+                        change.tailored_text = change.original_text
+                        change.action = "keep"
+                        change.reason = "Rewrite too long, trim failed"
+                    else:
+                        still_overflowing.append(change)
+                else:
+                    # Made progress but still overflows — use shorter
+                    # text for retry
+                    change.tailored_text = trimmed
+                    result.debug_log.append(
+                        f"RETRIM {change.bullet_id}: "
+                        f"{len(trimmed)} chars, "
+                        f"{trim_m.rendered_width_pt:.0f}pt"
+                    )
+                    if is_final:
+                        result.debug_log.append(
+                            f"REVERTED {change.bullet_id}: "
+                            f"still overflows after 3 rounds"
+                        )
+                        change.tailored_text = change.original_text
+                        change.action = "keep"
+                        change.reason = "Rewrite too long, trim failed"
+                    else:
+                        still_overflowing.append(change)
+
+            # Prepare next round with only the failures
+            overflow_changes = still_overflowing
+            if not overflow_changes:
+                break
+
+        # Log accepted rewrites
+        for change in result.bullet_changes:
+            if change.action == "rewrite":
+                result.debug_log.append(
+                    f"ACCEPTED {change.bullet_id}: "
+                    f"\"{change.tailored_text[:60]}...\""
+                )
+
+    @staticmethod
+    def _dedup_adjectives(result: TailoringResult):
+        """Flag rewrites that overuse the same adjective/descriptor.
+
+        If the same descriptive word appears in 3+ rewritten bullets,
+        log a warning. Common verbs and tech terms are excluded.
+        """
+        from collections import Counter
+
+        # Words that are fine to repeat (tech terms, common verbs)
+        EXEMPT = {
+            "python", "react", "javascript", "typescript", "sql",
+            "fastapi", "node.js", "docker", "mongodb", "postgresql",
+            "api", "apis", "rest", "data", "system", "application",
+            "developed", "built", "designed", "implemented", "created",
+            "tested", "deployed", "integrated", "automated", "led",
+            "using", "with", "for", "and", "the", "across", "from",
+            "processing", "tracking", "managing", "handling",
+            "full-stack", "frontend", "backend",
+        }
+
+        word_counts: Counter = Counter()
+        word_bullets: dict[str, list[str]] = {}
+
+        for change in result.bullet_changes:
+            if change.action != "rewrite":
+                continue
+            # Find words that are NEW (not in original)
+            orig_words = set(change.original_text.lower().split())
+            new_words = set(change.tailored_text.lower().split())
+            added = new_words - orig_words
+            for word in added:
+                clean = word.strip(",.;:()")
+                if clean in EXEMPT or len(clean) <= 3:
+                    continue
+                word_counts[clean] += 1
+                word_bullets.setdefault(clean, []).append(change.bullet_id)
+
+        for word, count in word_counts.most_common(10):
+            if count >= 3:
+                bullets = word_bullets[word]
+                result.debug_log.append(
+                    f"REPEATED '{word}' added to {count} bullets: "
+                    f"{', '.join(bullets)}"
+                )
 
     # ------------------------------------------------------------------
     # Deterministic fallback
@@ -414,7 +608,7 @@ class TailoringService:
         from backend.tailoring.bullet_measurer import BulletMeasurer
 
         try:
-            measurer = BulletMeasurer(ir.layout)
+            measurer = BulletMeasurer(ir.layout, content=ir.content)
         except Exception:
             return
 

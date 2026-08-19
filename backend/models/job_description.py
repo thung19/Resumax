@@ -77,21 +77,42 @@ class JobAnalysis(BaseModel):
         return result
 
     def all_keywords(self) -> list[str]:
-        """Return all keywords for matching."""
+        """Return ATS-relevant keywords for coverage matching.
+
+        Only includes actual technology/skill names and ATS phrases.
+        Excludes themes, repeated common words, and soft skills.
+        Deduplicates by checking if one keyword contains another
+        (e.g., "full-stack" and "full-stack development" → keep shorter).
+        """
         kws: list[str] = []
+
+        # Primary: named skills
         for item in self.all_skills_flat():
             kws.append(item.name)
-        for resp in self.responsibilities:
-            kws.extend(resp.keywords)
-        for term in self.repeated_terms:
-            kws.append(term.name)
+
+        # Secondary: ATS phrases (already filtered at extraction)
         kws.extend(self.ats_phrases)
-        # Deduplicate preserving order
-        seen: set[str] = set()
+
+        # Note: responsibility keywords are NOT included here.
+        # They are often generic phrases ("user-facing features",
+        # "code quality") that inflate the keyword list without
+        # being real ATS scan terms. The skills + ATS phrases
+        # from the deterministic pass already cover the real keywords.
+
+        # Deduplicate: exact match and containment
+        seen_lower: set[str] = set()
         result: list[str] = []
         for kw in kws:
             key = kw.lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                result.append(kw)
+            if not key or key in seen_lower:
+                continue
+            # Skip if a shorter version is already present
+            # e.g., skip "full-stack development" if "full-stack" exists
+            if any(
+                existing in key and existing != key
+                for existing in seen_lower
+            ):
+                continue
+            seen_lower.add(key)
+            result.append(kw)
         return result

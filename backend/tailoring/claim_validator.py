@@ -118,10 +118,7 @@ class ClaimValidator:
             if tech.lower() in ALWAYS_ALLOWED:
                 continue
 
-            if len(tech) <= 2:
-                pattern = rf"\b{re.escape(tech)}\b"
-            else:
-                pattern = re.escape(tech)
+            pattern = rf"\b{re.escape(tech)}\b"
 
             in_rewrite = bool(re.search(pattern, rewritten, re.IGNORECASE))
             in_source = bool(re.search(pattern, source, re.IGNORECASE))

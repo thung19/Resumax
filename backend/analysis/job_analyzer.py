@@ -111,22 +111,21 @@ SOFT_SKILLS_PATTERNS = [
 ]
 
 
-LLM_JD_ANALYSIS_PROMPT = """Analyze this job description and extract structured information.
+LLM_JD_ANALYSIS_PROMPT = """Extract the technical skills and requirements from this job description.
 
 JOB DESCRIPTION:
 {jd_text}
 
-Return a JSON object with these fields:
+Return a JSON object:
 
 {{
   "job_title": "exact title from the posting",
   "company": "company name if mentioned",
   "location": "location if mentioned",
   "job_type": "internship | full-time | part-time | contract",
-  "seniority": "intern | junior | mid | senior | staff | lead | principal",
 
   "required_skills": [
-    {{"name": "skill name", "importance": 0.0-1.0, "category": "language|framework|database|infrastructure|tool|methodology|domain|soft_skill"}}
+    {{"name": "skill name", "importance": 0.0-1.0, "category": "language|framework|database|infrastructure|tool|methodology"}}
   ],
   "preferred_skills": [
     {{"name": "skill name", "importance": 0.0-1.0, "category": "..."}}
@@ -138,23 +137,26 @@ Return a JSON object with these fields:
 
   "domain_knowledge": [
     {{"name": "domain area", "importance": 0.0-1.0}}
-  ],
-
-  "key_themes": ["recurring themes or priorities in the role"],
-
-  "ats_phrases": ["exact phrases a resume scanner would match on"]
+  ]
 }}
 
-RULES:
-- importance: 1.0 = explicitly required/emphasized, 0.7 = strongly implied, 0.4 = nice-to-have, 0.2 = barely mentioned
-- For skills: capture named technologies, specific tools, frameworks, languages, databases, cloud platforms, and methodologies. Do NOT extract generic activity descriptions (debugging, testing, building), soft skills (communication, collaboration, problem-solving, leadership, teamwork), or common verbs as skills. If it wouldn't appear as a listed skill on a resume's Skills section, don't include it.
-- For responsibilities: extract the actual duties, not just section headers. Include responsibilities from narrative paragraphs, not only bullet points
-- For required vs preferred: classify based on the SECTION they appear in and the language used ("must have" vs "nice to have" vs "bonus")
-- For domain_knowledge: capture industry-specific knowledge (e.g., "financial services", "healthcare", "e-commerce")
-- For ats_phrases: include the exact compound phrases an ATS would scan for (e.g., "full-stack development", "RESTful APIs", "CI/CD pipelines"). Do NOT include soft skills or generic verbs as ATS phrases.
-- For key_themes: what does this role REALLY care about? (e.g., "shipping quickly", "code quality", "cross-team collaboration")
+CRITICAL RULES FOR SKILLS:
+- Extract ATOMIC skill names only — the exact word an ATS would scan for
+- "Python expertise" → extract "Python" (not "Python expertise")
+- "LLM technologies" → extract "LLMs" (not "LLM technologies")
+- "experience with databases" → extract "databases" or "SQL" (not "database design and management")
+- "RESTful APIs" → extract "REST APIs" (this IS an atomic ATS term)
+- "CI/CD pipelines" → extract "CI/CD" (not "CI/CD pipelines")
+- "full-stack development" → extract "full-stack" (the ATS keyword)
+- Do NOT extract soft skills (communication, problem-solving, teamwork, leadership)
+- Do NOT extract generic phrases (clean code, well-tested, modern frameworks)
+- Do NOT add "technologies", "concepts", "experience", "expertise", "skills" as suffixes
+- importance: 1.0 = explicitly required, 0.7 = strongly implied, 0.4 = nice-to-have
 
-Return ONLY valid JSON, no markdown code blocks."""
+For responsibilities: extract actual duties with technical keywords in the keywords array.
+For domain_knowledge: industry-specific areas (fintech, healthcare, e-commerce).
+
+Return ONLY valid JSON, no markdown."""
 
 
 def _normalize(text: str) -> str:
@@ -164,7 +166,9 @@ def _normalize(text: str) -> str:
 def _find_matches(text_lower: str, dictionary: set[str]) -> list[str]:
     matches = []
     for term in sorted(dictionary, key=len, reverse=True):
-        if len(term) <= 2:
+        if len(term) <= 5:
+            # Short terms need word boundaries to avoid substring matches
+            # e.g., "lean" matching inside "clean"
             pattern = rf"\b{re.escape(term)}\b"
         else:
             pattern = re.escape(term)
@@ -301,10 +305,16 @@ class JobAnalyzer:
         return keywords
 
     def _analyze_term_frequency(self, text: str, analysis: JobAnalysis):
+        """Extract frequently repeated terms, but only technical ones.
+
+        Filters out common English words, JD boilerplate, and generic
+        terms that aren't real ATS keywords.
+        """
         words = re.findall(r"\b[a-zA-Z][a-zA-Z+#.]{1,30}\b", text)
         word_counts = Counter(w.lower() for w in words)
 
         stop_words = {
+            # Common English
             "the", "and", "for", "with", "that", "this", "you", "will",
             "are", "our", "have", "from", "your", "can", "all", "about",
             "work", "team", "role", "experience", "ability", "strong",
@@ -314,10 +324,20 @@ class JobAnalyzer:
             "working", "looking", "seeking", "ideal", "candidate",
             "responsible", "required", "preferred", "minimum", "years",
             "etc", "e.g.", "i.e.",
+            # JD boilerplate
+            "skills", "knowledge", "understanding", "familiarity",
+            "expertise", "proficiency", "technologies", "concepts",
+            "modern", "clean", "scalable", "reliable", "robust",
+            "production", "complex", "based", "driven",
+            "full", "stack", "end", "cross", "self",
+            "must", "need", "like", "plus", "bonus",
+            "company", "product", "products", "services", "service",
+            "management", "building", "engineer", "engineering",
+            "development", "quality", "high", "best", "first",
         }
 
         for word, count in word_counts.most_common(50):
-            if count >= 2 and word not in stop_words and len(word) > 2:
+            if count >= 2 and word not in stop_words and len(word) > 3:
                 already = any(word == i.name.lower() for i in analysis.all_skills_flat())
                 if not already:
                     analysis.repeated_terms.append(
@@ -509,6 +529,50 @@ class JobAnalyzer:
 
         raise ValueError(f"Could not parse LLM response as JSON (length={len(text)})")
 
+    @staticmethod
+    def _clean_skill_name(name: str) -> str:
+        """Strip generic suffixes from LLM-extracted skill names.
+
+        "LLM technologies" → "LLMs"
+        "Database design and management" → "databases"
+        "Python expertise" → "Python"
+        "CI/CD pipelines" → "CI/CD"
+        """
+        import re
+        # Known mappings
+        REMAP = {
+            "llm technologies": "LLMs",
+            "llm technology": "LLMs",
+            "ai/ml concepts": "AI/ML",
+            "ai/ml technologies": "AI/ML",
+            "database design and management": "databases",
+            "database management": "databases",
+            "database design": "databases",
+            "full-stack development": "full-stack",
+            "full stack development": "full-stack",
+            "data structures and algorithms": "data structures",
+            "ci/cd pipelines": "CI/CD",
+            "restful apis": "REST APIs",
+            "restful api development": "REST APIs",
+        }
+        lower = name.lower().strip()
+        if lower in REMAP:
+            return REMAP[lower]
+
+        # Strip generic suffixes
+        SUFFIXES = [
+            " technologies", " technology", " concepts", " expertise",
+            " experience", " skills", " proficiency", " knowledge",
+            " development", " management", " pipelines", " services",
+        ]
+        for suffix in SUFFIXES:
+            if lower.endswith(suffix):
+                stripped = name[: len(name) - len(suffix)].strip()
+                if len(stripped) > 1:
+                    return stripped
+
+        return name
+
     def _merge_llm_results(self, llm_data: dict, analysis: JobAnalysis):
         """Merge LLM analysis into the deterministic baseline.
 
@@ -537,7 +601,7 @@ class JobAnalyzer:
         existing_names = {s.name.lower() for s in analysis.all_skills_flat()}
 
         for skill_data in llm_data.get("required_skills", []):
-            name = skill_data.get("name", "")
+            name = self._clean_skill_name(skill_data.get("name", ""))
             importance = skill_data.get("importance", 0.7)
             category = skill_data.get("category", "")
 
@@ -564,7 +628,7 @@ class JobAnalyzer:
 
         # Merge preferred skills
         for skill_data in llm_data.get("preferred_skills", []):
-            name = skill_data.get("name", "")
+            name = self._clean_skill_name(skill_data.get("name", ""))
             importance = skill_data.get("importance", 0.4)
             category = skill_data.get("category", "")
 
@@ -607,20 +671,9 @@ class JobAnalyzer:
                     WeightedItem(name=name, importance=dk_data.get("importance", 0.4), category="domain")
                 )
 
-        # Merge ATS phrases
-        existing_ats = {p.lower() for p in analysis.ats_phrases}
-        for phrase in llm_data.get("ats_phrases", []):
-            if phrase.lower() not in existing_ats:
-                analysis.ats_phrases.append(phrase)
-                existing_ats.add(phrase.lower())
-
-        # Add key themes as repeated terms
-        for theme in llm_data.get("key_themes", []):
-            theme_lower = theme.lower()
-            if not any(t.name.lower() == theme_lower for t in analysis.repeated_terms):
-                analysis.repeated_terms.append(
-                    WeightedItem(name=theme, importance=0.6, category="theme")
-                )
+        # Note: ATS phrases and key_themes are no longer extracted
+        # by the LLM prompt. The deterministic pass builds ATS phrases
+        # from detected skills, which is sufficient.
 
     def _find_existing_skill(self, analysis: JobAnalysis, name_lower: str) -> Optional[WeightedItem]:
         """Find an existing skill by name across all categories."""

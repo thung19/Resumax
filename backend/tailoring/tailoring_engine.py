@@ -40,20 +40,20 @@ class TailoringEngineResult:
 # Prompt
 # ---------------------------------------------------------------------------
 
-TAILORING_SYSTEM = """You are a resume ATS optimization expert. You will receive a full resume and a full job description. Your job is to make small, surgical changes to improve ATS keyword matching while keeping the resume honest and natural.
+TAILORING_SYSTEM = """You are an expert resume writer optimizing for ATS (Applicant Tracking Systems). You read job descriptions carefully — not just the skills list, but the language, verbs, and phrasing the company uses — and mirror that language in the resume.
 
-RULES:
-1. Each bullet must NOT exceed the max character limit shown. You may use any length up to that limit — shorter is fine if the phrasing is better, but use the space if you can fit a keyword.
-2. Change 1-5 words per bullet. Think word swaps and small insertions, not full rewrites.
-3. PRESERVE all numbers, metrics, percentages, and dollar amounts exactly.
-4. Do NOT invent specific named technologies (Docker, Kubernetes, etc.) the candidate never used. You MAY add descriptors, framing words, and reasonable inferences from the candidate's actual work.
-5. Spread different JD keywords across different bullets — don't cram the same keyword everywhere.
-6. For skills: reorder to put JD-relevant skills first. Add technical concepts (LLMs, Embeddings, RAG, CI/CD) the candidate demonstrably used — never add soft skills as listed skills.
+Changes made should improve the resume bullet points by adding JD keywords or better matching the job description. You never fabricate technologies the candidate didn't use, and you never drop metrics or numbers. You distribute different JD keywords across different bullets for broad coverage.
 
-Return ONLY valid JSON, no markdown."""
+IMPORTANT: Vary your language across bullets. Do not add the same adjective (e.g., "modular", "reusable", "scalable") to more than 2 bullets. Each bullet should add a DIFFERENT JD keyword or phrase. If the JD says "modular, reusable code", put "modular" in one bullet and "reusable" in another — not both in every bullet.
+
+Return ONLY valid JSON."""
 
 
-TAILORING_USER_TEMPLATE = """Improve this resume to match the job description for ATS. For every bullet point, tell me what the new version should be. Each bullet has a max character limit — do not exceed it.
+TAILORING_USER_TEMPLATE = """Here is a job description and a resume. Tell me which bullet points you would change to better match this JD for ATS, and what the new versions should be.
+
+Each bullet shows (current/max chars). Your rewrite MUST NOT exceed the max chars shown — this is a hard limit based on the page layout. If your rewrite would be longer, rephrase it more concisely. It is better to add fewer keywords than to exceed the limit.
+
+Read the JD carefully. Pay attention to the specific language, terminology, and qualities the company emphasizes — then mirror that language in the resume bullets. If a bullet is already well-matched to the JD, keep it as-is.
 
 JOB DESCRIPTION:
 {jd_text}
@@ -61,38 +61,59 @@ JOB DESCRIPTION:
 RESUME:
 {resume_text}
 
-For EVERY bullet, return an entry in the JSON below. Change as many bullets as you can to better match the JD — even small 1-2 word swaps count. Look for opportunities like:
-- Add a JD verb: "Built" → "Built and tested", "Designed" → "Designed and deployed"
-- Add a JD descriptor: "API pipelines" → "reliable API pipelines", "REST API" → "scalable REST API"
-- Swap for JD terms: "collaborated" → "cross-functional collaboration", "app" → "application", "NoSQL models" → "database models"
-- Add framing: "solving complex tradeoffs", "through iterative collaboration"
-
-Return a JSON object:
+Return a JSON object with entries for every bullet:
 {{
   "bullet_changes": [
     {{
-      "bullet_id": "the bullet ID",
+      "bullet_id": "the ID shown in brackets",
       "action": "keep" | "rewrite" | "remove",
-      "new_text": "rewritten text (only if action is rewrite)",
-      "reason": "what changed and why",
-      "keywords_added": ["JD keywords now present that weren't before"]
+      "new_text": "the improved bullet text (if rewrite)",
+      "reason": "what you changed and why",
+      "keywords_added": ["JD terms now in this bullet"]
     }}
   ],
   "skill_reorders": {{
-    "Category Name": ["skill1 in new order", "skill2", "skill3"]
+    "Category Name": ["reordered skills, JD-relevant first"]
   }},
   "skill_additions": {{
-    "Category Name": ["NewSkill1", "NewSkill2"]
+    "Category Name": ["TechSkill the candidate demonstrably used"]
   }}
 }}
 
-Include ALL bullets — use "keep" only if the bullet truly cannot be improved for this JD.
-For removals: only remove if an entry has more than {max_bullets} bullets AND the bullet is irrelevant.
-Only include skill categories you are reordering or adding to."""
+For skill_additions: only add technologies/concepts (LLMs, RAG, CI/CD, etc.) the candidate clearly used. Never add soft skills.
+Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bullet is irrelevant."""
 
 
-def _build_resume_text(content: ResumeContent, max_chars: int) -> str:
-    """Build resume text with bullet IDs and max character limit."""
+def _compute_char_cap(
+    text: str,
+    available_width_pt: float,
+    font_name: str,
+    font_size: float,
+) -> int:
+    """Compute how many chars fit on one line for text with this character mix."""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    if not text:
+        return 120
+    text_width = stringWidth(text, font_name, font_size)
+    if text_width <= 0:
+        return 120
+    avg_char_width = text_width / len(text)
+    # Subtract bullet prefix width
+    prefix_width = stringWidth("\u2022 ", font_name, font_size)
+    usable = available_width_pt - prefix_width
+    return max(40, int(usable / avg_char_width))
+
+
+def _build_resume_text(
+    content: ResumeContent,
+    max_chars: int,
+    available_width_pt: float = 0,
+    font_name: str = "",
+    font_size: float = 0,
+) -> str:
+    """Build resume text with bullet IDs and per-bullet char caps."""
+    use_per_bullet = available_width_pt > 0 and font_name and font_size > 0
     parts: list[str] = []
 
     for section in content.sections:
@@ -106,9 +127,11 @@ def _build_resume_text(content: ResumeContent, max_chars: int) -> str:
             parts.append(f"\n{entry.company}{date}")
             parts.append(f"{entry.role} | {entry.location or ''}")
             for b in entry.bullets:
-                parts.append(
-                    f"  [{b.id}] (max {max_chars} chars) {b.text}"
+                cap = (
+                    _compute_char_cap(b.text, available_width_pt, font_name, font_size)
+                    if use_per_bullet else max_chars
                 )
+                parts.append(f"  [{b.id}] ({len(b.text)}/{cap} chars) {b.text}")
 
         for entry in section.education_entries:
             parts.append(f"\n{entry.institution}")
@@ -118,9 +141,11 @@ def _build_resume_text(content: ResumeContent, max_chars: int) -> str:
         for entry in section.project_entries:
             parts.append(f"\n{entry.name}")
             for b in entry.bullets:
-                parts.append(
-                    f"  [{b.id}] (max {max_chars} chars) {b.text}"
+                cap = (
+                    _compute_char_cap(b.text, available_width_pt, font_name, font_size)
+                    if use_per_bullet else max_chars
                 )
+                parts.append(f"  [{b.id}] ({len(b.text)}/{cap} chars) {b.text}")
 
         for cat in section.skill_categories:
             parts.append(f"{cat.category}: {', '.join(cat.skills)}")
@@ -142,6 +167,9 @@ class TailoringEngine:
         jd_raw_text: str,
         max_chars_per_line: int = 120,
         max_bullets_per_entry: int = 4,
+        available_width_pt: float = 0,
+        font_name: str = "",
+        font_size: float = 0,
     ) -> TailoringEngineResult:
         """Run the unified tailoring pass."""
         result = TailoringEngineResult()
@@ -157,8 +185,13 @@ class TailoringEngine:
             result.llm_error = "anthropic package not installed"
             return result
 
-        # Build prompt
-        resume_text = _build_resume_text(content, max_chars_per_line)
+        # Build prompt with per-bullet char caps
+        resume_text = _build_resume_text(
+            content, max_chars_per_line,
+            available_width_pt=available_width_pt,
+            font_name=font_name,
+            font_size=font_size,
+        )
 
         user_msg = TAILORING_USER_TEMPLATE.format(
             jd_text=jd_raw_text,
@@ -209,6 +242,130 @@ class TailoringEngine:
             logger.warning(f"Tailoring engine failed: {e}")
 
         return result
+
+    def batch_trim_bullets(
+        self,
+        bullets: list[dict],
+        is_retry: bool = False,
+    ) -> dict[str, Optional[str]]:
+        """Trim multiple overflowing bullets in a single LLM call.
+
+        bullets: list of dicts with keys:
+            - bullet_id: str
+            - text: str (current bullet text)
+            - break_index: int (where the line overflows)
+            - max_chars: int (per-bullet char cap)
+            - keywords: list[str] (keywords to preserve)
+        is_retry: if True, nudge toward rephrasing rather than just trimming.
+
+        Returns: dict mapping bullet_id → trimmed text (or None if failed).
+        """
+        if not bullets:
+            return {}
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            return {b["bullet_id"]: None for b in bullets}
+
+        try:
+            import anthropic
+        except ImportError:
+            return {b["bullet_id"]: None for b in bullets}
+
+        # Build per-bullet entries
+        entries: list[str] = []
+        for b in bullets:
+            fits = b["text"][:b["break_index"]]
+            overflows = b["text"][b["break_index"]:]
+            chars_over = len(b["text"]) - b["max_chars"]
+            kw_text = ", ".join(b["keywords"]) if b["keywords"] else "the key terms"
+            entries.append(
+                f"[{b['bullet_id']}] (max {b['max_chars']} chars, "
+                f"currently {len(b['text'])}, cut at least {chars_over})\n"
+                f"  Keep: {kw_text}\n"
+                f"  {fits}|{overflows}"
+            )
+
+        retry_hint = (
+            " These bullets were already trimmed once but are still too long. "
+            "You MUST make each one shorter — use fewer words, "
+            "swap long phrases for concise ones, or rephrase entirely."
+        ) if is_retry else ""
+
+        prompt = (
+            f"These resume bullets are too long for one line each. "
+            f"For each bullet, the | marks where the line overflows — "
+            f"everything after the | spills to a second line.{retry_hint}\n\n"
+            + "\n\n".join(entries)
+            + "\n\nRewrite each bullet so it fits BEFORE the | mark. "
+            f"Each bullet MUST be within its stated max chars. "
+            f"Keep all numbers, metrics, and the listed keywords. "
+            f"Compress, remove filler, or rephrase to be shorter. "
+            f"Vary your language — don't add the same word to multiple bullets.\n\n"
+            f"Return ONLY a JSON object:\n"
+            f'{{"trimmed": {{'
+            f'"bullet_id": "shortened text", ...}}}}'
+        )
+
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=self._model,
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = None
+            for block in response.content:
+                if hasattr(block, "text"):
+                    response_text = block.text.strip()
+                    break
+            if not response_text:
+                return {b["bullet_id"]: None for b in bullets}
+
+            # Parse JSON
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            response_text = response_text.strip()
+
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                data = _parse_json_robust(response_text)
+
+            trimmed_map = data.get("trimmed", data)
+            if not isinstance(trimmed_map, dict):
+                return {b["bullet_id"]: None for b in bullets}
+
+            results: dict[str, Optional[str]] = {}
+            for b in bullets:
+                bid = b["bullet_id"]
+                text = trimmed_map.get(bid)
+                if not text or not isinstance(text, str):
+                    results[bid] = None
+                    continue
+
+                # Clean LLM artifacts
+                text = text.strip()
+                if text.startswith('"') and text.endswith('"'):
+                    text = text[1:-1]
+                if text.startswith("\u2022"):
+                    text = text.lstrip("\u2022 ").strip()
+                if "\n" in text:
+                    text = text.split("\n")[0].strip()
+
+                # Reject if longer than input
+                if len(text) > len(b["text"]):
+                    results[bid] = None
+                else:
+                    results[bid] = text
+
+            return results
+
+        except Exception as e:
+            logger.warning(f"Batch trim failed: {e}")
+            return {b["bullet_id"]: None for b in bullets}
 
     def _parse_response(
         self, text: str, content: ResumeContent,
