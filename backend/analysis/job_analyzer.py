@@ -205,8 +205,10 @@ class JobAnalyzer:
                 self._llm_enrich(jd_text, analysis)
                 self._llm_used = True
             except Exception as e:
-                self._llm_error = str(e)
-                logger.warning(f"LLM JD analysis failed, using deterministic only: {e}")
+                import re as _re
+                sanitized = _re.sub(r"sk-[a-zA-Z0-9_-]{10,}", "[REDACTED]", str(e))[:200]
+                self._llm_error = sanitized
+                logger.warning(f"LLM JD analysis failed, using deterministic only: {sanitized}")
 
         return analysis
 

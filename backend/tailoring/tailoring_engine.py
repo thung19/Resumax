@@ -25,6 +25,15 @@ from backend.models.tailoring import BulletChange, ResumeBank
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_error(e: Exception) -> str:
+    """Sanitize error message to prevent leaking secrets."""
+    msg = str(e)
+    # Strip anything that looks like an API key (sk-ant-..., sk-...)
+    import re
+    msg = re.sub(r"sk-[a-zA-Z0-9_-]{10,}", "[REDACTED]", msg)
+    return msg[:200]
+
+
 @dataclass
 class TailoringEngineResult:
     """Output of the unified tailoring pass."""
@@ -42,7 +51,7 @@ class TailoringEngineResult:
 
 TAILORING_SYSTEM = """You are an expert resume writer optimizing for ATS (Applicant Tracking Systems). You read job descriptions carefully — not just the skills list, but the language, verbs, and phrasing the company uses — and mirror that language in the resume.
 
-Changes made should improve the resume bullet points by adding JD keywords or better matching the job description. You never fabricate technologies the candidate didn't use, and you never drop metrics or numbers. You distribute different JD keywords across different bullets for broad coverage.
+Your primary goal is weaving JD keywords into the resume bullets naturally. Look at what each bullet describes and extrapolate — if someone built a data pipeline, they likely did data processing, ETL, data engineering. If someone built an API, they likely worked with REST, endpoints, integration. Add these implied keywords where the bullet's context supports them. You never fabricate technologies the candidate didn't use, and you never drop metrics or numbers. Distribute different JD keywords across different bullets for broad coverage.
 
 IMPORTANT: Vary your language across bullets. Do not add the same adjective (e.g., "modular", "reusable", "scalable") to more than 2 bullets. Each bullet should add a DIFFERENT JD keyword or phrase. If the JD says "modular, reusable code", put "modular" in one bullet and "reusable" in another — not both in every bullet.
 
@@ -53,7 +62,7 @@ TAILORING_USER_TEMPLATE = """Here is a job description and a resume. Tell me whi
 
 Each bullet shows (current/max chars). Your rewrite MUST NOT exceed the max chars shown — this is a hard limit based on the page layout. If your rewrite would be longer, rephrase it more concisely. It is better to add fewer keywords than to exceed the limit.
 
-Read the JD carefully. Pay attention to the specific language, terminology, and qualities the company emphasizes — then mirror that language in the resume bullets. If a bullet is already well-matched to the JD, keep it as-is.
+Read the JD carefully. Pay attention to the specific language, terminology, and qualities the company emphasizes — then mirror that language in the resume bullets. If a bullet already uses relevant keywords, matches the JD's language, and covers the right themes, keep it as-is — don't rewrite just for the sake of changing something.
 
 JOB DESCRIPTION:
 {jd_text}
@@ -238,8 +247,93 @@ class TailoringEngine:
 
         except Exception as e:
             result.duration_ms = int((time.time() - start) * 1000)
-            result.llm_error = str(e)[:200]
-            logger.warning(f"Tailoring engine failed: {e}")
+            result.llm_error = _sanitize_error(e)
+            logger.warning(f"Tailoring engine failed: {_sanitize_error(e)}")
+
+        return result
+
+    def freeform_edit(
+        self,
+        content: ResumeContent,
+        user_message: str,
+    ) -> TailoringEngineResult:
+        """Apply a freeform user instruction to the resume.
+
+        The user types whatever they want — the LLM sees the full
+        resume and the instruction, and returns bullet rewrites.
+        No char limits enforced here.
+        """
+        result = TailoringEngineResult()
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            result.llm_error = "ANTHROPIC_API_KEY not set"
+            return result
+
+        try:
+            import anthropic
+        except ImportError:
+            result.llm_error = "anthropic package not installed"
+            return result
+
+        # Build resume text (no char caps — freeform)
+        resume_text = _build_resume_text(content, max_chars=999)
+
+        prompt = (
+            f"{user_message}\n\n"
+            f"RESUME:\n{resume_text}\n\n"
+            f"Return a JSON object with changes:\n"
+            f'{{\n'
+            f'  "bullet_changes": [\n'
+            f'    {{\n'
+            f'      "bullet_id": "the ID shown in brackets",\n'
+            f'      "action": "keep" | "rewrite",\n'
+            f'      "new_text": "the updated bullet text (if rewrite)",\n'
+            f'      "reason": "what you changed and why"\n'
+            f'    }}\n'
+            f'  ]\n'
+            f'}}\n\n'
+            f"Only include bullets you are changing. "
+            f"Omit bullets that don't need changes."
+        )
+
+        client = anthropic.Anthropic(api_key=api_key)
+        start = time.time()
+        try:
+            response = client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=(
+                    "You are an expert resume writer. Follow the user's "
+                    "instructions to edit the resume bullets. Never fabricate "
+                    "experience. Keep all metrics and numbers. "
+                    "Return ONLY valid JSON."
+                ),
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            result.duration_ms = int((time.time() - start) * 1000)
+
+            response_text = None
+            for block in response.content:
+                if hasattr(block, "text"):
+                    response_text = block.text
+                    break
+
+            if not response_text:
+                result.llm_error = "LLM returned no text content"
+                return result
+
+            parsed = self._parse_response(response_text, content)
+            result.bullet_changes = parsed["bullet_changes"]
+            result.skill_reorders = parsed.get("skill_reorders", {})
+            result.skill_additions = parsed.get("skill_additions", {})
+            result.llm_used = True
+
+        except Exception as e:
+            result.duration_ms = int((time.time() - start) * 1000)
+            result.llm_error = _sanitize_error(e)
+            logger.warning(f"Freeform edit failed: {_sanitize_error(e)}")
 
         return result
 
@@ -364,7 +458,7 @@ class TailoringEngine:
             return results
 
         except Exception as e:
-            logger.warning(f"Batch trim failed: {e}")
+            logger.warning(f"Batch trim failed: {_sanitize_error(e)}")
             return {b["bullet_id"]: None for b in bullets}
 
     def _parse_response(

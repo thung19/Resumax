@@ -6,16 +6,22 @@ Phase 1: DOCX upload, parsing, and inspection endpoints.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import time
 import uuid
+from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger(__name__)
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
@@ -35,6 +41,52 @@ from backend.services.resume_bank_service import generate_bank_from_ir, save_ban
 from backend.services.tailoring_service import TailoringService
 
 app = FastAPI(title="Resumax", version="0.1.0")
+
+# --- Security constants ---
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_JD_CHARS = 50_000
+MAX_EDIT_MESSAGE_CHARS = 5_000
+RESUME_ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX = 20  # max LLM-calling requests per window
+
+
+def _validate_resume_id(resume_id: str) -> None:
+    """Validate resume_id is a safe hex string."""
+    if not RESUME_ID_PATTERN.match(resume_id):
+        raise HTTPException(400, "Invalid resume ID format")
+
+
+# --- Rate limiter (in-memory, per-IP) ---
+_rate_store: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_rate_limit(request: Request) -> None:
+    """Simple sliding-window rate limiter for LLM endpoints."""
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+
+    # Prune old entries
+    _rate_store[client_ip] = [
+        t for t in _rate_store[client_ip] if t > window_start
+    ]
+
+    if len(_rate_store[client_ip]) >= RATE_LIMIT_MAX:
+        raise HTTPException(429, "Rate limit exceeded. Try again shortly.")
+
+    _rate_store[client_ip].append(now)
+
+
+# --- Global exception handler (prevent secret leakage) ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch unhandled exceptions to prevent internal details leaking."""
+    logger.error(f"Unhandled error on {request.url.path}: {type(exc).__name__}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
 
 
 def _estimate_line_chars(ir: ResumeIR) -> int:
@@ -62,11 +114,15 @@ def _estimate_line_chars(ir: ResumeIR) -> int:
     # Conservative estimate: ~16 chars per inch at 10pt serif
     return int(content_width_in * 16)
 
+_allowed_origins = os.environ.get(
+    "CORS_ORIGINS", "http://localhost:3000,http://localhost:3001"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_allowed_origins,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type"],
 )
 
 # In-memory store for parsed resumes (Phase 1 only)
@@ -83,14 +139,21 @@ async def upload_resume(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
-    ext = Path(file.filename).suffix.lower()
+    # Sanitize filename — strip path components to prevent traversal
+    safe_name = Path(file.filename).name
+    ext = Path(safe_name).suffix.lower()
     if ext not in (".docx",):
-        raise HTTPException(
-            400,
-            f"Unsupported format: {ext}. Phase 1 supports .docx only.",
-        )
+        raise HTTPException(400, "Unsupported format. Only .docx is accepted.")
 
     file_bytes = await file.read()
+
+    # Validate file size
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+
+    # Validate DOCX magic bytes (DOCX is a ZIP file: starts with PK\x03\x04)
+    if len(file_bytes) < 4 or file_bytes[:4] != b"PK\x03\x04":
+        raise HTTPException(400, "Invalid file. Expected a .docx document.")
 
     # Save uploaded file
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -101,7 +164,7 @@ async def upload_resume(file: UploadFile = File(...)):
     # Import
     importer = DocxImporter(file_bytes=file_bytes)
     ir = importer.import_resume()
-    ir.source_filename = file.filename
+    ir.source_filename = safe_name
 
     # Run formatting detection for enrichment
     # Re-parse paragraphs for the detector
@@ -152,6 +215,7 @@ async def upload_resume(file: UploadFile = File(...)):
 
 def _load_ir(resume_id: str) -> ResumeIR:
     """Load a ResumeIR from memory or disk."""
+    _validate_resume_id(resume_id)
     ir = _store.get(resume_id)
     if ir is not None:
         return ir
@@ -385,31 +449,49 @@ _tailored_ir_store: dict[str, ResumeIR] = {}
 
 
 class AnalyzeJDRequest(BaseModel):
-    jd_text: str
+    jd_text: str = Field(..., max_length=MAX_JD_CHARS)
     resume_id: str | None = None
 
 
 class TailorRequest(BaseModel):
-    jd_text: str
+    jd_text: str = Field(..., max_length=MAX_JD_CHARS)
     use_llm: bool = True
-    max_bullets_per_entry: int = 4
+    max_bullets_per_entry: int = Field(default=4, ge=1, le=10)
     enforce_one_page: bool = True
-    one_line_bullets: bool = True  # layout-accurate one-line enforcement
-    enforce_single_line_bullets: bool = False  # legacy char-count fallback
-    max_bullet_chars: int = 0  # 0 = auto-detect (only used with legacy mode)
+    one_line_bullets: bool = True
+    enforce_single_line_bullets: bool = False
+    max_bullet_chars: int = Field(default=0, ge=0, le=500)
 
 
 class AcceptRejectRequest(BaseModel):
-    bullet_id: str
+    bullet_id: str = Field(..., max_length=50)
     accepted: bool
-    resolved: bool = True  # set to False to undo/unresolve
+    resolved: bool = True
+
+    @field_validator("bullet_id")
+    @classmethod
+    def validate_bullet_id(cls, v: str) -> str:
+        if not re.match(r"^[a-zA-Z0-9_-]+$", v):
+            raise ValueError("Invalid bullet_id format")
+        return v
 
 
 class SkillChangeRequest(BaseModel):
-    change_type: str  # "reorder" | "addition"
-    category: str
-    skill: str = ""  # only for additions
+    change_type: str = Field(..., max_length=20)
+    category: str = Field(..., max_length=200)
+    skill: str = Field(default="", max_length=200)
     accepted: bool
+
+    @field_validator("change_type")
+    @classmethod
+    def validate_change_type(cls, v: str) -> str:
+        if v not in ("reorder", "addition"):
+            raise ValueError("change_type must be 'reorder' or 'addition'")
+        return v
+
+
+class FreeformEditRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=MAX_EDIT_MESSAGE_CHARS)
 
 
 class SkillBatchAcceptRequest(BaseModel):
@@ -417,8 +499,9 @@ class SkillBatchAcceptRequest(BaseModel):
 
 
 @app.post("/analyze-jd")
-async def analyze_jd(req: AnalyzeJDRequest):
+async def analyze_jd(req: AnalyzeJDRequest, request: Request):
     """Analyze a job description using hybrid LLM + deterministic analysis."""
+    _check_rate_limit(request)
     use_llm = bool(os.environ.get("ANTHROPIC_API_KEY"))
     analyzer = JobAnalyzer(use_llm=use_llm)
     analysis = analyzer.analyze(req.jd_text)
@@ -451,8 +534,9 @@ async def analyze_jd(req: AnalyzeJDRequest):
 
 
 @app.post("/tailor/{resume_id}")
-async def tailor_resume(resume_id: str, req: TailorRequest):
+async def tailor_resume(resume_id: str, req: TailorRequest, request: Request):
     """Tailor a resume to a job description."""
+    _check_rate_limit(request)
     ir = _load_ir(resume_id)
 
     # Analyze JD
@@ -568,6 +652,68 @@ async def accept_reject_skill(resume_id: str, req: SkillChangeRequest):
     _tailored_ir_store[resume_id] = tailored_ir
 
     return result.model_dump()
+
+
+@app.post("/tailor/{resume_id}/edit")
+async def freeform_edit(resume_id: str, req: FreeformEditRequest, request: Request):
+    """Send a custom message to the LLM to edit the resume."""
+    _check_rate_limit(request)
+    _validate_resume_id(resume_id)
+    from backend.tailoring.tailoring_engine import TailoringEngine
+
+    # Use tailored IR if available, otherwise original
+    ir = _tailored_ir_store.get(resume_id)
+    if ir is None:
+        ir = _load_ir(resume_id)
+
+    engine = TailoringEngine()
+    engine_result = engine.freeform_edit(
+        content=ir.content,
+        user_message=req.message,
+    )
+
+    if not engine_result.llm_used:
+        raise HTTPException(500, engine_result.llm_error or "LLM call failed")
+
+    # Get or create tailoring result
+    result = _tailoring_store.get(resume_id)
+    if result is None:
+        result = TailoringResult(resume_id=resume_id, job_title="")
+        _tailoring_store[resume_id] = result
+
+    # Merge new changes into existing result
+    existing_ids = {c.bullet_id: i for i, c in enumerate(result.bullet_changes)}
+    for change in engine_result.bullet_changes:
+        if change.action != "rewrite":
+            continue
+        if change.bullet_id in existing_ids:
+            idx = existing_ids[change.bullet_id]
+            result.bullet_changes[idx].tailored_text = change.tailored_text
+            result.bullet_changes[idx].action = "rewrite"
+            result.bullet_changes[idx].reason = f"[edit] {change.reason}"
+            result.bullet_changes[idx].accepted = True
+            result.bullet_changes[idx].resolved = False
+        else:
+            change.reason = f"[edit] {change.reason}"
+            result.bullet_changes.append(change)
+
+    # Re-apply tailoring
+    base_ir = _load_ir(resume_id)
+    service = TailoringService(use_llm=False)
+    tailored_ir = service.apply_tailoring(base_ir, result)
+    _tailored_ir_store[resume_id] = tailored_ir
+
+    # Save
+    ir_path = GENERATED_DIR / f"{resume_id}_tailored_ir.json"
+    ir_path.write_text(tailored_ir.model_dump_json(indent=2))
+
+    return {
+        "changes_applied": sum(
+            1 for c in engine_result.bullet_changes if c.action == "rewrite"
+        ),
+        "duration_ms": engine_result.duration_ms,
+        "result": result.model_dump(),
+    }
 
 
 @app.post("/tailor/{resume_id}/skills/accept-all")
