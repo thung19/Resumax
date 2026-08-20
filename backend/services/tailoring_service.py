@@ -82,6 +82,7 @@ class TailoringService:
             engine_result = engine.tailor(
                 content=ir.content,
                 jd_raw_text=jd.raw_text,
+                jd_analysis=jd,
                 max_chars_per_line=max_chars,
                 max_bullets_per_entry=max_bullets_per_entry,
                 available_width_pt=measurer.raw_width_pt if measurer else 0,
@@ -128,14 +129,35 @@ class TailoringService:
             result.bullet_changes = self._deterministic_fallback(ir.content)
 
         # === STAGE 3: Safety net (fabrication + overflow revert) ===
-        validator = ClaimValidator()
-        self._run_safety_net(result, bank, ir, validator, measurer)
+        try:
+            validator = ClaimValidator()
+            self._run_safety_net(result, bank, ir, validator, measurer)
+        except Exception as e:
+            # Graceful degradation: if validation fails, keep original bullets
+            result.debug_log.append(
+                f"SAFETY NET FAILED (using original bullets): {str(e)[:100]}"
+            )
+            logger.warning(f"Safety net error (graceful fallback): {e}")
+            # Revert all rewrites to keeps
+            for change in result.bullet_changes:
+                if change.action == "rewrite":
+                    change.tailored_text = change.original_text
+                    change.action = "keep"
+                    change.reason = "Safety net error; using original"
 
         # === STAGE 4: Build coverage report ===
-        from backend.tailoring.matcher import Matcher
-        matcher = Matcher(jd, ir.content, bank)
-        match_result = matcher.match()
-        self._build_coverage_report(result, ir, jd, match_result)
+        try:
+            from backend.tailoring.matcher import Matcher
+            matcher = Matcher(jd, ir.content, bank)
+            match_result = matcher.match()
+            self._build_coverage_report(result, ir, jd, match_result)
+        except Exception as e:
+            # Graceful degradation: coverage report failure doesn't block result
+            result.debug_log.append(
+                f"COVERAGE REPORT FAILED: {str(e)[:100]}"
+            )
+            logger.warning(f"Coverage report error (continuing anyway): {e}")
+            # Still return the result; coverage metrics just won't be populated
 
         return result
 
@@ -225,15 +247,78 @@ class TailoringService:
                     f"\"{change.tailored_text[:60]}...\""
                 )
 
+        # === REJECTION FEEDBACK LOOP ===
+        # Collect bullets that failed validation and retry them
+        rejected_bullets = [
+            (change, change.reason.split(": ", 1)[1].split("; ") if "Rewrite rejected:" in change.reason else [])
+            for change in result.bullet_changes
+            if change.action == "keep" and "Rewrite rejected:" in (change.reason or "")
+        ]
+
+        if rejected_bullets and len(rejected_bullets) <= 5:
+            result.debug_log.append(
+                f"RETRY LOOP: Showing model why {len(rejected_bullets)} bullets failed validation"
+            )
+            from backend.tailoring.tailoring_engine import TailoringEngine
+
+            engine = TailoringEngine()
+            retry_result = engine.retry_rejected_bullets(rejected_bullets, ir.content)
+
+            if retry_result.llm_used:
+                # Merge retry results back into main results
+                retry_map = {c.bullet_id: c for c in retry_result.bullet_changes}
+                for change in result.bullet_changes:
+                    if change.bullet_id in retry_map:
+                        retry_change = retry_map[change.bullet_id]
+                        if retry_change.action == "rewrite":
+                            # Re-validate the retry before accepting it
+                            facts = self._get_facts_for_bullet(
+                                change.bullet_id, bank, ir.content,
+                            )
+                            facts_with_resume = facts + [
+                                {"id": "_resume", "text": full_resume_text},
+                            ]
+                            validation = validator.validate(retry_change, facts_with_resume)
+                            if validation.valid:
+                                change.tailored_text = retry_change.tailored_text
+                                change.action = "rewrite"
+                                change.reason = (
+                                    retry_change.reason + " (retry after feedback)"
+                                )
+                                result.debug_log.append(
+                                    f"RETRY ACCEPTED {change.bullet_id}: "
+                                    f"\"{change.tailored_text[:60]}...\""
+                                )
+                            else:
+                                result.debug_log.append(
+                                    f"RETRY REJECTED {change.bullet_id}: "
+                                    f"still failed: {'; '.join(validation.issues)}"
+                                )
+                        else:
+                            result.debug_log.append(
+                                f"RETRY ACTION={retry_change.action} {change.bullet_id}"
+                            )
+
         # === Batch overflow trimming ===
         if measurer:
-            self._batch_trim_overflows(result, measurer)
+            self._batch_trim_overflows(result, measurer, validator, bank, ir)
 
         # Dedup pass: check for repeated adjectives/descriptors
         self._dedup_adjectives(result)
 
-    def _batch_trim_overflows(self, result: TailoringResult, measurer):
-        """Batch-trim all overflowing bullets in 1-2 LLM calls."""
+    def _batch_trim_overflows(
+        self,
+        result: TailoringResult,
+        measurer,
+        validator: ClaimValidator,
+        bank: ResumeBank,
+        ir: ResumeIR,
+    ):
+        """Batch-trim all overflowing bullets in 1-2 LLM calls.
+
+        Re-validates trimmed text against claim validator to prevent
+        fabricated terms from being introduced during trimming.
+        """
         from backend.tailoring.tailoring_engine import (
             TailoringEngine,
             _compute_char_cap,
@@ -252,6 +337,7 @@ class TailoringService:
             return
 
         trimmer = TailoringEngine()
+        full_resume_text = self._build_full_resume_text(ir.content)
 
         # Up to 3 batch rounds
         for round_num in range(3):
@@ -313,9 +399,25 @@ class TailoringService:
                         still_overflowing.append(change)
                     continue
 
+                # === Re-validate trimmed text ===
+                original_text = change.tailored_text
+                change.tailored_text = trimmed
+                facts = self._get_facts_for_bullet(change.bullet_id, bank, ir.content)
+                facts_with_resume = facts + [{"id": "_resume", "text": full_resume_text}]
+                validation = validator.validate(change, facts_with_resume)
+
+                if not validation.valid:
+                    result.debug_log.append(
+                        f"TRIMMED TEXT FAILED VALIDATION {change.bullet_id}: "
+                        f"{'; '.join(validation.issues)}"
+                    )
+                    change.tailored_text = change.original_text
+                    change.action = "keep"
+                    change.reason = "Rewrite too long, trim failed"
+                    continue
+
                 trim_m = measurer.measure(trimmed)
                 if trim_m.fits_one_line:
-                    change.tailored_text = trimmed
                     change.reason = (
                         (change.reason or "") + " (trimmed to fit)"
                     )
@@ -325,7 +427,7 @@ class TailoringService:
                         f"{trim_m.rendered_width_pt:.0f}pt "
                         f"(round {round_num + 1})"
                     )
-                elif len(trimmed) >= len(change.tailored_text):
+                elif len(trimmed) >= len(original_text):
                     # Stuck — no progress
                     result.debug_log.append(
                         f"TRIM STUCK {change.bullet_id}: "
@@ -343,7 +445,6 @@ class TailoringService:
                 else:
                     # Made progress but still overflows — use shorter
                     # text for retry
-                    change.tailored_text = trimmed
                     result.debug_log.append(
                         f"RETRIM {change.bullet_id}: "
                         f"{len(trimmed)} chars, "
@@ -572,7 +673,12 @@ class TailoringService:
                             key = f"{cat.category}:{new_skill}"
                             accepted = result.additions_accepted.get(key, True)
                             if accepted and new_skill.lower() not in existing:
-                                cat.skills.append(new_skill)
+                                # === CHANGE: Mark LLM-added skills with internal marker ===
+                                # When skills fitting trims the row, it can see which skills
+                                # came from the LLM (JD-matched) vs original resume.
+                                # Trim the original skills first; protect the LLM additions.
+                                marked_skill = f"[LLM]{new_skill}"
+                                cat.skills.append(marked_skill)
                                 existing.add(new_skill.lower())
 
                     if cat.category in result.reordered_skills:
@@ -604,7 +710,13 @@ class TailoringService:
         ir: ResumeIR,
         result: Optional[TailoringResult] = None,
     ):
-        """Trim skills rows so each fits on a single rendered line."""
+        """Trim skills rows so each fits on a single rendered line.
+
+        === PRIORITY CHANGE ===
+        When trimming overflowing skills rows, PROTECT skills marked with [LLM].
+        These are JD-matched additions from the tailoring engine.
+        We trim original resume skills first; only trim [LLM] skills if absolutely necessary.
+        """
         from backend.tailoring.bullet_measurer import BulletMeasurer
 
         try:
@@ -619,18 +731,38 @@ class TailoringService:
                 row_text = f"{cat.category}: {', '.join(cat.skills)}"
                 m = measurer.measure_line(row_text)
                 if m.fits_one_line:
+                    # === Clean [LLM] markers even if row fits ===
+                    cat.skills = [s.replace("[LLM]", "").strip() for s in cat.skills]
                     continue
 
+                # === Trim with protection for [LLM]-marked skills ===
                 while len(cat.skills) > 1:
-                    removed = cat.skills.pop()
+                    # Find the last non-[LLM] skill to remove
+                    removed_idx = None
+                    for i in range(len(cat.skills) - 1, -1, -1):
+                        if not cat.skills[i].startswith("[LLM]"):
+                            removed_idx = i
+                            break
+
+                    # If all remaining are [LLM], stop
+                    if removed_idx is None:
+                        break
+
+                    removed = cat.skills.pop(removed_idx)
                     if result:
-                        key = f"{cat.category}:{removed}"
+                        # Clean the marker for the result tracking
+                        clean_removed = removed.replace("[LLM]", "").strip()
+                        key = f"{cat.category}:{clean_removed}"
                         if key not in result.additions_accepted:
                             result.additions_accepted[key] = False
+
                     row_text = f"{cat.category}: {', '.join(cat.skills)}"
                     m = measurer.measure_line(row_text)
                     if m.fits_one_line:
                         break
+
+                # === Clean [LLM] markers from final result ===
+                cat.skills = [s.replace("[LLM]", "").strip() for s in cat.skills]
 
     def _sync_elements_with_content(
         self,
@@ -644,8 +776,10 @@ class TailoringService:
         skills_texts: dict[str, str] = {}
         for section in ir.content.sections:
             for cat in section.skill_categories:
+                # === Clean any [LLM] markers (safety measure) ===
+                clean_skills = [s.replace("[LLM]", "").strip() for s in cat.skills]
                 skills_texts[cat.category] = (
-                    f"{cat.category}: " + ", ".join(cat.skills)
+                    f"{cat.category}: " + ", ".join(clean_skills)
                 )
 
         new_elements = []
