@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # --- Resume Bank ---
@@ -20,6 +20,22 @@ class Fact(BaseModel):
     text: str
     tags: list[str] = Field(default_factory=list)  # e.g. ["python", "optimization"]
 
+    @field_validator("id")
+    @classmethod
+    def id_not_empty(cls, v: str) -> str:
+        """Ensure id is not empty."""
+        if not v or not v.strip():
+            raise ValueError("Fact.id cannot be empty")
+        return v
+
+    @field_validator("text")
+    @classmethod
+    def text_not_empty(cls, v: str) -> str:
+        """Ensure text is not empty."""
+        if not v or not v.strip():
+            raise ValueError("Fact.text cannot be empty")
+        return v
+
 
 class ApprovedBullet(BaseModel):
     """A pre-written, approved bullet point."""
@@ -27,6 +43,22 @@ class ApprovedBullet(BaseModel):
     text: str
     source_fact_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+
+    @field_validator("id")
+    @classmethod
+    def id_not_empty(cls, v: str) -> str:
+        """Ensure id is not empty."""
+        if not v or not v.strip():
+            raise ValueError("ApprovedBullet.id cannot be empty")
+        return v
+
+    @field_validator("text")
+    @classmethod
+    def text_not_empty(cls, v: str) -> str:
+        """Ensure text is not empty."""
+        if not v or not v.strip():
+            raise ValueError("ApprovedBullet.text cannot be empty")
+        return v
 
 
 class ExperienceBank(BaseModel):
@@ -92,6 +124,23 @@ class BulletChange(BaseModel):
     reason: str = ""
     accepted: bool = True  # user can reject
     resolved: bool = False  # has the user explicitly accepted/rejected this?
+
+    @field_validator("bullet_id")
+    @classmethod
+    def bullet_id_not_empty(cls, v: str) -> str:
+        """Ensure bullet_id is not empty."""
+        if not v or not v.strip():
+            raise ValueError("BulletChange.bullet_id cannot be empty")
+        return v
+
+    @field_validator("action")
+    @classmethod
+    def action_valid(cls, v: str) -> str:
+        """Ensure action is one of the allowed values."""
+        allowed = {"rewrite", "remove", "keep", "reorder", "add"}
+        if v not in allowed:
+            raise ValueError(f"BulletChange.action must be one of {allowed}, got {v}")
+        return v
 
 
 class KeywordCoverage(BaseModel):
