@@ -82,7 +82,6 @@ class TailoringService:
             engine_result = engine.tailor(
                 content=ir.content,
                 jd_raw_text=jd.raw_text,
-                jd_analysis=jd,
                 max_chars_per_line=max_chars,
                 max_bullets_per_entry=max_bullets_per_entry,
                 available_width_pt=measurer.raw_width_pt if measurer else 0,
