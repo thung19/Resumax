@@ -5,13 +5,16 @@ Rejects bullets with fabricated technologies or metrics.
 Warns (but doesn't reject) when original metrics are dropped.
 
 This is a thin safety net — not a quality gate.
+Validation strictness is controlled by ValidationConfig.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Optional
 
+from backend.config import ValidationConfig, get_config
 from backend.models.tailoring import BulletChange
 
 
@@ -74,12 +77,20 @@ TECH_TERMS = {
 class ClaimValidator:
     """Validate rewritten bullets against source facts."""
 
+    def __init__(self, config: Optional[ValidationConfig] = None):
+        """Initialize with validation configuration.
+
+        Args:
+            config: ValidationConfig instance. If None, uses global config.
+        """
+        self.config = config or get_config().validation
+
     def validate(
         self,
         change: BulletChange,
         source_facts: list[dict],
     ) -> ValidationResult:
-        """Validate a bullet change."""
+        """Validate a bullet change according to configured thresholds."""
         result = ValidationResult()
 
         if change.action in ("keep", "remove"):
@@ -151,17 +162,33 @@ class ClaimValidator:
     def _check_metric_preservation(
         self, original: str, rewritten: str, result: ValidationResult,
     ):
-        """Warn if key metrics from original were dropped (not a rejection)."""
+        """Warn if too many metrics from original were dropped (not a rejection).
+
+        Tolerance is controlled by config.metric_loss_tolerance (default 20%).
+        """
         orig_numbers = set(re.findall(r"(?<!\w)(\d[\d,]*)", original))
         rewrite_numbers = set(re.findall(r"(?<!\w)(\d[\d,]*)", rewritten))
 
+        # Count how many original metrics were preserved
+        preserved = 0
         for num in orig_numbers:
             norm = num.replace(",", "")
             if int(norm) > 1:
                 found = any(
                     norm == rn.replace(",", "") for rn in rewrite_numbers
                 )
-                if not found:
+                if found:
+                    preserved += 1
+                else:
                     result.metric_warnings.append(
                         f"Original metric '{num}' was dropped in rewrite"
                     )
+
+        # Check if metric loss exceeds tolerance
+        if orig_numbers:
+            loss_ratio = 1.0 - (preserved / len(orig_numbers))
+            if loss_ratio > self.config.metric_loss_tolerance:
+                result.metric_warnings.append(
+                    f"Metric loss ratio {loss_ratio:.1%} exceeds tolerance "
+                    f"{self.config.metric_loss_tolerance:.1%}"
+                )

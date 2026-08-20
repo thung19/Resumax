@@ -130,7 +130,9 @@ class TailoringService:
 
         # === STAGE 3: Safety net (fabrication + overflow revert) ===
         try:
-            validator = ClaimValidator()
+            from backend.config import get_config
+            config = get_config()
+            validator = ClaimValidator(config.validation)
             self._run_safety_net(result, bank, ir, validator, measurer)
         except Exception as e:
             # Graceful degradation: if validation fails, keep original bullets
