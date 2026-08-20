@@ -361,7 +361,22 @@ class TailoringEngine:
             except json.JSONDecodeError:
                 data = _parse_json_robust(response_text)
 
-            trimmed_map = data.get("trimmed", data)
+            # Handle both old format {"trimmed": {...}} and new format {"trimmed_bullets": [...]}
+            trimmed_map: dict[str, Optional[str]] = {}
+
+            # New format: {"trimmed_bullets": [{"bullet_id": "...", "trimmed_text": "..."}, ...]}
+            if "trimmed_bullets" in data:
+                for item in data.get("trimmed_bullets", []):
+                    if isinstance(item, dict):
+                        bid = item.get("bullet_id", "")
+                        text = item.get("trimmed_text", "")
+                        if bid and text:
+                            trimmed_map[bid] = text
+
+            # Old format: {"trimmed": {"bullet_id": "text", ...}}
+            if not trimmed_map:
+                trimmed_map = data.get("trimmed", {})
+
             if not isinstance(trimmed_map, dict):
                 return {b["bullet_id"]: None for b in bullets}
 
