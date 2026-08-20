@@ -21,6 +21,17 @@ from typing import Optional
 from backend.models.job_description import JobAnalysis
 from backend.models.resume_content import ResumeContent, SectionType
 from backend.models.tailoring import BulletChange, ResumeBank
+from backend.prompts import (
+    TAILORING_SYSTEM_V2,
+    TAILORING_USER_V2,
+    BATCH_TRIM_SYSTEM_V2,
+    BATCH_TRIM_USER_V2,
+    BATCH_TRIM_RETRY_HINT,
+    REJECTION_RETRY_SYSTEM_V1,
+    REJECTION_RETRY_USER_TEMPLATE,
+    FREEFORM_EDIT_SYSTEM_V1,
+    FREEFORM_EDIT_USER_TEMPLATE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,52 +56,6 @@ class TailoringEngineResult:
     duration_ms: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Prompt
-# ---------------------------------------------------------------------------
-
-TAILORING_SYSTEM = """You are an expert resume writer optimizing for ATS (Applicant Tracking Systems). You read job descriptions carefully — not just the skills list, but the language, verbs, and phrasing the company uses — and mirror that language in the resume.
-
-Your primary goal is weaving JD keywords into the resume bullets naturally. Look at what each bullet describes and extrapolate — if someone built a data pipeline, they likely did data processing, ETL, data engineering. If someone built an API, they likely worked with REST, endpoints, integration. Add these implied keywords where the bullet's context supports them. You never fabricate technologies the candidate didn't use, and you never drop metrics or numbers. Distribute different JD keywords across different bullets for broad coverage.
-
-IMPORTANT: Vary your language across bullets. Do not add the same adjective (e.g., "modular", "reusable", "scalable") to more than 2 bullets. Each bullet should add a DIFFERENT JD keyword or phrase. If the JD says "modular, reusable code", put "modular" in one bullet and "reusable" in another — not both in every bullet.
-
-Return ONLY valid JSON."""
-
-
-TAILORING_USER_TEMPLATE = """Here is a job description and a resume. Tell me which bullet points you would change to better match this JD for ATS, and what the new versions should be.
-
-Each bullet shows (current/max chars). Your rewrite MUST NOT exceed the max chars shown — this is a hard limit based on the page layout. If your rewrite would be longer, rephrase it more concisely. It is better to add fewer keywords than to exceed the limit.
-
-Read the JD carefully. Pay attention to the specific language, terminology, and qualities the company emphasizes — then mirror that language in the resume bullets. If a bullet already uses relevant keywords, matches the JD's language, and covers the right themes, keep it as-is — don't rewrite just for the sake of changing something.
-
-JOB DESCRIPTION:
-{jd_text}
-
-RESUME:
-{resume_text}
-
-Return a JSON object with entries for every bullet:
-{{
-  "bullet_changes": [
-    {{
-      "bullet_id": "the ID shown in brackets",
-      "action": "keep" | "rewrite" | "remove",
-      "new_text": "the improved bullet text (if rewrite)",
-      "reason": "what you changed and why",
-      "keywords_added": ["JD terms now in this bullet"]
-    }}
-  ],
-  "skill_reorders": {{
-    "Category Name": ["reordered skills, JD-relevant first"]
-  }},
-  "skill_additions": {{
-    "Category Name": ["TechSkill the candidate demonstrably used"]
-  }}
-}}
-
-For skill_additions: only add technologies/concepts (LLMs, RAG, CI/CD, etc.) the candidate clearly used. Never add soft skills.
-Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bullet is irrelevant."""
 
 
 def _compute_char_cap(
@@ -202,7 +167,7 @@ class TailoringEngine:
             font_size=font_size,
         )
 
-        user_msg = TAILORING_USER_TEMPLATE.format(
+        user_msg = TAILORING_USER_V2.format(
             jd_text=jd_raw_text,
             resume_text=resume_text,
             max_bullets=max_bullets_per_entry,
@@ -215,7 +180,7 @@ class TailoringEngine:
             response = client.messages.create(
                 model=self._model,
                 max_tokens=4096,
-                system=TAILORING_SYSTEM,
+                system=TAILORING_SYSTEM_V2,
                 messages=[{"role": "user", "content": user_msg}],
             )
 
@@ -279,22 +244,9 @@ class TailoringEngine:
         # Build resume text (no char caps — freeform)
         resume_text = _build_resume_text(content, max_chars=999)
 
-        prompt = (
-            f"{user_message}\n\n"
-            f"RESUME:\n{resume_text}\n\n"
-            f"Return a JSON object with changes:\n"
-            f'{{\n'
-            f'  "bullet_changes": [\n'
-            f'    {{\n'
-            f'      "bullet_id": "the ID shown in brackets",\n'
-            f'      "action": "keep" | "rewrite",\n'
-            f'      "new_text": "the updated bullet text (if rewrite)",\n'
-            f'      "reason": "what you changed and why"\n'
-            f'    }}\n'
-            f'  ]\n'
-            f'}}\n\n'
-            f"Only include bullets you are changing. "
-            f"Omit bullets that don't need changes."
+        user_msg = FREEFORM_EDIT_USER_TEMPLATE.format(
+            user_instruction=user_message,
+            resume_text=resume_text,
         )
 
         client = anthropic.Anthropic(api_key=api_key)
@@ -303,13 +255,8 @@ class TailoringEngine:
             response = client.messages.create(
                 model=self._model,
                 max_tokens=4096,
-                system=(
-                    "You are an expert resume writer. Follow the user's "
-                    "instructions to edit the resume bullets. Never fabricate "
-                    "experience. Keep all metrics and numbers. "
-                    "Return ONLY valid JSON."
-                ),
-                messages=[{"role": "user", "content": prompt}],
+                system=FREEFORM_EDIT_SYSTEM_V1,
+                messages=[{"role": "user", "content": user_msg}],
             )
 
             result.duration_ms = int((time.time() - start) * 1000)
@@ -380,33 +327,19 @@ class TailoringEngine:
                 f"  {fits}|{overflows}"
             )
 
-        retry_hint = (
-            " These bullets were already trimmed once but are still too long. "
-            "You MUST make each one shorter — use fewer words, "
-            "swap long phrases for concise ones, or rephrase entirely."
-        ) if is_retry else ""
+        bullet_list = "\n\n".join(entries)
 
-        prompt = (
-            f"These resume bullets are too long for one line each. "
-            f"For each bullet, the | marks where the line overflows — "
-            f"everything after the | spills to a second line.{retry_hint}\n\n"
-            + "\n\n".join(entries)
-            + "\n\nRewrite each bullet so it fits BEFORE the | mark. "
-            f"Each bullet MUST be within its stated max chars. "
-            f"Keep all numbers, metrics, and the listed keywords. "
-            f"Compress, remove filler, or rephrase to be shorter. "
-            f"Vary your language — don't add the same word to multiple bullets.\n\n"
-            f"Return ONLY a JSON object:\n"
-            f'{{"trimmed": {{'
-            f'"bullet_id": "shortened text", ...}}}}'
-        )
+        retry_hint = f"\n\n{BATCH_TRIM_RETRY_HINT}" if is_retry else ""
+
+        user_msg = BATCH_TRIM_USER_V2.format(bullet_list=bullet_list) + retry_hint
 
         try:
             client = anthropic.Anthropic(api_key=api_key)
             response = client.messages.create(
                 model=self._model,
                 max_tokens=2048,
-                messages=[{"role": "user", "content": prompt}],
+                system=BATCH_TRIM_SYSTEM_V2,
+                messages=[{"role": "user", "content": user_msg}],
             )
             response_text = None
             for block in response.content:

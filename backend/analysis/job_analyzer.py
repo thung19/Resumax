@@ -30,6 +30,7 @@ from backend.models.job_description import (
     Responsibility,
     WeightedItem,
 )
+from backend.prompts import JD_ANALYSIS_SYSTEM_V1, JD_ANALYSIS_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -110,53 +111,6 @@ SOFT_SKILLS_PATTERNS = [
     "mentoring", "presentation", "stakeholder",
 ]
 
-
-LLM_JD_ANALYSIS_PROMPT = """Extract the technical skills and requirements from this job description.
-
-JOB DESCRIPTION:
-{jd_text}
-
-Return a JSON object:
-
-{{
-  "job_title": "exact title from the posting",
-  "company": "company name if mentioned",
-  "location": "location if mentioned",
-  "job_type": "internship | full-time | part-time | contract",
-
-  "required_skills": [
-    {{"name": "skill name", "importance": 0.0-1.0, "category": "language|framework|database|infrastructure|tool|methodology"}}
-  ],
-  "preferred_skills": [
-    {{"name": "skill name", "importance": 0.0-1.0, "category": "..."}}
-  ],
-
-  "responsibilities": [
-    {{"text": "responsibility description", "importance": 0.0-1.0, "keywords": ["relevant", "technical", "terms"]}}
-  ],
-
-  "domain_knowledge": [
-    {{"name": "domain area", "importance": 0.0-1.0}}
-  ]
-}}
-
-CRITICAL RULES FOR SKILLS:
-- Extract ATOMIC skill names only — the exact word an ATS would scan for
-- "Python expertise" → extract "Python" (not "Python expertise")
-- "LLM technologies" → extract "LLMs" (not "LLM technologies")
-- "experience with databases" → extract "databases" or "SQL" (not "database design and management")
-- "RESTful APIs" → extract "REST APIs" (this IS an atomic ATS term)
-- "CI/CD pipelines" → extract "CI/CD" (not "CI/CD pipelines")
-- "full-stack development" → extract "full-stack" (the ATS keyword)
-- Do NOT extract soft skills (communication, problem-solving, teamwork, leadership)
-- Do NOT extract generic phrases (clean code, well-tested, modern frameworks)
-- Do NOT add "technologies", "concepts", "experience", "expertise", "skills" as suffixes
-- importance: 1.0 = explicitly required, 0.7 = strongly implied, 0.4 = nice-to-have
-
-For responsibilities: extract actual duties with technical keywords in the keywords array.
-For domain_knowledge: industry-specific areas (fintech, healthcare, e-commerce).
-
-Return ONLY valid JSON, no markdown."""
 
 
 def _normalize(text: str) -> str:
@@ -442,12 +396,13 @@ class JobAnalyzer:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
 
-        prompt = LLM_JD_ANALYSIS_PROMPT.format(jd_text=jd_text)
+        user_msg = JD_ANALYSIS_USER_TEMPLATE.format(jd_text=jd_text)
 
         response = client.messages.create(
             model=self._model,
             max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
+            system=JD_ANALYSIS_SYSTEM_V1,
+            messages=[{"role": "user", "content": user_msg}],
         )
 
         response_text = response.content[0].text.strip()
