@@ -601,13 +601,13 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
     """
     jd = _jd_store.get(resume_id)
     if jd is None:
-        logger.warning(f"No JD found in store for {resume_id} — coverage not recalculated")
+        print(f"DEBUG: No JD found in store for {resume_id} — coverage not recalculated")
         return
 
     try:
         from backend.tailoring.matcher import Matcher
 
-        logger.info(f"Recalculating coverage for {resume_id}")
+        print(f"DEBUG: Recalculating coverage for {resume_id}")
 
         # Clear previous coverage
         result.keyword_coverage = []
@@ -625,9 +625,9 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         result.technical_keyword_coverage = match_result.technical_coverage
         result.responsibility_coverage = match_result.responsibility_coverage
 
-        logger.info(f"Coverage updated: Required {old_req}% → {result.required_skill_coverage}%, "
-                   f"Technical {old_tech}% → {result.technical_keyword_coverage}%, "
-                   f"Responsibility {old_resp}% → {result.responsibility_coverage}%")
+        print(f"DEBUG: Coverage updated: Required {old_req:.0f}% → {result.required_skill_coverage:.0f}%, "
+              f"Technical {old_tech:.0f}% → {result.technical_keyword_coverage:.0f}%, "
+              f"Responsibility {old_resp:.0f}% → {result.responsibility_coverage:.0f}%")
 
         # Rebuild keyword coverage list
         all_jd_keywords = jd.all_keywords()
@@ -713,9 +713,9 @@ async def accept_reject_bullet(resume_id: str, req: AcceptRejectRequest):
 
     # Return result with updated coverage
     response = result.model_dump()
-    logger.info(f"Accept response: Required {response.get('required_skill_coverage')}%, "
-               f"Technical {response.get('technical_keyword_coverage')}%, "
-               f"Responsibility {response.get('responsibility_coverage')}%")
+    print(f"DEBUG: Accept response being returned: Required {response.get('required_skill_coverage'):.0f}%, "
+          f"Technical {response.get('technical_keyword_coverage'):.0f}%, "
+          f"Responsibility {response.get('responsibility_coverage'):.0f}%")
     return response
 
 
