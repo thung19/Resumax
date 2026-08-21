@@ -629,7 +629,11 @@ async def accept_reject_bullet(resume_id: str, req: AcceptRejectRequest):
     ir_path = GENERATED_DIR / f"{resume_id}_tailored_ir.json"
     ir_path.write_text(tailored_ir.model_dump_json(indent=2))
 
-    return result.model_dump()
+    # Return result, ensuring keyword_coverage is preserved
+    response = result.model_dump()
+    if not response.get("keyword_coverage"):
+        response["keyword_coverage"] = result.keyword_coverage
+    return response
 
 
 @app.post("/tailor/{resume_id}/skill")
@@ -651,7 +655,11 @@ async def accept_reject_skill(resume_id: str, req: SkillChangeRequest):
     tailored_ir = service.apply_tailoring(ir, result)
     _tailored_ir_store[resume_id] = tailored_ir
 
-    return result.model_dump()
+    # Return result, ensuring keyword_coverage is preserved
+    response = result.model_dump()
+    if not response.get("keyword_coverage"):
+        response["keyword_coverage"] = result.keyword_coverage
+    return response
 
 
 @app.post("/tailor/{resume_id}/edit")
@@ -741,7 +749,11 @@ async def accept_all_skills(resume_id: str, req: SkillBatchAcceptRequest):
     tailored_ir = service.apply_tailoring(ir, result)
     _tailored_ir_store[resume_id] = tailored_ir
 
-    return result.model_dump()
+    # Return result, ensuring keyword_coverage is preserved
+    response = result.model_dump()
+    if not response.get("keyword_coverage"):
+        response["keyword_coverage"] = result.keyword_coverage
+    return response
 
 
 @app.get("/preview/{resume_id}/tailored", response_class=HTMLResponse)
