@@ -601,11 +601,13 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
     """
     jd = _jd_store.get(resume_id)
     if jd is None:
-        # No JD available — coverage can't be recalculated
+        logger.warning(f"No JD found in store for {resume_id} — coverage not recalculated")
         return
 
     try:
         from backend.tailoring.matcher import Matcher
+
+        logger.info(f"Recalculating coverage for {resume_id}")
 
         # Clear previous coverage
         result.keyword_coverage = []
@@ -615,9 +617,17 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         match_result = matcher.match()
 
         # Update coverage percentages from matcher
+        old_req = result.required_skill_coverage
+        old_tech = result.technical_keyword_coverage
+        old_resp = result.responsibility_coverage
+
         result.required_skill_coverage = match_result.required_coverage
         result.technical_keyword_coverage = match_result.technical_coverage
         result.responsibility_coverage = match_result.responsibility_coverage
+
+        logger.info(f"Coverage updated: Required {old_req}% → {result.required_skill_coverage}%, "
+                   f"Technical {old_tech}% → {result.technical_keyword_coverage}%, "
+                   f"Responsibility {old_resp}% → {result.responsibility_coverage}%")
 
         # Rebuild keyword coverage list
         all_jd_keywords = jd.all_keywords()
@@ -703,6 +713,9 @@ async def accept_reject_bullet(resume_id: str, req: AcceptRejectRequest):
 
     # Return result with updated coverage
     response = result.model_dump()
+    logger.info(f"Accept response: Required {response.get('required_skill_coverage')}%, "
+               f"Technical {response.get('technical_keyword_coverage')}%, "
+               f"Responsibility {response.get('responsibility_coverage')}%")
     return response
 
 
