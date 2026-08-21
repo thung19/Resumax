@@ -598,6 +598,9 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
 
     When bullets are accepted/rejected, the resume content changes, so we need
     to re-run the matcher to get updated coverage percentages.
+
+    IMPORTANT: We must use the TAILORED text from result.bullet_changes, not the
+    original text in ir.content.bullets, because the matcher scans the text content.
     """
     jd = _jd_store.get(resume_id)
     if jd is None:
@@ -605,25 +608,70 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         return
 
     try:
-        from backend.tailoring.matcher import Matcher
+        from backend.tailoring.matcher import _text_contains_keyword, _normalize
 
         print(f"DEBUG: Recalculating coverage for {resume_id}")
 
         # Clear previous coverage
         result.keyword_coverage = []
 
-        # Re-run matcher with updated IR
-        matcher = Matcher(jd, ir.content, None)  # No resume bank needed for matching
-        match_result = matcher.match()
+        # Build resume text from TAILORED bullets (not original)
+        resume_parts = []
+        for change in result.bullet_changes:
+            # Use tailored_text if it's a rewrite, otherwise use original
+            text = change.tailored_text if change.action == "rewrite" else change.original_text
+            if change.action != "remove":  # Skip removed bullets
+                resume_parts.append(text)
 
-        # Update coverage percentages from matcher
+        # Add skills from IR
+        for section in ir.content.sections:
+            for cat in section.skill_categories:
+                resume_parts.append(f"{cat.category} {' '.join(cat.skills)}")
+
+        resume_text = " ".join(resume_parts)
+        resume_text_lower = _normalize(resume_text)
+
+        print(f"DEBUG: Built resume text from tailored bullets: {len(resume_text)} chars")
+
+        # Calculate coverage percentages from tailored resume text
         old_req = result.required_skill_coverage
         old_tech = result.technical_keyword_coverage
         old_resp = result.responsibility_coverage
 
-        result.required_skill_coverage = match_result.required_coverage
-        result.technical_keyword_coverage = match_result.technical_coverage
-        result.responsibility_coverage = match_result.responsibility_coverage
+        # Required skills coverage
+        required = jd.required_skills
+        if required:
+            matched_req = sum(
+                1 for s in required
+                if _text_contains_keyword(resume_text_lower, s.name)
+            )
+            result.required_skill_coverage = (matched_req / len(required)) * 100
+        else:
+            result.required_skill_coverage = 0.0
+
+        # Technical skills coverage
+        all_skills = jd.all_skills_flat()
+        if all_skills:
+            matched_count = sum(
+                1 for s in all_skills
+                if _text_contains_keyword(resume_text_lower, s.name)
+            )
+            result.technical_keyword_coverage = (matched_count / len(all_skills)) * 100
+        else:
+            result.technical_keyword_coverage = 0.0
+
+        # Responsibility coverage
+        responsibilities = jd.responsibilities
+        if responsibilities:
+            matched_resp = sum(
+                1 for r in responsibilities
+                if any(_text_contains_keyword(resume_text_lower, kw) for kw in r.keywords)
+                or any(_text_contains_keyword(resume_text_lower, word)
+                       for word in r.text.split() if len(word) > 4)
+            )
+            result.responsibility_coverage = (matched_resp / len(responsibilities)) * 100
+        else:
+            result.responsibility_coverage = 0.0
 
         print(f"DEBUG: Coverage updated: Required {old_req:.0f}% → {result.required_skill_coverage:.0f}%, "
               f"Technical {old_tech:.0f}% → {result.technical_keyword_coverage:.0f}%, "
