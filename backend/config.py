@@ -86,6 +86,47 @@ class LayoutConfig:
 
 
 @dataclass
+class TrimmingConfig:
+    """Configuration for bullet trimming behavior.
+
+    The system calculates character limits dynamically based on precise point
+    measurements using the actual font (e.g., Garamond at 11pt). Variable-width
+    fonts mean average char width may not match actual rendered width, so we
+    apply a safety factor to be conservative.
+    """
+
+    # Safety factor for variable-width font calculations (0.0 to 1.0)
+    # Accounts for the fact that average char width may not match actual rendered width
+    # due to variable-width fonts like Garamond (M and W are wider, i and l are narrower)
+    # 1.0 = use calculated width exactly (risky for variable-width fonts)
+    # 0.9 = use 90% of calculated width (10% buffer for wide characters)
+    # 0.8 = use 80% of calculated width (20% buffer, very conservative)
+    # Default: 0.85 (15% safety buffer for Garamond variable-width issues)
+    char_width_safety_factor: float = 0.85
+
+    # Enable trimming at all (can disable if causing too many reverts)
+    enable_trimming: bool = True
+
+    # Maximum trim rounds before giving up
+    max_trim_rounds: int = 3
+
+    @classmethod
+    def from_env(cls) -> "TrimmingConfig":
+        """Load configuration from environment variables."""
+        return cls(
+            char_width_safety_factor=float(
+                os.environ.get("TRIM_SAFETY_FACTOR", "0.85")
+            ),
+            enable_trimming=os.environ.get(
+                "TRIM_ENABLE", "true"
+            ).lower() == "true",
+            max_trim_rounds=int(
+                os.environ.get("TRIM_MAX_ROUNDS", "3")
+            ),
+        )
+
+
+@dataclass
 class LLMConfig:
     """Configuration for LLM behavior."""
 
@@ -138,6 +179,7 @@ class PipelineConfig:
 
     validation: ValidationConfig
     layout: LayoutConfig
+    trimming: TrimmingConfig
     llm: LLMConfig
 
     # Debug: enable detailed logging
@@ -152,6 +194,7 @@ class PipelineConfig:
         return cls(
             validation=ValidationConfig.from_env(),
             layout=LayoutConfig.from_env(),
+            trimming=TrimmingConfig.from_env(),
             llm=LLMConfig.from_env(),
             debug_logging=os.environ.get(
                 "DEBUG_LOGGING", "false"
@@ -167,6 +210,7 @@ class PipelineConfig:
         return cls(
             validation=ValidationConfig(),
             layout=LayoutConfig(),
+            trimming=TrimmingConfig(),
             llm=LLMConfig(),
         )
 

@@ -63,8 +63,22 @@ def _compute_char_cap(
     available_width_pt: float,
     font_name: str,
     font_size: float,
+    safety_factor: float = 0.85,
 ) -> int:
-    """Compute how many chars fit on one line for text with this character mix."""
+    """Compute how many chars fit on one line for text with this character mix.
+
+    Args:
+        text: Current bullet text (used to estimate average character width)
+        available_width_pt: Available width in points for the text
+        font_name: Font name (e.g., "Garamond")
+        font_size: Font size in points
+        safety_factor: Conservative factor (0.0 to 1.0) to account for variable-width
+            fonts. Lower values = more conservative. Default 0.85 adds 15% buffer
+            for characters like M/W that are wider than average.
+
+    Returns:
+        Maximum characters that should fit on one line.
+    """
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
     if not text:
@@ -76,7 +90,9 @@ def _compute_char_cap(
     # Subtract bullet prefix width
     prefix_width = stringWidth("\u2022 ", font_name, font_size)
     usable = available_width_pt - prefix_width
-    return max(40, int(usable / avg_char_width))
+    # Apply safety factor: conservative estimate accounts for variable-width fonts
+    conservative_usable = usable * safety_factor
+    return max(40, int(conservative_usable / avg_char_width))
 
 
 def _build_resume_text(

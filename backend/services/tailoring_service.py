@@ -283,10 +283,14 @@ class TailoringService:
         Re-validates trimmed text against claim validator to prevent
         fabricated terms from being introduced during trimming.
         """
+        from backend.config import get_config
         from backend.tailoring.tailoring_engine import (
             TailoringEngine,
             _compute_char_cap,
         )
+
+        # Load configuration for trimming settings
+        config = get_config()
 
         # Collect overflowing rewrites
         overflow_changes: list[BulletChange] = []
@@ -314,6 +318,7 @@ class TailoringService:
                     measurer.raw_width_pt,
                     measurer.font_name,
                     measurer.font_size,
+                    safety_factor=config.trimming.char_width_safety_factor,
                 )
                 overflow_text = change.tailored_text[break_idx:]
                 measurement = measurer.measure(change.tailored_text)
