@@ -61,37 +61,63 @@ Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bull
 # BATCH BULLET TRIMMING
 # =============================================================================
 
-BATCH_TRIM_SYSTEM_V2 = """You are an expert resume writer specializing in concise, impactful bullets. Your task: trim resume bullets to fit on one line while preserving all metrics and keywords.
+BATCH_TRIM_SYSTEM_V2 = """You are an expert resume writer who trims bullets to fit on ONE LINE ONLY. This is non-negotiable.
 
-CRITICAL: Never fabricate. Keep all metrics, numbers, and listed keywords.
-Return ONLY valid JSON."""
+Your ONLY goal: rewrite each bullet to fit within the EXACT character limit stated. Period.
+
+Rules:
+1. MUST fit within the char limit — not close, not almost — exact or shorter
+2. Keep ALL metrics, numbers, and keywords listed in "Keep:"
+3. Remove adjectives, adverbs, and descriptive padding
+4. Use imperative verbs (Deployed, Built, Optimized) not passive (Was deployed, Had been building)
+5. Cut phrases like "and", "to", "through", "by", "with" where the meaning still works
+6. Never fabricate or omit numbers
+
+CRITICAL: If a bullet cannot fit with required content, report it honestly — do NOT return text longer than the limit."""
 
 
-BATCH_TRIM_USER_V2 = """Trim these resume bullets to fit their max character limits.
+BATCH_TRIM_USER_V2 = """TASK: Trim these bullets to fit ONE LINE ONLY. Each has a hard character limit that CANNOT be exceeded.
 
-For each bullet, the | marks where the line overflows — everything after spills to a second line.
+For each bullet:
+- Max chars: the HARD LIMIT (text MUST NOT exceed this)
+- Keep: these keywords/metrics MUST stay
+- Current: the bullet text now (X chars)
+- Overflow: [example of what goes off-page]
 
 {bullet_list}
 
-Rewrite each bullet so it fits BEFORE the | mark.
-Each bullet MUST be within its stated max chars.
-Keep all numbers, metrics, and the listed keywords.
+REWRITE RULES:
+1. Strip adjectives first (scalable, robust, modular, seamless, efficient, innovative)
+2. Use short verbs (Built not "Built out", Deploy not "Deployed", Design not "Designed and implemented")
+3. Merge clauses (remove "to", "by", "and" where possible): "Built and deployed" → "Deployed"
+4. Abbreviate: "HTTP API" → "API", "full-stack" → "full-stack" (this one stays)
+5. Numbers and keywords listed in "Keep:" ALWAYS stay
+
+EXAMPLE:
+- Input (156 chars, max 120): "Architected and deployed a distributed system using Kubernetes to handle 10K requests per second"
+- Output (120 chars): "Deployed distributed Kubernetes system handling 10K requests/second"
 
 Return a JSON object:
 {{
   "trimmed_bullets": [
     {{
-      "bullet_id": "...",
-      "trimmed_text": "..."
+      "bullet_id": "b1",
+      "trimmed_text": "trimmed text here (MUST be <= char limit)"
     }}
   ]
 }}"""
 
 
-BATCH_TRIM_RETRY_HINT = """The model struggled to trim bullets to the exact character limit.
-Try a more aggressive approach: prioritize metrics and core action over descriptive language.
-For example: "Architected and deployed a distributed system" → "Deployed distributed system"
-Keep the essential content; drop the adjectives."""
+BATCH_TRIM_RETRY_HINT = """The previous trimming did not meet the character limits. Be more aggressive:
+
+1. Cut ALL descriptive words (scalable, efficient, modular, seamless, innovative, robust)
+2. Use ACTION + RESULT format only, no adjectives: instead of "successfully architected a robust system", write "architected system"
+3. Abbreviate: "and" → remove, "to" → remove if meaning works, "through" → remove
+4. Short verb forms: "Deployed" (9 chars) vs "Built out and deployed" (22 chars) — use first
+5. Keywords/numbers from "Keep:" are MANDATORY but everything else is optional
+
+If you cannot fit the bullet within the limit while keeping keywords, the bullet should not be trimmed.
+Return only bullets that fit exactly or under the limit."""
 
 
 # =============================================================================
