@@ -66,8 +66,10 @@ def _compute_char_cap(
 ) -> int:
     """Compute how many chars fit on one line for text with this character mix.
 
-    Uses average character width from the actual text, which provides a reasonable
-    estimate for the bullet's character composition.
+    Uses average character width from the actual text, then applies a 3% safety
+    buffer to account for variable-width font variations (e.g., M and W are wider
+    than average, i and l are narrower). When LLM rewrites text, character
+    composition changes, so we need conservative margin.
 
     Args:
         text: Current bullet text (used to estimate average character width)
@@ -76,7 +78,7 @@ def _compute_char_cap(
         font_size: Font size in points
 
     Returns:
-        Maximum characters that should fit on one line.
+        Maximum characters that should safely fit on one line.
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
@@ -89,7 +91,10 @@ def _compute_char_cap(
     # Subtract bullet prefix width
     prefix_width = stringWidth("\u2022 ", font_name, font_size)
     usable = available_width_pt - prefix_width
-    return max(40, int(usable / avg_char_width))
+    # Apply 3% safety buffer for variable-width font composition changes
+    # When LLM rewrites, character mix changes (more M/W, fewer i/l)
+    conservative_usable = usable * 0.97
+    return max(40, int(conservative_usable / avg_char_width))
 
 
 def _build_resume_text(
