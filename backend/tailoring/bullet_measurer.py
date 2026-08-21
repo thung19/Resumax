@@ -29,104 +29,8 @@ from backend.models.resume_layout import ResumeLayout
 
 logger = logging.getLogger(__name__)
 
-# --- Font resolution ---
-
-_registered_fonts: set[str] = set()
-
-# Bundled fonts directory (ships with the app)
-_BUNDLED_FONTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "fonts"
-)
-
-_FONT_DIRS = [
-    _BUNDLED_FONTS_DIR,  # check bundled fonts first
-    "/System/Library/Fonts/Supplemental",
-    "/System/Library/Fonts",
-    "/Library/Fonts",
-    os.path.expanduser("~/Library/Fonts"),
-    "/usr/share/fonts/truetype",
-    "/usr/local/share/fonts",
-    r"C:\Windows\Fonts",
-]
-
-_FONT_FILE_PATTERNS: dict[str, list[str]] = {
-    "garamond": [
-        "EBGaramond-Regular.ttf",  # bundled open-source Garamond
-        "Garamond.ttf",
-        "Garamond-Regular.ttf",
-    ],
-    "calibri": ["Calibri.ttf", "calibri.ttf"],
-    "cambria": ["Cambria.ttf", "cambria.ttf"],
-    "georgia": ["Georgia.ttf", "georgia.ttf"],
-    "palatino": ["Palatino.ttc", "PalatinoLinotype.ttf"],
-    "arial": ["Arial.ttf", "arial.ttf"],
-    "helvetica": ["Helvetica.ttc", "HelveticaNeue.ttc"],
-    "times new roman": ["Times New Roman.ttf", "times.ttf"],
-    "times": ["Times.ttc", "Times New Roman.ttf"],
-}
-
-_SERIF = {"garamond", "georgia", "times", "times new roman", "palatino", "cambria"}
-_SANS = {"arial", "helvetica", "calibri", "verdana", "tahoma", "segoe ui"}
-
-
-def _find_font_file(family: str) -> Optional[str]:
-    fl = family.lower().strip()
-    patterns = _FONT_FILE_PATTERNS.get(fl, [f"{family}.ttf", f"{family.title()}.ttf"])
-    for font_dir in _FONT_DIRS:
-        if not os.path.isdir(font_dir):
-            continue
-        for pattern in patterns:
-            path = os.path.join(font_dir, pattern)
-            if os.path.isfile(path):
-                return path
-    for font_dir in _FONT_DIRS:
-        if not os.path.isdir(font_dir):
-            continue
-        try:
-            for f in os.listdir(font_dir):
-                if fl in f.lower() and f.lower().endswith((".ttf", ".otf")):
-                    return os.path.join(font_dir, f)
-        except OSError:
-            continue
-    return None
-
-
-def _register_and_resolve(family: str, bold: bool = False, italic: bool = False) -> str:
-    fl = family.lower().strip()
-    rl_name = f"Custom-{family.replace(' ', '')}"
-    if rl_name in _registered_fonts:
-        return rl_name
-    font_path = _find_font_file(family)
-    if font_path:
-        try:
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
-            if font_path.endswith(".ttc"):
-                pdfmetrics.registerFont(TTFont(rl_name, font_path, subfontIndex=0))
-            else:
-                pdfmetrics.registerFont(TTFont(rl_name, font_path))
-            _registered_fonts.add(rl_name)
-            logger.info(f"Registered font '{family}' from {font_path}")
-            return rl_name
-        except Exception as e:
-            logger.warning(f"Failed to register font '{family}': {e}")
-    return _builtin_fallback(fl, bold, italic)
-
-
-def _builtin_fallback(family_lower: str, bold: bool, italic: bool) -> str:
-    if family_lower in _SERIF or "garamond" in family_lower:
-        base = "Times"
-    elif family_lower in _SANS:
-        base = "Helvetica"
-    else:
-        base = "Helvetica"
-    if bold and italic:
-        return f"{base}-BoldItalic" if base == "Times" else f"{base}-BoldOblique"
-    elif bold:
-        return f"{base}-Bold"
-    elif italic:
-        return f"{base}-Italic" if base == "Times" else f"{base}-Oblique"
-    return f"{base}-Roman" if base == "Times" else base
+# === Use shared font resolution module ===
+from backend.renderers.fonts import register_and_resolve
 
 
 def _escape(text: str) -> str:
@@ -191,7 +95,7 @@ class BulletMeasurer:
         leading = 11.5
 
         if bullet_style:
-            font_family = _register_and_resolve(
+            font_family = register_and_resolve(
                 bullet_style.font.family,
                 bullet_style.font.bold,
                 bullet_style.font.italic,
@@ -202,7 +106,7 @@ class BulletMeasurer:
         else:
             df = layout.default_font
             if df.family:
-                font_family = _register_and_resolve(df.family, False, False)
+                font_family = register_and_resolve(df.family, False, False)
             if df.size_pt:
                 font_size = df.size_pt
                 leading = font_size * 1.15

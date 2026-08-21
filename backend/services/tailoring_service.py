@@ -306,6 +306,7 @@ class TailoringService:
 
         trimmer = TailoringEngine()
         full_resume_text = self._build_full_resume_text(ir.content)
+        failure_history: dict[str, dict] = {}  # Track failures for retry feedback
 
         # Up to 3 batch rounds
         for round_num in range(3):
@@ -318,10 +319,11 @@ class TailoringService:
                     measurer.raw_width_pt,
                     measurer.font_name,
                     measurer.font_size,
-                    safety_factor=config.trimming.char_width_safety_factor,
+                    use_widest_char=True,  # Conservative: assume all chars as wide as M/W
                 )
                 overflow_text = change.tailored_text[break_idx:]
                 measurement = measurer.measure(change.tailored_text)
+                chars_over = len(change.tailored_text) - char_cap
 
                 result.debug_log.append(
                     f"TRIMMING {change.bullet_id} (round {round_num + 1}): "
@@ -340,9 +342,11 @@ class TailoringService:
                     "keywords": change.target_keywords or [],
                 })
 
-            # Single LLM call for all overflowing bullets
+            # Single LLM call for all overflowing bullets (with failure history on retry)
             trim_results = trimmer.batch_trim_bullets(
-                batch_items, is_retry=(round_num > 0),
+                batch_items,
+                is_retry=(round_num > 0),
+                failure_history=failure_history if round_num > 0 else None,
             )
 
             # Validate each result individually
@@ -366,6 +370,15 @@ class TailoringService:
                         change.reason = "Rewrite too long, trim failed"
                     else:
                         still_overflowing.append(change)
+                        # Track failure for retry: LLM returned nothing
+                        failure_history[change.bullet_id] = {
+                            "previous_attempt": change.tailored_text,
+                            "overflow_chars": len(change.tailored_text) - next(
+                                (b["max_chars"] for b in batch_items if b["bullet_id"] == change.bullet_id),
+                                120
+                            ),
+                            "prev_char_count": len(change.tailored_text),
+                        }
                     continue
 
                 # === Re-validate trimmed text ===
@@ -383,6 +396,16 @@ class TailoringService:
                     change.tailored_text = change.original_text
                     change.action = "keep"
                     change.reason = "Rewrite too long, trim failed"
+                    if not is_final:
+                        # Track failure for retry: validation failed
+                        failure_history[change.bullet_id] = {
+                            "previous_attempt": trimmed,
+                            "overflow_chars": len(trimmed) - next(
+                                (b["max_chars"] for b in batch_items if b["bullet_id"] == change.bullet_id),
+                                120
+                            ),
+                            "prev_char_count": len(trimmed),
+                        }
                     continue
 
                 trim_m = measurer.measure(trimmed)
@@ -411,9 +434,17 @@ class TailoringService:
                         change.reason = "Rewrite too long, trim failed"
                     else:
                         still_overflowing.append(change)
+                        # Track failure for retry: made no progress
+                        failure_history[change.bullet_id] = {
+                            "previous_attempt": trimmed,
+                            "overflow_chars": len(trimmed) - next(
+                                (b["max_chars"] for b in batch_items if b["bullet_id"] == change.bullet_id),
+                                120
+                            ),
+                            "prev_char_count": len(trimmed),
+                        }
                 else:
-                    # Made progress but still overflows — use shorter
-                    # text for retry
+                    # Made progress but still overflows — use shorter text for retry
                     result.debug_log.append(
                         f"RETRIM {change.bullet_id}: "
                         f"{len(trimmed)} chars, "
@@ -429,6 +460,17 @@ class TailoringService:
                         change.reason = "Rewrite too long, trim failed"
                     else:
                         still_overflowing.append(change)
+                        # Track failure for retry: still overflowing despite progress
+                        failure_history[change.bullet_id] = {
+                            "previous_attempt": trimmed,
+                            "overflow_chars": max(0, len(trimmed) - next(
+                                (b["max_chars"] for b in batch_items if b["bullet_id"] == change.bullet_id),
+                                120
+                            )),
+                            "prev_char_count": len(trimmed),
+                        }
+                        # Update text to the trimmed version for next attempt
+                        change.tailored_text = trimmed
 
             # Prepare next round with only the failures
             overflow_changes = still_overflowing

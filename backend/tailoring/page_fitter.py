@@ -254,7 +254,7 @@ class PageFitter:
         return truncated.rstrip(",;: ")
 
     def _update_bullet(self, b_info: BulletInfo, new_text: str):
-        """Update a bullet's text in the IR."""
+        """Update a bullet's text in the IR and layout elements."""
         section = self._ir.content.sections[b_info.section_idx]
         if b_info.entry_type == "experience":
             section.experience_entries[b_info.entry_idx].bullets[b_info.bullet_idx].text = new_text
@@ -262,6 +262,34 @@ class PageFitter:
             section.project_entries[b_info.entry_idx].bullets[b_info.bullet_idx].text = new_text
         b_info.char_count = len(new_text)
         b_info.text = new_text
+
+        # Sync layout elements so renderers see the updated text
+        if self._ir.layout.elements:
+            from backend.models.resume_layout import ElementType, RunFormat
+            # Find the matching bullet element by matching the start of the original text
+            original_prefix = b_info.text[:30]
+            for el in self._ir.layout.elements:
+                if el.element_type == ElementType.BULLET:
+                    el_text = "".join(
+                        r.text for r in el.paragraph_format.runs if not r.is_tab
+                    ).lstrip("• ").strip()
+                    if el_text[:30] == original_prefix:
+                        # Update the element text with the new content
+                        if el.paragraph_format.runs:
+                            first_run = el.paragraph_format.runs[0]
+                            el.paragraph_format.runs = [RunFormat(
+                                text="• " + new_text,
+                                font_family=first_run.font_family,
+                                font_size_half_pt=first_run.font_size_half_pt,
+                                bold=first_run.bold,
+                                bold_cs=first_run.bold_cs,
+                                italic=first_run.italic,
+                                italic_cs=first_run.italic_cs,
+                                color=first_run.color,
+                            )]
+                        else:
+                            el.paragraph_format.runs = [RunFormat(text="• " + new_text)]
+                        break
 
     def _remove_bullet(self, b_info: BulletInfo):
         """Remove a bullet from both content and layout elements."""

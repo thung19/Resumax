@@ -58,41 +58,80 @@ class TailoringEngineResult:
 
 
 
+def _get_widest_char_width(font_name: str, font_size: float) -> float:
+    """Get the width of the widest character in a font.
+
+    Measures common wide characters (M, W, etc.) and returns the maximum.
+    This is used for conservative character cap calculations since variable-width
+    fonts mean some characters are much wider than average.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    # Test commonly wide characters in most fonts
+    wide_chars = ['M', 'W', 'Q', 'G', '@', '#']
+    max_width = 0
+
+    for char in wide_chars:
+        try:
+            width = stringWidth(char, font_name, font_size)
+            max_width = max(max_width, width)
+        except:
+            pass
+
+    # Fallback: if measurement fails, estimate as 0.5 * font size (typical for wide chars)
+    if max_width <= 0:
+        max_width = font_size * 0.5
+
+    return max_width
+
+
 def _compute_char_cap(
     text: str,
     available_width_pt: float,
     font_name: str,
     font_size: float,
-    safety_factor: float = 0.85,
+    use_widest_char: bool = True,
 ) -> int:
-    """Compute how many chars fit on one line for text with this character mix.
+    """Compute how many chars fit on one line, conservatively.
 
     Args:
-        text: Current bullet text (used to estimate average character width)
+        text: Current bullet text (used as fallback for average width)
         available_width_pt: Available width in points for the text
         font_name: Font name (e.g., "Garamond")
         font_size: Font size in points
-        safety_factor: Conservative factor (0.0 to 1.0) to account for variable-width
-            fonts. Lower values = more conservative. Default 0.85 adds 15% buffer
-            for characters like M/W that are wider than average.
+        use_widest_char: If True (default), calculate limit assuming worst case
+            (every character is as wide as the widest in the font, like M or W).
+            If False, use average character width from the text (less conservative).
 
     Returns:
-        Maximum characters that should fit on one line.
+        Maximum characters that should safely fit on one line, accounting for
+        variable-width fonts.
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
     if not text:
         return 120
+
+    # Subtract bullet prefix width ("\u2022 ")
+    prefix_width = stringWidth("\u2022 ", font_name, font_size)
+    usable = available_width_pt - prefix_width
+
+    if usable <= 0:
+        return 40
+
+    if use_widest_char:
+        # Conservative: assume all characters are as wide as the widest character
+        # This accounts for variable-width fonts (M/W are ~50% wider than average)
+        widest_width = _get_widest_char_width(font_name, font_size)
+        if widest_width > 0:
+            return max(40, int(usable / widest_width))
+
+    # Fallback: use average character width from the text
     text_width = stringWidth(text, font_name, font_size)
     if text_width <= 0:
         return 120
     avg_char_width = text_width / len(text)
-    # Subtract bullet prefix width
-    prefix_width = stringWidth("\u2022 ", font_name, font_size)
-    usable = available_width_pt - prefix_width
-    # Apply safety factor: conservative estimate accounts for variable-width fonts
-    conservative_usable = usable * safety_factor
-    return max(40, int(conservative_usable / avg_char_width))
+    return max(40, int(usable / avg_char_width))
 
 
 def _build_resume_text(
@@ -304,6 +343,7 @@ class TailoringEngine:
         self,
         bullets: list[dict],
         is_retry: bool = False,
+        failure_history: Optional[dict[str, dict]] = None,
     ) -> dict[str, Optional[str]]:
         """Trim multiple overflowing bullets in a single LLM call.
 
@@ -314,6 +354,11 @@ class TailoringEngine:
             - max_chars: int (per-bullet char cap)
             - keywords: list[str] (keywords to preserve)
         is_retry: if True, nudge toward rephrasing rather than just trimming.
+        failure_history: dict mapping bullet_id → {
+            "previous_attempt": str (what was tried before),
+            "overflow_chars": int (how many chars over the limit),
+            "prev_char_count": int (length of previous attempt)
+        }
 
         Returns: dict mapping bullet_id → trimmed text (or None if failed).
         """
@@ -329,23 +374,46 @@ class TailoringEngine:
         except ImportError:
             return {b["bullet_id"]: None for b in bullets}
 
-        # Build per-bullet entries
+        # Build per-bullet entries with failure history if available
         entries: list[str] = []
         for b in bullets:
             fits = b["text"][:b["break_index"]]
             overflows = b["text"][b["break_index"]:]
             chars_over = len(b["text"]) - b["max_chars"]
             kw_text = ", ".join(b["keywords"]) if b["keywords"] else "the key terms"
-            entries.append(
+
+            entry = (
                 f"[{b['bullet_id']}] (max {b['max_chars']} chars, "
                 f"currently {len(b['text'])}, cut at least {chars_over})\n"
                 f"  Keep: {kw_text}\n"
                 f"  {fits}|{overflows}"
             )
 
+            # If this bullet failed before, show the previous attempt and how much it overflowed
+            if failure_history and b["bullet_id"] in failure_history:
+                history = failure_history[b["bullet_id"]]
+                prev_text = history.get("previous_attempt", "")
+                overflow = history.get("overflow_chars", 0)
+                if prev_text and overflow > 0:
+                    entry += (
+                        f"\n  ❌ Previous attempt ({len(prev_text)} chars): "
+                        f"\"{prev_text}\" (STILL {overflow} chars over)\n"
+                        f"     Try removing more adjectives or less important words"
+                    )
+
+            entries.append(entry)
+
         bullet_list = "\n\n".join(entries)
 
-        retry_hint = f"\n\n{BATCH_TRIM_RETRY_HINT}" if is_retry else ""
+        # Build retry hint with specific failure context
+        retry_hint = ""
+        if is_retry:
+            retry_hint = f"\n\n{BATCH_TRIM_RETRY_HINT}"
+            if failure_history:
+                retry_hint += (
+                    "\n\nThese bullets FAILED in the previous round and are STILL TOO LONG. "
+                    "Show exactly what you're cutting and why."
+                )
 
         user_msg = BATCH_TRIM_USER_V2.format(bullet_list=bullet_list) + retry_hint
 
