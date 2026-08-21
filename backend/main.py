@@ -593,6 +593,75 @@ async def tailor_resume(resume_id: str, req: TailorRequest, request: Request):
     return resp
 
 
+def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR):
+    """Recalculate coverage stats after tailoring changes.
+
+    When bullets are accepted/rejected, the resume content changes, so we need
+    to re-run the matcher to get updated coverage percentages.
+    """
+    jd = _jd_store.get(resume_id)
+    if jd is None:
+        # No JD available — coverage can't be recalculated
+        return
+
+    try:
+        from backend.tailoring.matcher import Matcher
+
+        # Clear previous coverage
+        result.keyword_coverage = []
+
+        # Re-run matcher with updated IR
+        matcher = Matcher(jd, ir.content, None)  # No resume bank needed for matching
+        match_result = matcher.match()
+
+        # Update coverage percentages from matcher
+        result.required_skill_coverage = match_result.required_coverage
+        result.technical_keyword_coverage = match_result.technical_coverage
+        result.responsibility_coverage = match_result.responsibility_coverage
+
+        # Rebuild keyword coverage list
+        all_jd_keywords = jd.all_keywords()
+        resume_text = " ".join(
+            c.tailored_text.lower()
+            for c in result.bullet_changes
+            if c.action != "remove"
+        )
+        for section in ir.content.sections:
+            for cat in section.skill_categories:
+                resume_text += " " + " ".join(s.lower() for s in cat.skills)
+
+        for kw in all_jd_keywords[:30]:
+            skill_info = next(
+                (s for s in jd.all_skills_flat()
+                 if s.name.lower() == kw.lower()),
+                None,
+            )
+            importance = skill_info.importance if skill_info else 0.3
+
+            if kw.lower() in resume_text:
+                orig_text = " ".join(
+                    c.original_text.lower() for c in result.bullet_changes
+                )
+                for section in ir.content.sections:
+                    for cat in section.skill_categories:
+                        orig_text += " " + " ".join(s.lower() for s in cat.skills)
+                status = "matched" if kw.lower() in orig_text else "added"
+                source = "present in resume" if status == "matched" else "added via rewrite"
+            else:
+                status = "missing"
+                source = "not in resume bank"
+
+            from backend.models.tailoring import KeywordCoverage
+            result.keyword_coverage.append(KeywordCoverage(
+                keyword=kw,
+                importance=importance,
+                status=status,
+                source=source,
+            ))
+    except Exception as e:
+        logger.warning(f"Failed to recalculate coverage for {resume_id}: {e}")
+
+
 @app.get("/tailor/{resume_id}/result")
 async def get_tailoring_result(resume_id: str):
     """Get the tailoring result."""
@@ -629,10 +698,11 @@ async def accept_reject_bullet(resume_id: str, req: AcceptRejectRequest):
     ir_path = GENERATED_DIR / f"{resume_id}_tailored_ir.json"
     ir_path.write_text(tailored_ir.model_dump_json(indent=2))
 
-    # Return result, ensuring keyword_coverage is preserved
+    # Recalculate coverage stats based on updated resume
+    _recalculate_coverage(resume_id, result, tailored_ir)
+
+    # Return result with updated coverage
     response = result.model_dump()
-    if not response.get("keyword_coverage"):
-        response["keyword_coverage"] = result.keyword_coverage
     return response
 
 
@@ -655,10 +725,11 @@ async def accept_reject_skill(resume_id: str, req: SkillChangeRequest):
     tailored_ir = service.apply_tailoring(ir, result)
     _tailored_ir_store[resume_id] = tailored_ir
 
-    # Return result, ensuring keyword_coverage is preserved
+    # Recalculate coverage stats based on updated resume
+    _recalculate_coverage(resume_id, result, tailored_ir)
+
+    # Return result with updated coverage
     response = result.model_dump()
-    if not response.get("keyword_coverage"):
-        response["keyword_coverage"] = result.keyword_coverage
     return response
 
 
@@ -749,10 +820,11 @@ async def accept_all_skills(resume_id: str, req: SkillBatchAcceptRequest):
     tailored_ir = service.apply_tailoring(ir, result)
     _tailored_ir_store[resume_id] = tailored_ir
 
-    # Return result, ensuring keyword_coverage is preserved
+    # Recalculate coverage stats based on updated resume
+    _recalculate_coverage(resume_id, result, tailored_ir)
+
+    # Return result with updated coverage
     response = result.model_dump()
-    if not response.get("keyword_coverage"):
-        response["keyword_coverage"] = result.keyword_coverage
     return response
 
 
