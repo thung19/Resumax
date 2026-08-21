@@ -638,29 +638,29 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         old_tech = result.technical_keyword_coverage
         old_resp = result.responsibility_coverage
 
-        # Required skills coverage
+        # Required skills coverage (decimal 0.0-1.0, like matcher)
         required = jd.required_skills
         if required:
             matched_req = sum(
                 1 for s in required
                 if _text_contains_keyword(resume_text_lower, s.name)
             )
-            result.required_skill_coverage = (matched_req / len(required)) * 100
+            result.required_skill_coverage = matched_req / len(required)
         else:
             result.required_skill_coverage = 0.0
 
-        # Technical skills coverage
+        # Technical skills coverage (decimal 0.0-1.0, like matcher)
         all_skills = jd.all_skills_flat()
         if all_skills:
             matched_count = sum(
                 1 for s in all_skills
                 if _text_contains_keyword(resume_text_lower, s.name)
             )
-            result.technical_keyword_coverage = (matched_count / len(all_skills)) * 100
+            result.technical_keyword_coverage = matched_count / len(all_skills)
         else:
             result.technical_keyword_coverage = 0.0
 
-        # Responsibility coverage
+        # Responsibility coverage (decimal 0.0-1.0, like matcher)
         responsibilities = jd.responsibilities
         if responsibilities:
             matched_resp = sum(
@@ -669,7 +669,7 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
                 or any(_text_contains_keyword(resume_text_lower, word)
                        for word in r.text.split() if len(word) > 4)
             )
-            result.responsibility_coverage = (matched_resp / len(responsibilities)) * 100
+            result.responsibility_coverage = matched_resp / len(responsibilities)
         else:
             result.responsibility_coverage = 0.0
 
