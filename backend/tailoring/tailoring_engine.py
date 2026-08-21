@@ -58,79 +58,37 @@ class TailoringEngineResult:
 
 
 
-def _get_widest_char_width(font_name: str, font_size: float) -> float:
-    """Get the width of the widest character in a font.
-
-    Measures common wide characters (M, W, etc.) and returns the maximum.
-    This is used for conservative character cap calculations since variable-width
-    fonts mean some characters are much wider than average.
-    """
-    from reportlab.pdfbase.pdfmetrics import stringWidth
-
-    # Test commonly wide characters in most fonts
-    wide_chars = ['M', 'W', 'Q', 'G', '@', '#']
-    max_width = 0
-
-    for char in wide_chars:
-        try:
-            width = stringWidth(char, font_name, font_size)
-            max_width = max(max_width, width)
-        except:
-            pass
-
-    # Fallback: if measurement fails, estimate as 0.5 * font size (typical for wide chars)
-    if max_width <= 0:
-        max_width = font_size * 0.5
-
-    return max_width
-
-
 def _compute_char_cap(
     text: str,
     available_width_pt: float,
     font_name: str,
     font_size: float,
-    use_widest_char: bool = True,
 ) -> int:
-    """Compute how many chars fit on one line, conservatively.
+    """Compute how many chars fit on one line for text with this character mix.
+
+    Uses average character width from the actual text, which provides a reasonable
+    estimate for the bullet's character composition.
 
     Args:
-        text: Current bullet text (used as fallback for average width)
+        text: Current bullet text (used to estimate average character width)
         available_width_pt: Available width in points for the text
         font_name: Font name (e.g., "Garamond")
         font_size: Font size in points
-        use_widest_char: If True (default), calculate limit assuming worst case
-            (every character is as wide as the widest in the font, like M or W).
-            If False, use average character width from the text (less conservative).
 
     Returns:
-        Maximum characters that should safely fit on one line, accounting for
-        variable-width fonts.
+        Maximum characters that should fit on one line.
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
     if not text:
         return 120
-
-    # Subtract bullet prefix width ("\u2022 ")
-    prefix_width = stringWidth("\u2022 ", font_name, font_size)
-    usable = available_width_pt - prefix_width
-
-    if usable <= 0:
-        return 40
-
-    if use_widest_char:
-        # Conservative: assume all characters are as wide as the widest character
-        # This accounts for variable-width fonts (M/W are ~50% wider than average)
-        widest_width = _get_widest_char_width(font_name, font_size)
-        if widest_width > 0:
-            return max(40, int(usable / widest_width))
-
-    # Fallback: use average character width from the text
     text_width = stringWidth(text, font_name, font_size)
     if text_width <= 0:
         return 120
     avg_char_width = text_width / len(text)
+    # Subtract bullet prefix width
+    prefix_width = stringWidth("\u2022 ", font_name, font_size)
+    usable = available_width_pt - prefix_width
     return max(40, int(usable / avg_char_width))
 
 

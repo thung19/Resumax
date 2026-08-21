@@ -319,7 +319,6 @@ class TailoringService:
                     measurer.raw_width_pt,
                     measurer.font_name,
                     measurer.font_size,
-                    use_widest_char=True,  # Conservative: assume all chars as wide as M/W
                 )
                 overflow_text = change.tailored_text[break_idx:]
                 measurement = measurer.measure(change.tailored_text)
