@@ -249,56 +249,19 @@ class TailoringService:
                 )
 
         # === REJECTION FEEDBACK LOOP ===
-        # Collect bullets that failed validation and retry them
-        rejected_bullets = [
-            (change, change.reason.split(": ", 1)[1].split("; ") if "Rewrite rejected:" in change.reason else [])
-            for change in result.bullet_changes
-            if change.action == "keep" and "Rewrite rejected:" in (change.reason or "")
-        ]
-
-        if rejected_bullets and len(rejected_bullets) <= 5:
-            result.debug_log.append(
-                f"RETRY LOOP: Showing model why {len(rejected_bullets)} bullets failed validation"
-            )
-            from backend.tailoring.tailoring_engine import TailoringEngine
-
-            engine = TailoringEngine()
-            retry_result = engine.retry_rejected_bullets(rejected_bullets, ir.content)
-
-            if retry_result.llm_used:
-                # Merge retry results back into main results
-                retry_map = {c.bullet_id: c for c in retry_result.bullet_changes}
-                for change in result.bullet_changes:
-                    if change.bullet_id in retry_map:
-                        retry_change = retry_map[change.bullet_id]
-                        if retry_change.action == "rewrite":
-                            # Re-validate the retry before accepting it
-                            facts = self._get_facts_for_bullet(
-                                change.bullet_id, bank, ir.content,
-                            )
-                            facts_with_resume = facts + [
-                                {"id": "_resume", "text": full_resume_text},
-                            ]
-                            validation = validator.validate(retry_change, facts_with_resume)
-                            if validation.valid:
-                                change.tailored_text = retry_change.tailored_text
-                                change.action = "rewrite"
-                                change.reason = (
-                                    retry_change.reason + " (retry after feedback)"
-                                )
-                                result.debug_log.append(
-                                    f"RETRY ACCEPTED {change.bullet_id}: "
-                                    f"\"{change.tailored_text[:60]}...\""
-                                )
-                            else:
-                                result.debug_log.append(
-                                    f"RETRY REJECTED {change.bullet_id}: "
-                                    f"still failed: {'; '.join(validation.issues)}"
-                                )
-                        else:
-                            result.debug_log.append(
-                                f"RETRY ACTION={retry_change.action} {change.bullet_id}"
-                            )
+        # TODO: Implement retry_rejected_bullets() method in TailoringEngine
+        # This feature collects bullets that failed validation and retries them
+        # Currently disabled because the method is not implemented
+        # See: https://github.com/resumax/resumax/issues/XXX
+        #
+        # rejected_bullets = [
+        #     (change, change.reason.split(": ", 1)[1].split("; ") if "Rewrite rejected:" in change.reason else [])
+        #     for change in result.bullet_changes
+        #     if change.action == "keep" and "Rewrite rejected:" in (change.reason or "")
+        # ]
+        #
+        # if rejected_bullets and len(rejected_bullets) <= 5:
+        #     ... (retry logic disabled)
 
         # === Batch overflow trimming ===
         if measurer:
