@@ -615,13 +615,18 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         # Clear previous coverage
         result.keyword_coverage = []
 
-        # Build resume text from TAILORED bullets (not original)
+        # Build resume text from actual resume state (accepted rewrites or originals)
         resume_parts = []
         for change in result.bullet_changes:
-            # Use tailored_text if it's a rewrite, otherwise use original
-            text = change.tailored_text if change.action == "rewrite" else change.original_text
-            if change.action != "remove":  # Skip removed bullets
-                resume_parts.append(text)
+            if change.action == "remove":
+                # Skip removed bullets entirely
+                continue
+            elif change.action == "rewrite" and change.accepted:
+                # Use tailored text if rewrite was ACCEPTED
+                resume_parts.append(change.tailored_text)
+            else:
+                # Use original text if: kept, or rewrite was REJECTED
+                resume_parts.append(change.original_text)
 
         # Add skills from IR
         for section in ir.content.sections:
