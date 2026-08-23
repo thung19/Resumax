@@ -16,7 +16,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from backend.models.job_description import JobAnalysis, WeightedItem
+from backend.models.job_description import (
+    JobAnalysis,
+    WeightedItem,
+    JDRequirement,
+    ConcreteDeliverable,
+    BehavioralRequirement,
+    RequirementMatch,
+)
 from backend.models.resume_content import (
     Bullet,
     ExperienceEntry,
@@ -211,6 +218,18 @@ class SkillMatch:
 
 
 @dataclass
+class SkillOccurrenceMatrix:
+    """Pre-computed matrix: which skills appear in which bullets.
+
+    {skill_name: {bullet_id: True/False}}
+    Enables fast coverage recalculation without re-scanning text.
+    """
+    matrix: dict[str, dict[str, bool]] = field(default_factory=dict)
+    skill_set: set[str] = field(default_factory=set)  # All skills tracked
+    bullet_ids: set[str] = field(default_factory=set)  # All bullets indexed
+
+
+@dataclass
 class MatchResult:
     """Complete matching result."""
     entry_scores: list[EntryScore] = field(default_factory=list)
@@ -223,6 +242,9 @@ class MatchResult:
     required_coverage: float = 0.0
     technical_coverage: float = 0.0
     responsibility_coverage: float = 0.0
+
+    # Quick Win #4: Pre-computed skill occurrence matrix for fast recalculation
+    skill_matrix: SkillOccurrenceMatrix = field(default_factory=SkillOccurrenceMatrix)
 
 
 class Matcher:
@@ -274,29 +296,38 @@ class Matcher:
         # Coverage metrics
         all_skills = self._jd.all_skills_flat()
         if all_skills:
-            matched_count = sum(
-                1 for s in all_skills
+            # WEIGHTED: Account for importance of each skill
+            matched_importance = sum(
+                s.importance for s in all_skills
                 if _text_contains_keyword(self._resume_text_lower, s.name)
             )
-            result.technical_coverage = matched_count / len(all_skills)
+            total_importance = sum(s.importance for s in all_skills)
+            result.technical_coverage = matched_importance / total_importance if total_importance > 0 else 0.0
 
         required = self._jd.required_skills
         if required:
-            matched_req = sum(
-                1 for s in required
+            # WEIGHTED: Account for importance of each skill
+            matched_importance = sum(
+                s.importance for s in required
                 if _text_contains_keyword(self._resume_text_lower, s.name)
             )
-            result.required_coverage = matched_req / len(required)
+            total_importance = sum(s.importance for s in required)
+            result.required_coverage = matched_importance / total_importance if total_importance > 0 else 0.0
 
         responsibilities = self._jd.responsibilities
         if responsibilities:
-            matched_resp = sum(
-                1 for r in responsibilities
+            # WEIGHTED: Account for importance of each responsibility
+            matched_importance = sum(
+                r.importance for r in responsibilities
                 if any(_text_contains_keyword(self._resume_text_lower, kw) for kw in r.keywords)
                 or any(_text_contains_keyword(self._resume_text_lower, word)
                        for word in r.text.split() if len(word) > 4)
             )
-            result.responsibility_coverage = matched_resp / len(responsibilities)
+            total_importance = sum(r.importance for r in responsibilities)
+            result.responsibility_coverage = matched_importance / total_importance if total_importance > 0 else 0.0
+
+        # Quick Win #4: Build skill occurrence matrix for fast recalculation
+        result.skill_matrix = self._build_skill_matrix()
 
         return result
 
@@ -451,3 +482,175 @@ class Matcher:
             parts.extend(proj.technologies)
         parts.extend(self._bank.additional_skills)
         return " ".join(parts)
+
+    def _build_skill_matrix(self) -> SkillOccurrenceMatrix:
+        """Build a matrix of which skills appear in which bullets.
+
+        Returns {skill_name: {bullet_id: True/False}}
+        This enables fast coverage recalculation without re-scanning text.
+        """
+        matrix_dict: dict[str, dict[str, bool]] = {}
+        all_skills = self._jd.all_skills_flat()
+        all_skill_names = {s.name for s in all_skills}
+
+        # Map each bullet to its text
+        bullets_by_id = {}
+        for section in self._content.sections:
+            for entry in section.experience_entries:
+                for b in entry.bullets:
+                    bullets_by_id[b.id] = b.text
+            for entry in section.project_entries:
+                for b in entry.bullets:
+                    bullets_by_id[b.id] = b.text
+
+        # For each skill, check which bullets contain it
+        for skill in all_skills:
+            matrix_dict[skill.name] = {}
+            for bullet_id, bullet_text in bullets_by_id.items():
+                bullet_text_lower = _normalize(bullet_text)
+                matrix_dict[skill.name][bullet_id] = _text_contains_keyword_direct(
+                    bullet_text_lower, skill.name
+                )
+
+        return SkillOccurrenceMatrix(
+            matrix=matrix_dict,
+            skill_set=all_skill_names,
+            bullet_ids=set(bullets_by_id.keys()),
+        )
+
+
+# --- NEW: Categorized Requirement Matching (Phase 3) ---
+
+
+def match_jd_requirement(resume_text: str, requirement: JDRequirement) -> RequirementMatch:
+    """Match a JDRequirement against resume text.
+
+    Returns both ATS-found and conceptual-match results.
+
+    Args:
+        resume_text: Full resume text (normalized)
+        requirement: JDRequirement object from JD analysis
+
+    Returns:
+        RequirementMatch with ats_found, theme_confidence, and verdict
+    """
+    text_lower = _normalize(resume_text)
+
+    # ATS matching: look for ats_searchable terms
+    ats_matches = []
+    for term in requirement.ats_searchable:
+        if term.lower() in text_lower:
+            ats_matches.append(term)
+
+    ats_found = len(ats_matches) > 0
+
+    # Theme matching: check theme_indicators for conceptual understanding
+    theme_confidence = 0.0
+    theme_evidence = []
+
+    if requirement.requirement_type == "concept":
+        # For concepts, count how many theme indicators are found
+        found_indicators = []
+        for indicator in requirement.theme_indicators:
+            if indicator.lower() in text_lower:
+                found_indicators.append(indicator)
+                theme_evidence.append(indicator)
+
+        if found_indicators:
+            # Confidence = % of indicators found
+            theme_confidence = len(found_indicators) / len(requirement.theme_indicators)
+    elif requirement.requirement_type == "keyword":
+        # For keywords, theme and ATS are the same
+        theme_confidence = 1.0 if ats_found else 0.0
+        theme_evidence = ats_matches
+
+    # Determine if human would understand this requirement as met
+    human_understandable = False
+    if requirement.requirement_type == "keyword":
+        human_understandable = ats_found
+    elif requirement.requirement_type == "concept":
+        human_understandable = theme_confidence >= 0.5  # At least 50% of indicators found
+
+    return RequirementMatch(
+        requirement_phrase=requirement.keyword_phrase,
+        requirement_level=requirement.requirement_level,
+        requirement_type=requirement.requirement_type,
+        ats_found=ats_found,
+        ats_matches=ats_matches,
+        ats_frequency=sum(1 for m in ats_matches if m.lower() in text_lower),
+        theme_confidence=theme_confidence,
+        theme_evidence=theme_evidence,
+        human_understandable=human_understandable,
+    )
+
+
+def match_deliverable(resume_text: str, deliverable: ConcreteDeliverable) -> RequirementMatch:
+    """Match a concrete deliverable (activity) against resume text.
+
+    Deliverables are concrete activities like "Dashboard creation", "API design".
+    We look for ats_searchable terms that indicate this activity.
+
+    Args:
+        resume_text: Full resume text (normalized)
+        deliverable: ConcreteDeliverable object from JD analysis
+
+    Returns:
+        RequirementMatch indicating if deliverable is found
+    """
+    text_lower = _normalize(resume_text)
+
+    # Look for ats_searchable terms
+    found_terms = []
+    for term in deliverable.ats_searchable:
+        if term.lower() in text_lower:
+            found_terms.append(term)
+
+    found = len(found_terms) > 0
+
+    return RequirementMatch(
+        requirement_phrase=deliverable.phrase,
+        requirement_level=deliverable.requirement_level,
+        requirement_type="activity",
+        ats_found=found,
+        ats_matches=found_terms,
+        ats_frequency=sum(1 for t in found_terms if t.lower() in text_lower),
+        theme_confidence=1.0 if found else 0.0,
+        theme_evidence=found_terms,
+        human_understandable=found,
+    )
+
+
+def match_behavioral_requirement(resume_text: str, behavior: BehavioralRequirement) -> RequirementMatch:
+    """Match a behavioral requirement against resume text.
+
+    Behavioral requirements like "Collaboration", "Mentoring" are demonstrated
+    through context clues, not direct keywords.
+
+    Args:
+        resume_text: Full resume text
+        behavior: BehavioralRequirement object
+
+    Returns:
+        RequirementMatch indicating if evidence of this behavior is found
+    """
+    text_lower = _normalize(resume_text)
+
+    # Look for evidence indicators
+    found_evidence = []
+    for indicator in behavior.evidence_indicators:
+        if indicator.lower() in text_lower:
+            found_evidence.append(indicator)
+
+    found = len(found_evidence) > 0
+
+    return RequirementMatch(
+        requirement_phrase=behavior.phrase,
+        requirement_level=behavior.requirement_level,
+        requirement_type="behavioral",
+        ats_found=found,
+        ats_matches=found_evidence,
+        ats_frequency=len(found_evidence),
+        theme_confidence=1.0 if found else 0.0,
+        theme_evidence=found_evidence,
+        human_understandable=found,
+    )

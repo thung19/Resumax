@@ -29,6 +29,12 @@ from backend.models.job_description import (
     JobAnalysis,
     Responsibility,
     WeightedItem,
+    JDRequirement,
+    ConcreteDeliverable,
+    BehavioralRequirement,
+    EducationGate,
+    ExperienceGate,
+    EligibilityGate,
 )
 from backend.prompts import JD_ANALYSIS_SYSTEM_V1, JD_ANALYSIS_USER_TEMPLATE
 
@@ -163,6 +169,9 @@ class JobAnalyzer:
                 sanitized = _re.sub(r"sk-[a-zA-Z0-9_-]{10,}", "[REDACTED]", str(e))[:200]
                 self._llm_error = sanitized
                 logger.warning(f"LLM JD analysis failed, using deterministic only: {sanitized}")
+
+        # Stage 3: Categorize requirements for ATS matching
+        self._categorize_requirements_for_ats(analysis)
 
         return analysis
 
@@ -656,3 +665,378 @@ class JobAnalyzer:
         }
         target = cat_map.get(category, analysis.tools)
         target.append(item)
+
+    # ----------------------------------------------------------------
+    # STAGE 3: Categorize Requirements for ATS + Conceptual Matching
+    # ----------------------------------------------------------------
+
+    def _recategorize_skill_vs_activity(self, analysis: JobAnalysis):
+        """Use LLM to intelligently categorize tools as skills or activities.
+
+        SKILLS: Things you learn/know (Python, SQL, AWS, Docker, Agile, AI)
+        ACTIVITIES: Things you create/do (dashboards, reports, documentation, testing, APIs)
+
+        Stores activity items in analysis._activity_tools so _build_deliverables can use them.
+
+        NOTE: This method is OPTIONAL and should not break anything if it fails.
+        """
+        import json
+        from anthropic import Anthropic
+
+        # Initialize empty activity tools list
+        analysis._activity_tools = []
+
+        # Collect all items to categorize
+        all_items = []
+        for skill in analysis.tools:
+            all_items.append(skill.name)
+
+        # Short circuit if nothing to categorize
+        if not all_items:
+            return
+
+        # Create concise list for LLM
+        items_str = ", ".join(sorted(set(all_items)))
+
+        # Hardcoded categorization as fallback (if LLM fails)
+        activity_keywords = {
+            "tableau", "power bi", "looker", "qlik", "kibana",
+            "excel", "spreadsheet",
+            "test", "testing", "qa",
+            "dashboard", "report"
+        }
+
+        activity_names_fallback = set(
+            name for name in all_items
+            if any(kw in name.lower() for kw in activity_keywords)
+        )
+
+        prompt = f"""Categorize each item as SKILL (something you learn/know) or ACTIVITY (something you create/do).
+
+Items: {items_str}
+
+Respond with ONLY valid JSON:
+{{"skill": ["..."], "activity": ["..."]}}"""
+
+        try:
+            client = Anthropic()
+            response = client.messages.create(
+                model="claude-opus-5",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            if not response.content or not response.content[0].text:
+                logger.warning("LLM categorization returned empty response, using fallback")
+                activity_names = activity_names_fallback
+            else:
+                text = response.content[0].text.strip()
+
+                # Extract JSON if wrapped in markdown
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+
+                categorization = json.loads(text.strip())
+                activity_names = set(categorization.get("activity", []))
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse categorization JSON: {str(e)[:50]}, using fallback")
+            activity_names = activity_names_fallback
+        except Exception as e:
+            logger.warning(f"LLM categorization failed: {str(e)[:50]}, using fallback")
+            activity_names = activity_names_fallback
+
+        # Recategorize based on results
+        analysis._activity_tools = [tool for tool in analysis.tools if tool.name in activity_names]
+        analysis.tools = [tool for tool in analysis.tools if tool.name not in activity_names]
+
+    def _categorize_requirements_for_ats(self, analysis: JobAnalysis):
+        """Transform existing skills into categorized requirements with ATS + theme tracking.
+
+        Creates JDRequirement objects that track what ATS will find
+        vs what humans/LLM understand conceptually.
+
+        This is incremental: adds to analysis without modifying existing fields.
+        """
+        # First: Recategorize skills vs activities using LLM (if available)
+        # This ensures tools like Tableau are treated as activities, not skills
+        if self._use_llm:
+            try:
+                self._recategorize_skill_vs_activity(analysis)
+            except Exception as e:
+                # If categorization fails, continue with original categorization
+                # This should never happen given the inner error handling, but just in case
+                logger.error(f"Unexpected error in skill/activity categorization: {str(e)[:100]}")
+                analysis._activity_tools = []
+
+        # Technical requirements from extracted technologies
+        self._build_technical_requirements(analysis)
+
+        # Concrete deliverables from responsibilities
+        self._build_deliverables(analysis)
+
+        # Behavioral requirements (soft skills) noted but not scored
+        self._build_behavioral_requirements(analysis)
+
+        # Gates from extracted education/experience
+        self._build_gates(analysis)
+
+    def _build_technical_requirements(self, analysis: JobAnalysis):
+        """Convert extracted technologies into JDRequirement objects with ATS tracking.
+
+        NOTE: Activity-focused items (Tableau, Power BI, Excel, etc.) have already been
+        removed from analysis.tools by _recategorize_skill_vs_activity().
+        We only process skills here.
+        """
+        # Map each source of technologies to JDRequirement
+        for item in analysis.programming_languages:
+            analysis.technical_requirements.append(JDRequirement(
+                keyword_phrase=item.name,
+                theme="Programming Language",
+                requirement_level="required" if item in analysis.required_skills else "preferred",
+                requirement_type="keyword",
+                ats_searchable=[item.name.lower()],  # E.g., ["python"]
+                theme_indicators=[item.name.lower()],  # Direct match only
+                importance=item.importance,
+            ))
+
+        for item in analysis.frameworks:
+            analysis.technical_requirements.append(JDRequirement(
+                keyword_phrase=item.name,
+                theme="Framework/Library",
+                requirement_level="required" if item in analysis.required_skills else "preferred",
+                requirement_type="keyword",
+                ats_searchable=[item.name.lower()],
+                theme_indicators=[item.name.lower()],
+                importance=item.importance,
+            ))
+
+        for item in analysis.databases:
+            analysis.technical_requirements.append(JDRequirement(
+                keyword_phrase=item.name,
+                theme="Database",
+                requirement_level="required" if item in analysis.required_skills else "preferred",
+                requirement_type="keyword",
+                ats_searchable=[item.name.lower()],
+                theme_indicators=[item.name.lower()],
+                importance=item.importance,
+            ))
+
+        for item in analysis.infrastructure:
+            analysis.technical_requirements.append(JDRequirement(
+                keyword_phrase=item.name,
+                theme="Infrastructure/Platform",
+                requirement_level="required" if item in analysis.required_skills else "preferred",
+                requirement_type="keyword",
+                ats_searchable=[item.name.lower()],
+                theme_indicators=[item.name.lower()],
+                importance=item.importance,
+            ))
+
+        # Add remaining tools (activities have been removed by _recategorize_skill_vs_activity)
+        for item in analysis.tools:
+            analysis.technical_requirements.append(JDRequirement(
+                keyword_phrase=item.name,
+                theme="Tool/Service",
+                requirement_level="required" if item in analysis.required_skills else "preferred",
+                requirement_type="keyword",
+                ats_searchable=[item.name.lower()],
+                theme_indicators=[item.name.lower()],
+                importance=item.importance,
+            ))
+
+        for item in analysis.methodologies:
+            # Methodologies are concepts, not keywords
+            ats_terms, theme_terms = self._get_methodology_indicators(item.name)
+            analysis.technical_requirements.append(JDRequirement(
+                keyword_phrase=item.name,
+                theme="Development Methodology/Concept",
+                requirement_level="required" if item in analysis.required_skills else "preferred",
+                requirement_type="concept",
+                ats_searchable=ats_terms,  # What ATS might find
+                theme_indicators=theme_terms,  # What demonstrates this concept
+                importance=item.importance,
+            ))
+
+    def _get_methodology_indicators(self, methodology: str) -> tuple[list[str], list[str]]:
+        """Get ATS terms and theme indicators for a methodology.
+
+        Examples:
+        - "Agile" → ats_searchable=["agile", "scrum"], theme_indicators=["scrum", "sprints", "agile"]
+        - "CI/CD" → ats_searchable=["ci/cd", "ci cd", "continuous"], theme_indicators=["deployment", "pipeline", "continuous"]
+        """
+        methodology_lower = methodology.lower()
+
+        # Mapping of methodologies to their indicators
+        indicators_map = {
+            "agile": {
+                "ats": ["agile", "scrum", "sprint"],
+                "theme": ["scrum", "sprint", "iterative", "agile", "sprints"],
+            },
+            "scrum": {
+                "ats": ["scrum", "agile"],
+                "theme": ["scrum", "sprint", "agile", "iterative", "standup"],
+            },
+            "ci/cd": {
+                "ats": ["ci/cd", "ci cd", "continuous"],
+                "theme": ["continuous integration", "continuous deployment", "ci/cd", "pipeline", "automated", "deployment"],
+            },
+            "devops": {
+                "ats": ["devops", "dev ops"],
+                "theme": ["devops", "deployment", "infrastructure", "automation", "continuous"],
+            },
+            "microservices": {
+                "ats": ["microservices", "microservice"],
+                "theme": ["microservices", "service", "distributed", "architecture"],
+            },
+            "machine learning": {
+                "ats": ["machine learning", "ml"],
+                "theme": ["machine learning", "ml", "models", "training", "algorithms"],
+            },
+            "deep learning": {
+                "ats": ["deep learning"],
+                "theme": ["deep learning", "neural", "networks", "training"],
+            },
+        }
+
+        mapping = indicators_map.get(methodology_lower, {})
+        return (
+            mapping.get("ats", [methodology_lower]),
+            mapping.get("theme", [methodology_lower]),
+        )
+
+    def _build_deliverables(self, analysis: JobAnalysis):
+        """Extract concrete deliverables from responsibilities and tools.
+
+        Deliverables are things you CREATE or DO, not technologies you know.
+        Examples: dashboards, reports, documentation, tests, APIs, monitoring systems
+        """
+        # Common deliverables to look for in responsibility text
+        deliverable_patterns = {
+            "dashboard": ["dashboard", "dashboards", "report", "visualization", "charts"],
+            "API": ["api", "rest", "endpoint", "graphql"],
+            "documentation": ["document", "documentation", "docs", "guide"],
+            "testing": ["test", "testing", "qa", "quality", "automated testing"],
+            "database": ["database", "schema", "query", "optimization"],
+            "deployment": ["deploy", "deployment", "production", "release"],
+            "monitoring": ["monitoring", "alerting", "logging", "observability"],
+        }
+
+        found_deliverables = set()
+
+        # First, extract from responsibility text using pattern matching
+        for resp in analysis.responsibilities:
+            resp_lower = resp.text.lower()
+            for deliverable, keywords in deliverable_patterns.items():
+                if any(kw in resp_lower for kw in keywords) and deliverable not in found_deliverables:
+                    analysis.deliverables.append(ConcreteDeliverable(
+                        phrase=deliverable,
+                        requirement_level="required",
+                        ats_searchable=keywords,
+                        importance=0.6,
+                    ))
+                    found_deliverables.add(deliverable)
+
+        # Second, add tools that were categorized as activities by LLM
+        # (stored in analysis._activity_tools by _recategorize_skill_vs_activity)
+        if hasattr(analysis, "_activity_tools"):
+            for tool in analysis._activity_tools:
+                tool_name_lower = tool.name.lower()
+                phrase = f"{tool.name} deliverables"  # Generic phrase for the tool
+
+                # Try to be more specific based on tool type
+                if any(x in tool_name_lower for x in ["tableau", "power bi", "looker", "qlik", "kibana"]):
+                    phrase = f"{tool.name} dashboards/reports"
+                elif any(x in tool_name_lower for x in ["excel", "spreadsheet"]):
+                    phrase = f"{tool.name} reports"
+                elif any(x in tool_name_lower for x in ["test", "qa"]):
+                    phrase = f"{tool.name} testing"
+
+                if phrase not in found_deliverables:
+                    analysis.deliverables.append(ConcreteDeliverable(
+                        phrase=phrase,
+                        requirement_level="required" if tool in analysis.required_skills else "preferred",
+                        ats_searchable=[tool_name_lower],
+                        importance=tool.importance,
+                    ))
+                    found_deliverables.add(phrase)
+
+    def _build_behavioral_requirements(self, analysis: JobAnalysis):
+        """Extract behavioral/soft requirements from soft skills and descriptions."""
+        # Common soft skills to note (not scored)
+        soft_skill_keywords = {
+            "communication": ["communication", "communicate", "verbal", "written"],
+            "collaboration": ["collaboration", "collaborate", "team", "cross-team"],
+            "leadership": ["leadership", "lead", "mentor", "team lead"],
+            "problem-solving": ["problem", "solving", "critical thinking"],
+            "self-motivation": ["self-motivated", "self-driven", "motivation"],
+        }
+
+        for skill_name, keywords in soft_skill_keywords.items():
+            for soft_skill in analysis.soft_skills:
+                if any(kw in soft_skill.name.lower() for kw in keywords):
+                    analysis.behavioral_requirements.append(BehavioralRequirement(
+                        phrase=skill_name,
+                        requirement_level="required",
+                        evidence_indicators=keywords,
+                        importance=0.4,
+                    ))
+                    break
+
+    def _build_gates(self, analysis: JobAnalysis):
+        """Extract education, experience, and eligibility requirements."""
+        # Simple heuristic: look for keywords in raw JD text
+        text_lower = analysis.raw_text.lower()
+
+        # Education gate
+        if any(term in text_lower for term in ["bachelor", "bs ", "b.s.", "degree in"]):
+            analysis.education_requirements = EducationGate(
+                degree_level="Bachelor's",
+                required=True,
+            )
+
+        if any(term in text_lower for term in ["master", "ms ", "m.s.", "mba"]):
+            analysis.education_requirements = EducationGate(
+                degree_level="Master's",
+                required=False,  # Usually preferred, not required
+            )
+
+        # Experience gate
+        if "intern" in text_lower:
+            analysis.experience_requirements = ExperienceGate(
+                minimum_years=0.0,
+                experience_level="intern",
+                required=True,
+            )
+        elif "junior" in text_lower:
+            analysis.experience_requirements = ExperienceGate(
+                minimum_years=0.0,
+                experience_level="junior",
+                required=True,
+            )
+        elif any(term in text_lower for term in ["5+ years", "5 years", "5+ yrs"]):
+            analysis.experience_requirements = ExperienceGate(
+                minimum_years=5.0,
+                experience_level="senior",
+                required=True,
+            )
+
+        # Eligibility gate
+        if any(term in text_lower for term in ["us citizen", "u.s. citizen", "us person"]):
+            analysis.eligibility_requirements = EligibilityGate(
+                work_authorization="US Citizen required",
+                required=True,
+            )
+        elif any(term in text_lower for term in ["security clearance", "secret", "top secret"]):
+            if "secret" in text_lower and "top secret" not in text_lower:
+                analysis.eligibility_requirements = EligibilityGate(
+                    security_clearance="Secret",
+                    required=False,
+                )
+            elif "top secret" in text_lower:
+                analysis.eligibility_requirements = EligibilityGate(
+                    security_clearance="Top Secret",
+                    required=False,
+                )

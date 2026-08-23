@@ -24,6 +24,9 @@ from backend.models.tailoring import BulletChange, ResumeBank
 from backend.prompts import (
     TAILORING_SYSTEM_V2,
     TAILORING_USER_V2,
+    TAILORING_USER_V3,
+    TAILORING_SKILLS_SYSTEM_V1,
+    TAILORING_SKILLS_USER_V1,
     BATCH_TRIM_SYSTEM_V2,
     BATCH_TRIM_USER_V2,
     BATCH_TRIM_RETRY_HINT,
@@ -66,10 +69,14 @@ def _compute_char_cap(
 ) -> int:
     """Compute how many chars fit on one line for text with this character mix.
 
-    Uses average character width from the actual text, then applies a 3% safety
-    buffer to account for variable-width font variations (e.g., M and W are wider
-    than average, i and l are narrower). When LLM rewrites text, character
-    composition changes, so we need conservative margin.
+    Uses average character width from the actual text, then applies a configurable
+    safety factor to account for variable-width font variations (e.g., M and W are
+    wider than average, i and l are narrower). When LLM rewrites text, character
+    composition changes, so we need a conservative margin.
+
+    The default safety factor is 0.85 (15% reduction) for Garamond, which is very
+    conservative. This ensures that even if the LLM rewrites with more M's/W's,
+    the text should still fit.
 
     Args:
         text: Current bullet text (used to estimate average character width)
@@ -81,6 +88,7 @@ def _compute_char_cap(
         Maximum characters that should safely fit on one line.
     """
     from reportlab.pdfbase.pdfmetrics import stringWidth
+    from backend.config import get_config
 
     if not text:
         return 120
@@ -91,9 +99,11 @@ def _compute_char_cap(
     # Subtract bullet prefix width
     prefix_width = stringWidth("\u2022 ", font_name, font_size)
     usable = available_width_pt - prefix_width
-    # Apply 3% safety buffer for variable-width font composition changes
+    # Apply configurable safety buffer (default 0.85 = 15% reduction)
     # When LLM rewrites, character mix changes (more M/W, fewer i/l)
-    conservative_usable = usable * 0.97
+    config = get_config()
+    safety_factor = config.trimming.char_width_safety_factor
+    conservative_usable = usable * safety_factor
     return max(40, int(conservative_usable / avg_char_width))
 
 
@@ -162,6 +172,8 @@ class TailoringEngine:
         available_width_pt: float = 0,
         font_name: str = "",
         font_size: float = 0,
+        jd: Optional[JobAnalysis] = None,  # For coverage feedback
+        coverage_feedback: Optional[dict] = None,  # Pre-calculated gaps
     ) -> TailoringEngineResult:
         """Run the unified tailoring pass."""
         result = TailoringEngineResult()
@@ -185,11 +197,30 @@ class TailoringEngine:
             font_size=font_size,
         )
 
-        user_msg = TAILORING_USER_V2.format(
-            jd_text=jd_raw_text,
-            resume_text=resume_text,
-            max_bullets=max_bullets_per_entry,
-        )
+        # Use V3 with coverage feedback if available, otherwise V2
+        if coverage_feedback:
+            user_msg = TAILORING_USER_V3.format(
+                jd_text=jd_raw_text,
+                resume_text=resume_text,
+                max_bullets=max_bullets_per_entry,
+                required_coverage=coverage_feedback.get("required_coverage", "?"),
+                matched_required=coverage_feedback.get("matched_required", "?"),
+                total_required=coverage_feedback.get("total_required", "?"),
+                technical_coverage=coverage_feedback.get("technical_coverage", "?"),
+                matched_technical=coverage_feedback.get("matched_technical", "?"),
+                total_technical=coverage_feedback.get("total_technical", "?"),
+                responsibility_coverage=coverage_feedback.get("responsibility_coverage", "?"),
+                matched_resp=coverage_feedback.get("matched_resp", "?"),
+                total_resp=coverage_feedback.get("total_resp", "?"),
+                missing_skills=coverage_feedback.get("missing_skills", "None"),
+                underweight_skills=coverage_feedback.get("underweight_skills", "None"),
+            )
+        else:
+            user_msg = TAILORING_USER_V2.format(
+                jd_text=jd_raw_text,
+                resume_text=resume_text,
+                max_bullets=max_bullets_per_entry,
+            )
 
         # Call Claude
         client = anthropic.Anthropic(api_key=api_key)
@@ -403,6 +434,9 @@ class TailoringEngine:
                 response_text = response_text.split("```")[1].split("```")[0]
             response_text = response_text.strip()
 
+            # Debug: log the raw response for trim failures
+            logger.debug(f"Trim LLM response ({len(response_text)} chars): {response_text[:300]}")
+
             try:
                 data = json.loads(response_text)
             except json.JSONDecodeError:
@@ -455,6 +489,128 @@ class TailoringEngine:
         except Exception as e:
             logger.warning(f"Batch trim failed: {_sanitize_error(e)}")
             return {b["bullet_id"]: None for b in bullets}
+
+    def optimize_skills(
+        self,
+        content: ResumeContent,
+        jd: JobAnalysis,
+    ) -> dict:
+        """Optimize the Skills section to match JD.
+
+        Returns dict with:
+        - skill_reorders: {category: [skills in priority order]}
+        - skill_additions: {category: [new skills to add]}
+        - skill_removals: {category: [skills to remove]}
+        """
+        result = {
+            "skill_reorders": {},
+            "skill_additions": {},
+            "skill_removals": {},
+            "duration_ms": 0,
+            "llm_error": None,
+        }
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            result["llm_error"] = "ANTHROPIC_API_KEY not set"
+            return result
+
+        try:
+            import anthropic
+        except ImportError:
+            result["llm_error"] = "anthropic package not installed"
+            return result
+
+        # Build skills text from resume
+        resume_skills_by_cat = {}
+        for section in content.sections:
+            for cat in section.skill_categories:
+                resume_skills_by_cat[cat.category] = cat.skills
+
+        resume_skills_text = "\n".join(
+            f"{cat}: {', '.join(skills)}"
+            for cat, skills in resume_skills_by_cat.items()
+        ) or "No skills listed"
+
+        # Extract JD required and preferred skills
+        jd_required_list = ", ".join(
+            f"{s.name}" for s in jd.required_skills[:10]
+        ) or "None listed"
+        jd_preferred_list = ", ".join(
+            f"{s.name}" for s in jd.preferred_skills[:10]
+        ) or "None listed"
+
+        # Extract candidate keywords from bullets
+        candidate_keywords = set()
+        for section in content.sections:
+            for entry in section.experience_entries:
+                for b in entry.bullets:
+                    words = b.text.lower().split()
+                    candidate_keywords.update(w.strip(",.;:()") for w in words if len(w) > 4)
+            for entry in section.project_entries:
+                for b in entry.bullets:
+                    words = b.text.lower().split()
+                    candidate_keywords.update(w.strip(",.;:()") for w in words if len(w) > 4)
+
+        candidate_keywords_text = ", ".join(sorted(candidate_keywords)[:50]) or "None found"
+
+        # Format prompt
+        user_msg = TAILORING_SKILLS_USER_V1.format(
+            jd_required_skills=jd_required_list,
+            jd_preferred_skills=jd_preferred_list,
+            resume_skills=resume_skills_text,
+            candidate_keywords=candidate_keywords_text,
+        )
+
+        # Call Claude
+        client = anthropic.Anthropic(api_key=api_key)
+        start = time.time()
+        try:
+            response = client.messages.create(
+                model=self._model,
+                max_tokens=2048,
+                system=TAILORING_SKILLS_SYSTEM_V1,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+
+            result["duration_ms"] = int((time.time() - start) * 1000)
+
+            # Extract text
+            response_text = None
+            for block in response.content:
+                if hasattr(block, "text"):
+                    response_text = block.text
+                    break
+
+            if not response_text:
+                result["llm_error"] = "LLM returned no text content"
+                return result
+
+            # Parse response
+            logger.info(f"Skills optimization response ({len(response_text)} chars)")
+            text = response_text.strip()
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            text = text.strip()
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = _parse_json_robust(text)
+
+            if isinstance(data, dict):
+                result["skill_reorders"] = data.get("skill_reorders", {})
+                result["skill_additions"] = data.get("skill_additions", {})
+                result["skill_removals"] = data.get("skill_removals", {})
+
+        except Exception as e:
+            result["duration_ms"] = int((time.time() - start) * 1000)
+            result["llm_error"] = _sanitize_error(e)
+            logger.warning(f"Skills optimization failed: {_sanitize_error(e)}")
+
+        return result
 
     def _parse_response(
         self, text: str, content: ResumeContent,

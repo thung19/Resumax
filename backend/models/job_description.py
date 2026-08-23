@@ -6,6 +6,7 @@ with extracted skills, responsibilities, and relevance weights.
 
 from __future__ import annotations
 
+from typing import Optional, Any
 from pydantic import BaseModel, Field
 
 
@@ -54,6 +55,31 @@ class JobAnalysis(BaseModel):
     # Keyword analysis
     repeated_terms: list[WeightedItem] = Field(default_factory=list)
     ats_phrases: list[str] = Field(default_factory=list)
+
+    # --- New: Categorized Requirements (incremental migration) ---
+    # These complement the existing fields above.
+    # Gradually replacing required_skills / preferred_skills with structured requirements.
+
+    # Technical keywords with ATS + theme tracking
+    technical_requirements: list[JDRequirement] = Field(default_factory=list)
+    # Examples: {"keyword_phrase": "Python", "ats_searchable": ["python"]}
+    #           {"keyword_phrase": "Agile methodologies", "ats_searchable": ["agile", "scrum"],
+    #            "theme_indicators": ["scrum", "sprints", "iterative"]}
+
+    # Concrete deliverables (activities that can be keyword-tracked)
+    deliverables: list[ConcreteDeliverable] = Field(default_factory=list)
+    # Examples: {"phrase": "Dashboard creation", "ats_searchable": ["dashboard", "dashboards"]}
+    #           {"phrase": "API design", "ats_searchable": ["api", "design"]}
+
+    # Behavioral/soft requirements (demonstrated through context)
+    behavioral_requirements: list[BehavioralRequirement] = Field(default_factory=list)
+    # Examples: {"phrase": "Cross-team collaboration", "evidence_indicators": ["cross-functional", "team"]}
+    #           {"phrase": "Mentoring", "evidence_indicators": ["Tech Lead", "mentored", "team lead"]}
+
+    # Gates (education, experience, eligibility)
+    education_requirements: EducationGate | None = None
+    experience_requirements: ExperienceGate | None = None
+    eligibility_requirements: EligibilityGate | None = None
 
     def all_skills_flat(self) -> list[WeightedItem]:
         """Return all skills as a flat list, deduplicated by name."""
@@ -116,3 +142,176 @@ class JobAnalysis(BaseModel):
             seen_lower.add(key)
             result.append(kw)
         return result
+
+
+# --- New: Categorized Requirements for Better ATS Matching ---
+
+
+class JDRequirement(BaseModel):
+    """A requirement from JD with ATS-scannable and conceptual tracking.
+
+    Handles both exact keyword matches (ATS) and thematic understanding (humans/LLM).
+    Examples:
+    - "Python" → ats_searchable=["python"], theme_indicators=["python"]
+    - "Agile methodologies" → ats_searchable=["agile", "scrum"],
+                              theme_indicators=["scrum", "sprints", "iterative", "agile"]
+    """
+    keyword_phrase: str  # What the JD literally says
+    theme: str  # Conceptual category for humans/LLM
+    requirement_level: str = "required"  # "required" | "preferred" | "optional"
+    requirement_type: str  # "keyword" | "activity" | "concept" | "behavioral"
+
+    ats_searchable: list[str] = Field(default_factory=list)  # What ATS can find
+    theme_indicators: list[str] = Field(default_factory=list)  # Evidence of this concept
+    importance: float = 0.5  # Weight for scoring
+
+
+class EducationGate(BaseModel):
+    """Education requirement (degree, field, graduation date)."""
+    degree_level: str = ""  # "High School", "Bachelor's", "Master's", "PhD"
+    field_of_study: str = ""  # "Computer Science", "related field", etc.
+    graduation_window: tuple[str, str] | None = None  # ("2025", "2027")
+    minimum_gpa: float | None = None
+    required: bool = True
+
+
+class ExperienceGate(BaseModel):
+    """Experience requirement (years, level, or track)."""
+    minimum_years: float = 0.0
+    experience_level: str = ""  # "intern", "junior", "mid", "senior", "staff"
+    required: bool = True
+
+
+class EligibilityGate(BaseModel):
+    """Eligibility requirements (security clearance, location, visa, etc.)."""
+    work_authorization: str = ""  # "US Citizen", "Green Card", "requires sponsorship"
+    security_clearance: str = ""  # "None", "Secret", "Top Secret", "preferred"
+    location_flexible: bool = True
+    visa_sponsorship_available: bool | None = None  # None = unknown
+    student_only: bool = False
+    other_requirements: list[str] = Field(default_factory=list)  # Custom gates
+
+
+class ConcreteDeliverable(BaseModel):
+    """Concrete activity/deliverable that can be keyword-tracked.
+
+    Examples: Dashboard creation, API design, Documentation
+    These appear in resumes as concrete terms.
+    """
+    phrase: str  # "Dashboard creation"
+    requirement_level: str = "required"  # "required" | "preferred"
+
+    ats_searchable: list[str] = Field(default_factory=list)  # ["dashboard", "dashboards", "created dashboards"]
+    importance: float = 0.5
+
+
+class BehavioralRequirement(BaseModel):
+    """Behavioral/soft requirement that's demonstrated through context, not keywords.
+
+    Examples: Cross-team collaboration, Mentoring, Communication
+    These are NOT scored as keywords but noted as demonstrated.
+    """
+    phrase: str  # "Cross-team collaboration"
+    requirement_level: str = "required"
+
+    evidence_indicators: list[str] = Field(default_factory=list)  # Job titles, descriptions that show this
+    # Examples for "mentoring": ["Tech Lead", "mentored", "team lead", "manager"]
+
+    importance: float = 0.5
+    notes: str = ""  # "Demonstrated through team lead role"
+
+
+# --- Resume Extraction Models ---
+
+
+class RequirementMatch(BaseModel):
+    """Match result for a single JD requirement against resume.
+
+    Tracks both ATS-scannable and conceptual matches.
+    """
+    requirement_phrase: str  # What JD says
+    requirement_level: str  # "required" | "preferred"
+    requirement_type: str  # "keyword" | "activity" | "concept" | "behavioral"
+
+    # ATS matching
+    ats_found: bool  # Was the exact keyword/phrase found?
+    ats_matches: list[str] = Field(default_factory=list)  # Which ATS terms matched
+    ats_frequency: int = 0  # How many times found
+
+    # Conceptual/thematic matching (for concepts/behaviors)
+    theme_confidence: float = 0.0  # 0.0-1.0, how confident is this conceptually matched
+    theme_evidence: list[str] = Field(default_factory=list)  # What evidence found
+    theme_notes: str = ""  # Human-readable notes
+
+    # Overall verdict
+    human_understandable: bool = False  # Would a human see this requirement met?
+
+
+class KeywordMatch(BaseModel):
+    """Tracking for a technical keyword match."""
+    found: bool
+    frequency: int = 0
+    sources: list[str] = Field(default_factory=list)  # ["skills_section", "work_bullet_3"]
+
+
+class ActivityMatch(BaseModel):
+    """Tracking for an activity/deliverable match."""
+    found: bool
+    frequency: int = 0
+    sources: list[str] = Field(default_factory=list)
+
+
+class BehavioralEvidenceMatch(BaseModel):
+    """Evidence for a behavioral requirement."""
+    found: bool
+    evidence_type: str = ""  # "job_title", "bullet", "project"
+    evidence_text: str = ""
+
+
+class EducationInfo(BaseModel):
+    """Resume education information."""
+    degree: str = ""
+    field: str = ""
+    graduation_date: Optional[str] = None
+    gpa: Optional[float] = None
+
+
+class ExperienceInfo(BaseModel):
+    """Resume experience information."""
+    total_years: float = 0.0
+    current_level: str = ""  # "intern", "junior", "mid", "senior"
+
+
+class EligibilityInfo(BaseModel):
+    """Resume eligibility information."""
+    work_auth: str = ""  # "US Citizen", "Requires sponsorship", "Unknown"
+    location: str = ""
+    security_clearance: str = ""  # "None", "Secret", "Top Secret"
+
+
+class ResumeExtraction(BaseModel):
+    """Structured extraction of resume content for matching against JD requirements.
+
+    Tracks what was found, with confidence levels and evidence.
+    """
+    resume_id: str
+
+    # Technical keywords found
+    technical_keywords: dict[str, KeywordMatch] = Field(default_factory=dict)
+
+    # Activities/deliverables found
+    activities: dict[str, ActivityMatch] = Field(default_factory=dict)
+
+    # Behavioral indicators
+    behavioral_evidence: dict[str, BehavioralEvidenceMatch] = Field(default_factory=dict)
+
+    # Domain/industry
+    domains: list[str] = Field(default_factory=list)
+
+    # Gates (facts, not matched)
+    education: Optional[EducationInfo] = None
+    experience: Optional[ExperienceInfo] = None
+    eligibility: Optional[EligibilityInfo] = None
+
+    # Match results (populated after comparing against JD)
+    requirement_matches: list[RequirementMatch] = Field(default_factory=list)

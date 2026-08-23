@@ -57,26 +57,141 @@ For skill_additions: only add technologies/concepts (LLMs, RAG, CI/CD, etc.) the
 Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bullet is irrelevant."""
 
 
+# NEW V3: With Coverage Feedback (tells LLM what's missing)
+TAILORING_USER_V3 = """Here is a job description and a resume. Tell me which bullet points you would change to better match this JD for ATS.
+
+CURRENT ATS COVERAGE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Required Skills:    {required_coverage}% ({matched_required}/{total_required})
+Technical Keywords: {technical_coverage}% ({matched_technical}/{total_technical})
+Responsibilities:   {responsibility_coverage}% ({matched_resp}/{total_resp})
+
+CRITICAL GAPS TO CLOSE (missing or underweighted):
+{missing_skills}
+
+KEYWORDS TO EXPAND (already in resume, but underutilized):
+{underweight_skills}
+
+STRATEGY:
+1. Focus on closing the gaps above while keeping existing strengths
+2. Each rewrite should target at least one missing keyword if possible
+3. Preserve metrics and numbers — only improve keyword coverage
+4. Don't add the same keyword repeatedly (distribute across bullets)
+
+Each bullet shows (current/max chars). MUST NOT exceed the max chars shown.
+
+JOB DESCRIPTION:
+{jd_text}
+
+RESUME:
+{resume_text}
+
+Return a JSON object with entries for every bullet:
+{{
+  "bullet_changes": [
+    {{
+      "bullet_id": "the ID shown in brackets",
+      "action": "keep" | "rewrite" | "remove",
+      "new_text": "the improved bullet text (if rewrite)",
+      "reason": "what you changed and why",
+      "keywords_added": ["JD terms now in this bullet"]
+    }}
+  ],
+  "skill_reorders": {{
+    "Category Name": ["reordered skills, JD-relevant first"]
+  }},
+  "skill_additions": {{
+    "Category Name": ["TechSkill the candidate demonstrably used"]
+  }}
+}}
+
+For skill_additions: only add technologies/concepts (LLMs, RAG, CI/CD, etc.) the candidate clearly used. Never add soft skills.
+Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bullet is irrelevant."""
+
+
+# =============================================================================
+# SKILLS SECTION OPTIMIZATION
+# =============================================================================
+
+TAILORING_SKILLS_SYSTEM_V1 = """You are an expert resume writer optimizing the Skills section for ATS systems.
+
+Your goal is to make the Skills section match the job description as closely as possible using EXACT skill name matching only.
+
+Rules:
+1. Reorder skills to put JD-matching skills FIRST
+2. Only add skills the candidate demonstrably has (from the context provided)
+3. Remove soft skills and vague terms (communication, teamwork, problem-solving)
+4. Keep skills concise and ATS-scannable (one word or short phrases)
+5. Prioritize exact matches over semantic equivalents
+
+Return ONLY valid JSON."""
+
+
+TAILORING_SKILLS_USER_V1 = """Optimize the Skills section of this resume to match the job description.
+
+JOB DESCRIPTION REQUIRED SKILLS (in priority order):
+{jd_required_skills}
+
+JOB DESCRIPTION PREFERRED SKILLS:
+{jd_preferred_skills}
+
+CURRENT RESUME SKILLS:
+{resume_skills}
+
+CANDIDATE'S OTHER KEYWORDS (from bullets, can add if they used these):
+{candidate_keywords}
+
+STRATEGY:
+1. Move JD-required skills to the front (even if already listed)
+2. Keep existing skills the candidate actually has
+3. Only add skills from "candidate keywords" that aren't already in the resume
+4. Remove generic soft skills (communication, collaboration, management, etc.)
+
+Return a JSON object:
+{{
+  "skill_reorders": {{
+    "Category Name": ["reordered skills, matching JD first"]
+  }},
+  "skill_additions": {{
+    "Category Name": ["new technical skills to add"]
+  }},
+  "skill_removals": {{
+    "Category Name": ["soft skills or generic terms to remove"]
+  }},
+  "reason": "brief explanation of changes"
+}}
+
+IMPORTANT: Only return skills that the candidate actually has (based on bullets and context).
+Never add theoretical skills or soft skills."""
+
+
 # =============================================================================
 # BATCH BULLET TRIMMING
 # =============================================================================
 
-BATCH_TRIM_SYSTEM_V2 = """You are an expert resume writer who trims bullets to fit on ONE LINE ONLY. This is non-negotiable.
+BATCH_TRIM_SYSTEM_V2 = """You are an expert resume writer who trims/rephrases bullets to fit on ONE LINE ONLY.
 
-Your ONLY goal: rewrite each bullet to fit within the EXACT character limit stated. Period.
+Your goal: rewrite each bullet to fit within the EXACT character limit while keeping impact.
+
+When simple trimming isn't enough (e.g., 164 chars → 108 chars), REPHRASE more concisely:
+- Instead of just cutting words, restructure the bullet to express the same idea more concisely
+- Combine related concepts: "Built and deployed a distributed system using Kubernetes" → "Deployed Kubernetes system"
+- Use abbreviated forms: "for handling X requests per second" → "for X req/sec"
+- Transform details: "optimization system for portfolio allocation, solving to balance risk, yield, correlation" → "optimization for risk/yield balance"
 
 Rules:
-1. MUST fit within the char limit — not close, not almost — exact or shorter
+1. MUST fit within the char limit — text MUST NOT exceed this
 2. Keep ALL metrics, numbers, and keywords listed in "Keep:"
-3. Remove adjectives, adverbs, and descriptive padding
-4. Use imperative verbs (Deployed, Built, Optimized) not passive (Was deployed, Had been building)
-5. Cut phrases like "and", "to", "through", "by", "with" where the meaning still works
+3. Remove adjectives, adverbs, descriptive padding (scalable, robust, innovative, efficient, seamless)
+4. Restructure for conciseness: "Architected and deployed a distributed system" → "Deployed distributed system"
+5. Abbreviate: "HTTP API" → "API", "per second" → "/sec", "and" → "" when meaning works
 6. Never fabricate or omit numbers
 
-CRITICAL: If a bullet cannot fit with required content, report it honestly — do NOT return text longer than the limit."""
+CRITICAL: If trimming alone won't work, REPHRASE the bullet more concisely to meet the limit.
+Always return a properly formatted bullet — never return null or report as untrimmed."""
 
 
-BATCH_TRIM_USER_V2 = """TASK: Trim these bullets to fit ONE LINE ONLY. Each has a hard character limit that CANNOT be exceeded.
+BATCH_TRIM_USER_V2 = """TASK: Trim/rephrase these bullets to fit ONE LINE ONLY. Each has a hard character limit that CANNOT be exceeded.
 
 For each bullet:
 - Max chars: the HARD LIMIT (text MUST NOT exceed this)
@@ -86,16 +201,29 @@ For each bullet:
 
 {bullet_list}
 
-REWRITE RULES:
-1. Strip adjectives first (scalable, robust, modular, seamless, efficient, innovative)
-2. Use short verbs (Built not "Built out", Deploy not "Deployed", Design not "Designed and implemented")
-3. Merge clauses (remove "to", "by", "and" where possible): "Built and deployed" → "Deployed"
-4. Abbreviate: "HTTP API" → "API", "full-stack" → "full-stack" (this one stays)
-5. Numbers and keywords listed in "Keep:" ALWAYS stay
+REWRITE STRATEGIES:
+1. TRIMMING: Remove adjectives (scalable, robust, modular, seamless, efficient, innovative)
+2. VERB SHORTENING: "Built and deployed" → "Deployed", "Designed and implemented" → "Designed"
+3. CLAUSE CUTTING: Remove "to", "through", "by", "and" when meaning works
+4. ABBREVIATION: "per second" → "/sec", "HTTP API" → "API", "requirements" → "req"
+5. RESTRUCTURING: Combine ideas more concisely
+   - "optimization system for portfolio allocation, solving to balance risk, yield, and correlation"
+   - → "optimization for risk/yield/correlation balance"
 
-EXAMPLE:
+EXAMPLES:
+
+SIMPLE TRIM:
 - Input (156 chars, max 120): "Architected and deployed a distributed system using Kubernetes to handle 10K requests per second"
 - Output (120 chars): "Deployed distributed Kubernetes system handling 10K requests/second"
+
+AGGRESSIVE REPHRASE (when simple trim isn't enough):
+- Input (164 chars, max 110): "Developed and tested a Python/SciPy optimization system for portfolio allocation, solving to balance risk, yield, and correlation"
+- Output (105 chars): "Built Python optimization system balancing portfolio risk, yield, correlation"
+
+The rephrased version:
+- Keeps all keywords: Python, SciPy (via "optimization"), portfolio, balance, risk, yield
+- Removes filler: "developed and tested" → "built", "solving to" → removed, "and" → ","
+- Result: Same impact, much shorter
 
 Return a JSON object:
 {{
@@ -105,19 +233,31 @@ Return a JSON object:
       "trimmed_text": "trimmed text here (MUST be <= char limit)"
     }}
   ]
-}}"""
+}}
+
+CRITICAL: Always return trimmed text. Never return null or blank. If it doesn't fit, rephrase it more concisely."""
 
 
-BATCH_TRIM_RETRY_HINT = """The previous trimming did not meet the character limits. Be more aggressive:
+BATCH_TRIM_RETRY_HINT = """The previous attempt did not meet character limits. Be MORE AGGRESSIVE with rephrasing:
 
-1. Cut ALL descriptive words (scalable, efficient, modular, seamless, innovative, robust)
-2. Use ACTION + RESULT format only, no adjectives: instead of "successfully architected a robust system", write "architected system"
-3. Abbreviate: "and" → remove, "to" → remove if meaning works, "through" → remove
-4. Short verb forms: "Deployed" (9 chars) vs "Built out and deployed" (22 chars) — use first
-5. Keywords/numbers from "Keep:" are MANDATORY but everything else is optional
+LEVEL 1 - Aggressive Trimming:
+1. Cut ALL descriptive words (scalable, efficient, modular, seamless, innovative, robust, successful)
+2. Use ACTION + RESULT format: "successfully architected a robust system" → "architected system"
+3. Remove all filler: "and", "to", "through", "by", "for", "from", "with" (if meaning survives)
+4. Short verbs: "Deployed" (9 chars) vs "Built and deployed" (18 chars) — use shortest
+5. Aggressive abbreviation: "per" → "/", "second" → "sec", "implementation" → "impl"
 
-If you cannot fit the bullet within the limit while keeping keywords, the bullet should not be trimmed.
-Return only bullets that fit exactly or under the limit."""
+LEVEL 2 - Restructure for Conciseness (if Level 1 isn't enough):
+1. Combine related concepts: "Built and deployed a system using X for Y" → "Deployed X for Y"
+2. Replace descriptions with shorthand: "optimization system for portfolio allocation, solving to balance A, B, C" → "optimization for A/B/C balance"
+3. Use slash notation: "risk and yield balance" → "risk/yield balance"
+4. Merge clauses: "designed, implemented, and tested" → "implemented"
+5. Numeric shorthand: "10,000 requests per second" → "10K req/sec"
+
+Keywords/numbers from "Keep:" are MANDATORY — everything else is negotiable.
+
+CRITICAL: Always return a trimmed/rephrased bullet. Never return null, empty, or untrimmed text.
+If a bullet cannot fit while keeping mandatory keywords, that's impossible and should not happen."""
 
 
 # =============================================================================

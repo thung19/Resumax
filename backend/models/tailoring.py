@@ -143,6 +143,27 @@ class BulletChange(BaseModel):
         return v
 
 
+class BulletSnapshot(BaseModel):
+    """Pre-calculated snapshot of what skills/keywords are in a bullet.
+
+    Calculated at tailoring time for the tailored_text.
+    Used at accept/reject time to quickly recalculate coverage without re-scanning.
+
+    IMPORTANT: Snapshots track DIRECT matches only (explicit keywords in text).
+    IMPLIES matches (semantic inference) are NOT included in snapshots to prevent
+    inflated coverage percentages. Coverage metrics reflect only proven keywords.
+    """
+    bullet_id: str
+    # DIRECT matches only — exact keyword or alias found in text
+    matched_required_skills: list[str] = Field(default_factory=list)
+    matched_technical_keywords: list[str] = Field(default_factory=list)
+    matched_responsibilities: list[str] = Field(default_factory=list)  # text snippets, not full
+
+    # NEW: Matches from new categorized system
+    matched_technical_requirements: list[str] = Field(default_factory=list)  # JDRequirement.keyword_phrase
+    matched_deliverables: list[str] = Field(default_factory=list)  # ConcreteDeliverable.phrase
+
+
 class KeywordCoverage(BaseModel):
     """Keyword coverage report."""
     keyword: str
@@ -159,11 +180,41 @@ class TailoringResult(BaseModel):
     bullet_changes: list[BulletChange] = Field(default_factory=list)
     keyword_coverage: list[KeywordCoverage] = Field(default_factory=list)
 
-    # Coverage metrics
+    # Quick Win: Pre-calculated snapshots for fast coverage recalculation
+    # One snapshot per bullet, containing matched skills/keywords at tailoring time
+    # On accept/reject, just sum snapshots of accepted bullets (no text scanning)
+    bullet_snapshots: list[BulletSnapshot] = Field(default_factory=list)
+
+    # Coverage metrics (original, kept for backward compatibility)
     required_skill_coverage: float = 0.0
     technical_keyword_coverage: float = 0.0
     responsibility_coverage: float = 0.0
     preferred_skill_coverage: float = 0.0
+
+    # --- NEW (Simplified Metrics) ---
+    # Skills and Activities matched from new categorized requirements
+    skills_matched_coverage: float = 0.0  # % of technical_requirements matched
+    activities_matched_coverage: float = 0.0  # % of deliverables matched
+
+    # Detailed coverage breakdown (for Review tab UI)
+    required_skills_matched: list[str] = Field(default_factory=list)
+    required_skills_missing: list[str] = Field(default_factory=list)
+    technical_keywords_matched: list[str] = Field(default_factory=list)
+    technical_keywords_missing: list[str] = Field(default_factory=list)
+    responsibilities_matched: list[str] = Field(default_factory=list)
+    responsibilities_missing: list[str] = Field(default_factory=list)
+
+    # Skills and Activities breakdown (from new categorized system)
+    skills_matched: list[str] = Field(default_factory=list)
+    skills_missing: list[str] = Field(default_factory=list)
+    activities_matched: list[str] = Field(default_factory=list)
+    activities_missing: list[str] = Field(default_factory=list)
+
+    # --- NEW (Phase 4): Two-tier coverage metrics ---
+    # Separates what ATS will find from what humans would understand
+    ats_coverage: float = 0.0  # What ATS literally finds (0.0-1.0)
+    human_coverage: float = 0.0  # What humans would recognize (0.0-1.0)
+    coverage_gap: float = 0.0  # Difference: human - ats (what ATS misses but humans see)
 
     # Skills reordering: category -> [reordered skills]
     reordered_skills: dict[str, list[str]] = Field(default_factory=dict)
@@ -181,6 +232,10 @@ class TailoringResult(BaseModel):
     # Bullet fitting report
     fitting_report: Optional[dict] = None
     fitting_violations: list[str] = Field(default_factory=list)
+
+    # Quick Win #4: Pre-computed skill occurrence matrix for fast recalculation
+    # {skill_name: {bullet_id: True/False}} — enables O(1) coverage lookup instead of O(text_length)
+    skill_occurrence_matrix: Optional[dict[str, dict[str, bool]]] = None
 
     # Debug log — tracks what the LLM returned and what the safety net did
     debug_log: list[str] = Field(default_factory=list)

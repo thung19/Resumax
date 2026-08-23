@@ -91,8 +91,10 @@ class TrimmingConfig:
 
     The system calculates character limits dynamically based on precise point
     measurements. For variable-width fonts (e.g., Garamond), it conservatively
-    assumes every character is as wide as the widest character in the font
-    (e.g., M or W), then provides failure feedback to the LLM on retry rounds.
+    applies a safety factor to account for character composition differences.
+
+    When LLM rewrites text, the character mix changes (more M's/W's, fewer i's/l's),
+    affecting the actual pixel width. The safety factor provides a conservative margin.
     """
 
     # Enable trimming at all (can disable if causing too many reverts)
@@ -100,6 +102,14 @@ class TrimmingConfig:
 
     # Maximum trim rounds before giving up (hardcoded to 3 in implementation)
     max_trim_rounds: int = 3
+
+    # Character width safety factor (0.0-1.0)
+    # Multiplied by usable width when calculating per-bullet char limits
+    # 1.0 = no reduction, 0.85 = 15% reduction for safety
+    # Default: 0.85 for Garamond (very conservative for variable-width font)
+    # Lower values = tighter char budgets = more revert-on-overflow
+    # Higher values = looser budgets = more trim failures
+    char_width_safety_factor: float = 0.85
 
     @classmethod
     def from_env(cls) -> "TrimmingConfig":
@@ -110,6 +120,9 @@ class TrimmingConfig:
             ).lower() == "true",
             max_trim_rounds=int(
                 os.environ.get("TRIM_MAX_ROUNDS", "3")
+            ),
+            char_width_safety_factor=float(
+                os.environ.get("TRIM_SAFETY_FACTOR", "0.85")
             ),
         )
 

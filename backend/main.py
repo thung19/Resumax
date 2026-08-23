@@ -498,6 +498,11 @@ class SkillBatchAcceptRequest(BaseModel):
     accepted: bool = True
 
 
+class SaveEditedBulletsRequest(BaseModel):
+    """Request to save user-edited bullets and recalculate coverage."""
+    edited_bullets: dict[str, str]  # bullet_id -> new_text
+
+
 @app.post("/analyze-jd")
 async def analyze_jd(req: AnalyzeJDRequest, request: Request):
     """Analyze a job description using hybrid LLM + deterministic analysis."""
@@ -594,13 +599,10 @@ async def tailor_resume(resume_id: str, req: TailorRequest, request: Request):
 
 
 def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR):
-    """Recalculate coverage stats after tailoring changes.
+    """Recalculate coverage stats after accept/reject changes using snapshots.
 
-    When bullets are accepted/rejected, the resume content changes, so we need
-    to re-run the matcher to get updated coverage percentages.
-
-    IMPORTANT: We must use the TAILORED text from result.bullet_changes, not the
-    original text in ir.content.bullets, because the matcher scans the text content.
+    Snapshots are the single source of truth for coverage metrics.
+    This ensures top percentages always perfectly match detail breakdown.
     """
     jd = _jd_store.get(resume_id)
     if jd is None:
@@ -608,77 +610,20 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         return
 
     try:
-        from backend.tailoring.matcher import _text_contains_keyword, _normalize
+        print(f"DEBUG: Recalculating coverage from snapshots for {resume_id}")
 
-        print(f"DEBUG: Recalculating coverage for {resume_id}")
-
-        # Clear previous coverage
-        result.keyword_coverage = []
-
-        # Build resume text from actual resume state (accepted rewrites or originals)
-        resume_parts = []
-        for change in result.bullet_changes:
-            if change.action == "remove":
-                # Skip removed bullets entirely
-                continue
-            elif change.action == "rewrite" and change.accepted:
-                # Use tailored text if rewrite was ACCEPTED
-                resume_parts.append(change.tailored_text)
-            else:
-                # Use original text if: kept, or rewrite was REJECTED
-                resume_parts.append(change.original_text)
-
-        # Add skills from IR
-        for section in ir.content.sections:
-            for cat in section.skill_categories:
-                resume_parts.append(f"{cat.category} {' '.join(cat.skills)}")
-
-        resume_text = " ".join(resume_parts)
-        resume_text_lower = _normalize(resume_text)
-
-        print(f"DEBUG: Built resume text from tailored bullets: {len(resume_text)} chars")
-
-        # Calculate coverage percentages from tailored resume text
+        # Track old values for logging
         old_req = result.required_skill_coverage
         old_tech = result.technical_keyword_coverage
         old_resp = result.responsibility_coverage
 
-        # Required skills coverage (decimal 0.0-1.0, like matcher)
-        required = jd.required_skills
-        if required:
-            matched_req = sum(
-                1 for s in required
-                if _text_contains_keyword(resume_text_lower, s.name)
-            )
-            result.required_skill_coverage = matched_req / len(required)
-        else:
-            result.required_skill_coverage = 0.0
+        # Import and call the calculation function from service
+        from backend.services.tailoring_service import TailoringService
+        service = TailoringService()
+        service._calculate_coverage_from_snapshots(result, jd)
 
-        # Technical skills coverage (decimal 0.0-1.0, like matcher)
-        all_skills = jd.all_skills_flat()
-        if all_skills:
-            matched_count = sum(
-                1 for s in all_skills
-                if _text_contains_keyword(resume_text_lower, s.name)
-            )
-            result.technical_keyword_coverage = matched_count / len(all_skills)
-        else:
-            result.technical_keyword_coverage = 0.0
-
-        # Responsibility coverage (decimal 0.0-1.0, like matcher)
-        responsibilities = jd.responsibilities
-        if responsibilities:
-            matched_resp = sum(
-                1 for r in responsibilities
-                if any(_text_contains_keyword(resume_text_lower, kw) for kw in r.keywords)
-                or any(_text_contains_keyword(resume_text_lower, word)
-                       for word in r.text.split() if len(word) > 4)
-            )
-            result.responsibility_coverage = matched_resp / len(responsibilities)
-        else:
-            result.responsibility_coverage = 0.0
-
-        print(f"DEBUG: Coverage updated: Required {old_req:.0f}% → {result.required_skill_coverage:.0f}%, "
+        print(f"DEBUG: Coverage updated: "
+              f"Required {old_req:.0f}% → {result.required_skill_coverage:.0f}%, "
               f"Technical {old_tech:.0f}% → {result.technical_keyword_coverage:.0f}%, "
               f"Responsibility {old_resp:.0f}% → {result.responsibility_coverage:.0f}%")
 
@@ -891,6 +836,43 @@ async def accept_all_skills(resume_id: str, req: SkillBatchAcceptRequest):
 
     # Return result with updated coverage
     response = result.model_dump()
+    return response
+
+
+@app.post("/tailor/{resume_id}/save-edits")
+async def save_edited_bullets(resume_id: str, req: SaveEditedBulletsRequest):
+    """Save user-edited bullet text and recalculate coverage metrics.
+
+    User edits bullets directly on the review page (contenteditable)
+    and clicks Save → this updates the result and recalculates coverage.
+    """
+    result = _tailoring_store.get(resume_id)
+    if result is None:
+        raise HTTPException(404, "No tailoring result found")
+
+    # Get JD for coverage recalculation
+    jd = _jd_store.get(resume_id)
+    if jd is None:
+        raise HTTPException(404, "No JD found for this resume")
+
+    # Use service to save edits and recalculate
+    service = TailoringService(use_llm=False)
+    updated_result = service.save_edited_bullets(result, req.edited_bullets, jd)
+
+    # Update stored result
+    _tailoring_store[resume_id] = updated_result
+
+    # Re-apply tailoring to get updated IR
+    ir = _load_ir(resume_id)
+    tailored_ir = service.apply_tailoring(ir, updated_result)
+    _tailored_ir_store[resume_id] = tailored_ir
+
+    # Save updated IR
+    ir_path = GENERATED_DIR / f"{resume_id}_tailored_ir.json"
+    ir_path.write_text(tailored_ir.model_dump_json(indent=2))
+
+    # Return updated result with new metrics
+    response = updated_result.model_dump()
     return response
 
 
