@@ -261,49 +261,6 @@ If a bullet cannot fit while keeping mandatory keywords, that's impossible and s
 
 
 # =============================================================================
-# REJECTION RETRY LOOP (NOT YET IMPLEMENTED)
-# =============================================================================
-# TODO: Implement TailoringEngine.retry_rejected_bullets() method
-# This feature is planned but not yet implemented. The prompts are defined
-# but the method that uses them does not exist yet.
-# See: backend/services/tailoring_service.py line ~251 for details
-# When implemented, this will retry bullets that failed claim validation.
-
-REJECTION_RETRY_SYSTEM_V1 = """You are an expert resume writer. These bullet rewrites were rejected during validation.
-
-Your job: look at WHY each failed, then try again with a rewrite that addresses the issue.
-
-The core rules you must follow:
-- Never add technologies that aren't clearly supported by the source facts
-- Never drop numbers, metrics, or listed keywords from the original
-- Keep the bullet concise and impactful
-
-Return ONLY valid JSON."""
-
-
-REJECTION_RETRY_USER_TEMPLATE = """Here are bullet rewrites that failed validation:
-
-{rejection_details}
-
-For each bullet, rewrite it to avoid the validation issue.
-
-Source facts available for this entry:
-{facts}
-
-Return a JSON object:
-{{
-  "bullet_changes": [
-    {{
-      "bullet_id": "...",
-      "action": "rewrite",
-      "new_text": "...",
-      "reason": "..."
-    }}
-  ]
-}}"""
-
-
-# =============================================================================
 # FREEFORM EDITS
 # =============================================================================
 
@@ -402,7 +359,6 @@ Return ONLY valid JSON, no markdown."""
 PROMPT_VERSIONS = {
     "TAILORING": {"system": "V2", "user": "V2", "updated": "2026-08-20"},
     "BATCH_TRIM": {"system": "V2", "user": "V2", "retry_hint": "V1", "updated": "2026-08-20"},
-    "REJECTION_RETRY": {"system": "V1", "user": "V1", "updated": "2026-08-20", "status": "NOT_IMPLEMENTED"},
     "FREEFORM_EDIT": {"system": "V1", "user": "V1", "updated": "2026-08-20"},
     "JD_ANALYSIS": {"system": "V1", "user": "V1", "updated": "2026-08-20"},
 }

@@ -335,21 +335,6 @@ class TailoringService:
                     f"\"{change.tailored_text[:60]}...\""
                 )
 
-        # === REJECTION FEEDBACK LOOP ===
-        # TODO: Implement retry_rejected_bullets() method in TailoringEngine
-        # This feature collects bullets that failed validation and retries them
-        # Currently disabled because the method is not implemented
-        # See: https://github.com/resumax/resumax/issues/XXX
-        #
-        # rejected_bullets = [
-        #     (change, change.reason.split(": ", 1)[1].split("; ") if "Rewrite rejected:" in change.reason else [])
-        #     for change in result.bullet_changes
-        #     if change.action == "keep" and "Rewrite rejected:" in (change.reason or "")
-        # ]
-        #
-        # if rejected_bullets and len(rejected_bullets) <= 5:
-        #     ... (retry logic disabled)
-
         # === Batch overflow trimming ===
         if measurer:
             self._batch_trim_overflows(result, measurer, validator, bank, ir)

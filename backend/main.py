@@ -616,16 +616,24 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         old_req = result.required_skill_coverage
         old_tech = result.technical_keyword_coverage
         old_resp = result.responsibility_coverage
+        old_skills = result.skills_matched_coverage if hasattr(result, 'skills_matched_coverage') else 0
+        old_activities = result.activities_matched_coverage if hasattr(result, 'activities_matched_coverage') else 0
 
-        # Import and call the calculation function from service
+        # CRITICAL: Rebuild snapshots based on current accepted/rejected state
+        # The IR has been updated by apply_tailoring(), so we need fresh snapshots
         from backend.services.tailoring_service import TailoringService
         service = TailoringService()
+        service._build_bullet_snapshots(result, jd)
+
+        # NOW recalculate coverage from the rebuilt snapshots
         service._calculate_coverage_from_snapshots(result, jd)
 
         print(f"DEBUG: Coverage updated: "
               f"Required {old_req:.0f}% → {result.required_skill_coverage:.0f}%, "
               f"Technical {old_tech:.0f}% → {result.technical_keyword_coverage:.0f}%, "
-              f"Responsibility {old_resp:.0f}% → {result.responsibility_coverage:.0f}%")
+              f"Responsibility {old_resp:.0f}% → {result.responsibility_coverage:.0f}%, "
+              f"Skills {old_skills:.0f}% → {result.skills_matched_coverage:.0f}%, "
+              f"Activities {old_activities:.0f}% → {result.activities_matched_coverage:.0f}%")
 
         # Rebuild keyword coverage list
         all_jd_keywords = jd.all_keywords()
