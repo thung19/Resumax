@@ -245,6 +245,21 @@ async def inspect_layout(resume_id: str):
     return _load_ir(resume_id).layout.model_dump()
 
 
+@app.get("/page-dimensions/{resume_id}")
+async def get_page_dimensions(resume_id: str):
+    """Return the page dimensions and margins for accurate preview sizing."""
+    ir = _load_ir(resume_id)
+    page = ir.layout.page
+    return {
+        "width_in": page.width_in,
+        "height_in": page.height_in,
+        "margin_top_in": page.margin_top_in,
+        "margin_bottom_in": page.margin_bottom_in,
+        "margin_left_in": page.margin_left_in,
+        "margin_right_in": page.margin_right_in,
+    }
+
+
 @app.get("/preview/{resume_id}", response_class=HTMLResponse)
 async def preview_resume(resume_id: str):
     """Return an HTML preview of the resume."""
