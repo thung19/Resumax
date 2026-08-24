@@ -1277,7 +1277,7 @@ class TailoringService:
                     new_text = "• " + matched_change.tailored_text
                     if el.paragraph_format.runs:
                         first_run = el.paragraph_format.runs[0]
-                        ✅ # Copy ALL properties from original run, only replace text
+                        # Copy ALL properties from original run, only replace text
                         run_props = first_run.model_dump(exclude={"text"})
                         el.paragraph_format.runs = [RunFormat(
                             text=new_text,
@@ -1310,7 +1310,7 @@ class TailoringService:
                             if el.paragraph_format.runs
                             else RunFormat()
                         )
-                        ✅ # Copy ALL properties from original run, override specific ones
+                        # Copy ALL properties from original run, override specific ones
                         base_props = first_run.model_dump(exclude={"text", "bold"})
                         el.paragraph_format.runs = [
                             RunFormat(
