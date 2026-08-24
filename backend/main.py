@@ -273,7 +273,12 @@ async def export_docx(resume_id: str):
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
@@ -294,6 +299,9 @@ async def export_pdf(resume_id: str):
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Page-Count": str(info.page_count),
             "X-Overflow": str(info.overflow),
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 
@@ -310,7 +318,12 @@ async def export_txt(resume_id: str):
     return Response(
         content=text,
         media_type="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
@@ -334,6 +347,9 @@ async def export_tailored_pdf(resume_id: str):
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Page-Count": str(info.page_count),
             "X-Overflow": str(info.overflow),
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
         },
     )
 
@@ -348,9 +364,17 @@ async def export_tailored_txt(resume_id: str):
     renderer = TextRenderer(ir)
     text = renderer.render()
 
+    filename = (ir.source_filename or "resume").rsplit(".", 1)[0] + "_tailored.txt"
+
     return Response(
         content=text,
         media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
@@ -911,7 +935,12 @@ async def export_tailored_docx(resume_id: str):
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
