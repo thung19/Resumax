@@ -456,7 +456,7 @@ class DocxRenderer:
 
         # Classify each group: does it look like a date/location?
         DATE_RE = re.compile(
-            r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|present|\d{4})",
+            r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|present)\b|\b\d{4}\b",
             re.I,
         )
         LOCATION_RE = re.compile(
