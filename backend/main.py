@@ -269,17 +269,18 @@ async def preview_resume(resume_id: str):
 
 
 @app.get("/export/{resume_id}/docx")
-async def export_docx(resume_id: str):
+async def export_docx(resume_id: str, filename: str | None = None):
     """Export the resume as a .docx file."""
     ir = _load_ir(resume_id)
     renderer = DocxRenderer(ir)
     docx_bytes = renderer.render()
 
-    filename = ir.source_filename or "resume.docx"
-    if not filename.endswith(".docx"):
-        filename = filename.rsplit(".", 1)[0] + "_tailored.docx"
-    else:
-        filename = filename.rsplit(".", 1)[0] + "_tailored.docx"
+    # Use custom filename if provided, otherwise derive from source
+    if not filename:
+        filename = ir.source_filename or "resume"
+        if filename.endswith(".docx"):
+            filename = filename[:-5]
+    filename = filename + ".docx"
 
     # Save to generated dir
     export_path = GENERATED_DIR / f"{resume_id}_export.docx"
@@ -298,14 +299,19 @@ async def export_docx(resume_id: str):
 
 
 @app.get("/export/{resume_id}/pdf")
-async def export_pdf(resume_id: str):
+async def export_pdf(resume_id: str, filename: str | None = None):
     """Export the resume as a PDF file."""
     ir = _load_ir(resume_id)
     renderer = PdfRenderer(ir)
     pdf_bytes = renderer.render()
     info = renderer.get_overflow_info()
 
-    filename = (ir.source_filename or "resume").rsplit(".", 1)[0] + ".pdf"
+    # Use custom filename if provided, otherwise derive from source
+    if not filename:
+        filename = ir.source_filename or "resume"
+        if filename.endswith(".pdf"):
+            filename = filename[:-4]
+    filename = filename + ".pdf"
 
     return Response(
         content=pdf_bytes,
@@ -322,13 +328,18 @@ async def export_pdf(resume_id: str):
 
 
 @app.get("/export/{resume_id}/txt")
-async def export_txt(resume_id: str):
+async def export_txt(resume_id: str, filename: str | None = None):
     """Export the resume as plain text."""
     ir = _load_ir(resume_id)
     renderer = TextRenderer(ir)
     text = renderer.render()
 
-    filename = (ir.source_filename or "resume").rsplit(".", 1)[0] + ".txt"
+    # Use custom filename if provided, otherwise derive from source
+    if not filename:
+        filename = ir.source_filename or "resume"
+        if filename.endswith(".txt"):
+            filename = filename[:-4]
+    filename = filename + ".txt"
 
     return Response(
         content=text,
@@ -343,7 +354,7 @@ async def export_txt(resume_id: str):
 
 
 @app.get("/export/{resume_id}/tailored/pdf")
-async def export_tailored_pdf(resume_id: str):
+async def export_tailored_pdf(resume_id: str, filename: str | None = None):
     """Export the tailored resume as PDF."""
     ir = _tailored_ir_store.get(resume_id)
     if ir is None:
@@ -353,7 +364,12 @@ async def export_tailored_pdf(resume_id: str):
     pdf_bytes = renderer.render()
     info = renderer.get_overflow_info()
 
-    filename = (ir.source_filename or "resume").rsplit(".", 1)[0] + "_tailored.pdf"
+    # Use custom filename if provided, otherwise derive from source
+    if not filename:
+        filename = ir.source_filename or "resume"
+        if filename.endswith(".pdf"):
+            filename = filename[:-4]
+    filename = filename + "_tailored.pdf"
 
     return Response(
         content=pdf_bytes,
@@ -370,7 +386,7 @@ async def export_tailored_pdf(resume_id: str):
 
 
 @app.get("/export/{resume_id}/tailored/txt")
-async def export_tailored_txt(resume_id: str):
+async def export_tailored_txt(resume_id: str, filename: str | None = None):
     """Export the tailored resume as plain text."""
     ir = _tailored_ir_store.get(resume_id)
     if ir is None:
@@ -379,7 +395,12 @@ async def export_tailored_txt(resume_id: str):
     renderer = TextRenderer(ir)
     text = renderer.render()
 
-    filename = (ir.source_filename or "resume").rsplit(".", 1)[0] + "_tailored.txt"
+    # Use custom filename if provided, otherwise derive from source
+    if not filename:
+        filename = ir.source_filename or "resume"
+        if filename.endswith(".txt"):
+            filename = filename[:-4]
+    filename = filename + "_tailored.txt"
 
     return Response(
         content=text,
@@ -935,7 +956,7 @@ async def preview_tailored(resume_id: str, diff: bool = False):
 
 
 @app.get("/export/{resume_id}/tailored/docx")
-async def export_tailored_docx(resume_id: str):
+async def export_tailored_docx(resume_id: str, filename: str | None = None):
     """Export the tailored resume as .docx."""
     ir = _tailored_ir_store.get(resume_id)
     if ir is None:
@@ -944,8 +965,12 @@ async def export_tailored_docx(resume_id: str):
     renderer = DocxRenderer(ir)
     docx_bytes = renderer.render()
 
-    orig_name = ir.source_filename or "resume"
-    filename = orig_name.rsplit(".", 1)[0] + "_tailored.docx"
+    # Use custom filename if provided, otherwise derive from source
+    if not filename:
+        filename = ir.source_filename or "resume"
+        if filename.endswith(".docx"):
+            filename = filename[:-5]
+    filename = filename + "_tailored.docx"
 
     return Response(
         content=docx_bytes,
