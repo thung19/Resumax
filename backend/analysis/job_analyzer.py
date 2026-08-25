@@ -213,18 +213,86 @@ class JobAnalyzer:
             analysis.job_type = "contract"
 
     def _extract_technologies(self, text_lower: str, analysis: JobAnalysis):
+        # Track what we've already added to prevent duplicates
+        seen_lower = set()
+
         for lang in _find_matches(text_lower, PROGRAMMING_LANGUAGES):
-            analysis.programming_languages.append(WeightedItem(name=lang, category="language"))
+            lang_lower = lang.lower()
+            if lang_lower not in seen_lower:
+                analysis.programming_languages.append(WeightedItem(name=lang, category="language"))
+                seen_lower.add(lang_lower)
+
         for fw in _find_matches(text_lower, FRAMEWORKS):
-            analysis.frameworks.append(WeightedItem(name=fw, category="framework"))
+            fw_lower = fw.lower()
+            if fw_lower not in seen_lower:
+                analysis.frameworks.append(WeightedItem(name=fw, category="framework"))
+                seen_lower.add(fw_lower)
+
         for db in _find_matches(text_lower, DATABASES):
-            analysis.databases.append(WeightedItem(name=db, category="database"))
+            db_lower = db.lower()
+            if db_lower not in seen_lower:
+                analysis.databases.append(WeightedItem(name=db, category="database"))
+                seen_lower.add(db_lower)
+
         for infra in _find_matches(text_lower, INFRASTRUCTURE):
-            analysis.infrastructure.append(WeightedItem(name=infra, category="infrastructure"))
+            infra_lower = infra.lower()
+            if infra_lower not in seen_lower:
+                analysis.infrastructure.append(WeightedItem(name=infra, category="infrastructure"))
+                seen_lower.add(infra_lower)
+
         for tool in _find_matches(text_lower, TOOLS):
-            analysis.tools.append(WeightedItem(name=tool, category="tool"))
+            tool_lower = tool.lower()
+            if tool_lower not in seen_lower:
+                analysis.tools.append(WeightedItem(name=tool, category="tool"))
+                seen_lower.add(tool_lower)
+
         for meth in _find_matches(text_lower, METHODOLOGIES):
-            analysis.methodologies.append(WeightedItem(name=meth, category="methodology"))
+            meth_lower = meth.lower()
+            if meth_lower not in seen_lower:
+                analysis.methodologies.append(WeightedItem(name=meth, category="methodology"))
+                seen_lower.add(meth_lower)
+
+        # Deduplicate variant forms: prefer more specific/complete terms
+        self._deduplicate_variants(analysis)
+
+    def _deduplicate_variants(self, analysis: JobAnalysis):
+        """Remove redundant variant forms, preferring the more specific/complete term.
+
+        Examples of variants to deduplicate:
+        - "git" vs "github" → keep "github" (more specific)
+        - "node.js" vs "nodejs" → keep "node.js" (canonical form)
+        - "vue.js" vs "vue" → keep "vue.js" (more complete)
+        - "next.js" vs "nextjs" → keep "next.js" (canonical form)
+        """
+        # Define variant relationships: (less_specific, more_specific)
+        variant_pairs = [
+            ("git", "github"),          # github is more specific
+            ("node", "node.js"),        # node.js is canonical
+            ("nodejs", "node.js"),      # node.js is canonical
+            ("vue", "vue.js"),          # vue.js is more complete
+            ("vuejs", "vue.js"),        # vue.js is canonical
+            ("next", "next.js"),        # next.js is canonical
+            ("nextjs", "next.js"),      # next.js is canonical
+            ("nest", "nest.js"),        # nest.js is canonical
+            ("nestjs", "nest.js"),      # nest.js is canonical
+            ("tailwind", "tailwindcss"),# tailwindcss is more complete
+            ("rest", "restful"),        # restful is more specific
+        ]
+
+        for list_obj in [
+            analysis.frameworks, analysis.tools, analysis.programming_languages,
+            analysis.databases, analysis.infrastructure,
+        ]:
+            existing_lower = {item.name.lower(): item for item in list_obj}
+
+            # For each variant pair, remove the less specific if more specific exists
+            for less_specific, more_specific in variant_pairs:
+                if more_specific.lower() in existing_lower and less_specific.lower() in existing_lower:
+                    # Remove the less specific variant
+                    list_obj[:] = [
+                        item for item in list_obj
+                        if item.name.lower() != less_specific.lower()
+                    ]
 
     def _extract_responsibilities(self, text: str, analysis: JobAnalysis):
         lines = text.split("\n")
@@ -363,6 +431,10 @@ class JobAnalyzer:
                 for kw in self._extract_keywords_from_text(line):
                     preferred_keywords.add(kw.lower())
 
+        # Track what's already in required/preferred to avoid duplicates
+        required_seen = {s.name.lower() for s in analysis.required_skills}
+        preferred_seen = {s.name.lower() for s in analysis.preferred_skills}
+
         for item_list in [
             analysis.programming_languages, analysis.frameworks,
             analysis.databases, analysis.infrastructure, analysis.tools,
@@ -371,14 +443,18 @@ class JobAnalyzer:
                 name_lower = item.name.lower()
                 if name_lower in required_keywords:
                     item.importance = min(1.0, item.importance + 0.3)
-                    analysis.required_skills.append(
-                        WeightedItem(name=item.name, importance=item.importance, category=item.category)
-                    )
+                    if name_lower not in required_seen:
+                        analysis.required_skills.append(
+                            WeightedItem(name=item.name, importance=item.importance, category=item.category)
+                        )
+                        required_seen.add(name_lower)
                 elif name_lower in preferred_keywords:
                     item.importance = min(1.0, item.importance + 0.1)
-                    analysis.preferred_skills.append(
-                        WeightedItem(name=item.name, importance=item.importance, category=item.category)
-                    )
+                    if name_lower not in preferred_seen and name_lower not in required_seen:
+                        analysis.preferred_skills.append(
+                            WeightedItem(name=item.name, importance=item.importance, category=item.category)
+                        )
+                        preferred_seen.add(name_lower)
 
     def _build_ats_phrases(self, analysis: JobAnalysis):
         phrases = []
@@ -640,6 +716,35 @@ class JobAnalyzer:
         # Note: ATS phrases and key_themes are no longer extracted
         # by the LLM prompt. The deterministic pass builds ATS phrases
         # from detected skills, which is sufficient.
+
+        # Final deduplication pass on required/preferred skills lists
+        self._deduplicate_skill_lists(analysis)
+
+    def _deduplicate_skill_lists(self, analysis: JobAnalysis):
+        """Remove duplicate entries from required_skills and preferred_skills lists.
+
+        Ensures no skill appears more than once in each list (case-insensitive).
+        """
+        seen_required = set()
+        seen_preferred = set()
+
+        # Deduplicate required_skills
+        unique_required = []
+        for item in analysis.required_skills:
+            item_lower = item.name.lower()
+            if item_lower not in seen_required:
+                unique_required.append(item)
+                seen_required.add(item_lower)
+        analysis.required_skills = unique_required
+
+        # Deduplicate preferred_skills (exclude any that are in required)
+        unique_preferred = []
+        for item in analysis.preferred_skills:
+            item_lower = item.name.lower()
+            if item_lower not in seen_preferred and item_lower not in seen_required:
+                unique_preferred.append(item)
+                seen_preferred.add(item_lower)
+        analysis.preferred_skills = unique_preferred
 
     def _find_existing_skill(self, analysis: JobAnalysis, name_lower: str) -> Optional[WeightedItem]:
         """Find an existing skill by name across all categories."""
