@@ -389,8 +389,17 @@ class TailoringEngine:
                 history = failure_history[b["bullet_id"]]
                 prev_text = history.get("previous_attempt", "")
                 overflow = history.get("overflow_chars", 0)
-                if prev_text and overflow > 0:
-                    xml += f'    <failure_context>\n      <previous_attempt>{escape_xml(prev_text)}</previous_attempt>\n      <still_over_by>{overflow}</still_over_by>\n      <guidance>Try removing more adjectives or restructure more aggressively</guidance>\n    </failure_context>\n'
+                missing_kw = history.get("missing_keywords", [])
+                if prev_text and (overflow > 0 or missing_kw):
+                    if missing_kw:
+                        guidance = (
+                            "Your previous attempt fit the character limit but DROPPED "
+                            "required keyword(s): " + ", ".join(missing_kw) + ". "
+                            "Keep those words verbatim and trim other parts of the sentence instead."
+                        )
+                    else:
+                        guidance = "Try removing more adjectives or restructure more aggressively"
+                    xml += f'    <failure_context>\n      <previous_attempt>{escape_xml(prev_text)}</previous_attempt>\n      <still_over_by>{overflow}</still_over_by>\n      <guidance>{escape_xml(guidance)}</guidance>\n    </failure_context>\n'
 
             xml += '  </bullet>\n'
             xml_entries.append(xml)

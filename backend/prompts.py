@@ -54,6 +54,7 @@ Return a JSON object with entries for every bullet:
 }}
 
 For skill_additions: only add technologies/concepts (LLMs, RAG, CI/CD, etc.) the candidate clearly used. Never add soft skills.
+Each skill_reorders list must contain every skill EXACTLY ONCE — never repeat an item, and never list two spellings of the same thing (e.g. "Git" and "GitHub", "HTML" and "HTML5") as separate entries; keep only the more specific/complete form.
 Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bullet is irrelevant."""
 
 
@@ -106,6 +107,7 @@ Return a JSON object with entries for every bullet:
 }}
 
 For skill_additions: only add technologies/concepts (LLMs, RAG, CI/CD, etc.) the candidate clearly used. Never add soft skills.
+Each skill_reorders list must contain every skill EXACTLY ONCE — never repeat an item, and never list two spellings of the same thing (e.g. "Git" and "GitHub", "HTML" and "HTML5") as separate entries; keep only the more specific/complete form.
 Max bullets per entry: {max_bullets}. Only remove if entry exceeds this AND bullet is irrelevant."""
 
 
@@ -123,6 +125,7 @@ Rules:
 3. Remove soft skills and vague terms (communication, teamwork, problem-solving)
 4. Keep skills concise and ATS-scannable (one word or short phrases)
 5. Prioritize exact matches over semantic equivalents
+6. Never list the same skill twice — including near-duplicate spellings like "Git"/"GitHub" or "HTML"/"HTML5" — in a category. Each item in skill_reorders and skill_additions must be distinct.
 
 Return ONLY valid JSON."""
 
@@ -144,8 +147,9 @@ CANDIDATE'S OTHER KEYWORDS (from bullets, can add if they used these):
 STRATEGY:
 1. Move JD-required skills to the front (even if already listed)
 2. Keep existing skills the candidate actually has
-3. Only add skills from "candidate keywords" that aren't already in the resume
+3. Only add skills from "candidate keywords" that aren't already in the resume — check for near-duplicates too, not just exact matches (don't add "HTML" if "HTML5" is already listed, or "Git" if "GitHub" is already listed)
 4. Remove generic soft skills (communication, collaboration, management, etc.)
+5. skill_reorders must contain each existing skill exactly once, in your chosen order — never duplicate an item within the list
 
 Return a JSON object:
 {{
@@ -180,7 +184,7 @@ APPROACH:
 LEVEL 1 - SIMPLE TRIMMING (if bullet is close to limit):
 - Remove adjectives/padding: scalable, robust, innovative, efficient, seamless, modular
 - Shorten verbs: "Built and deployed" → "Deployed", "Designed and implemented" → "Designed"
-- Abbreviate: "per second" → "/sec", "HTTP API" → "API", "requirements" → "req"
+- Abbreviate ONLY with standard, professional resume shorthand: "per second" → "/sec", "HTTP API" → "API". Do NOT use informal truncations like "req" for "requirements" or "impl" for "implementation" — those read as sloppy, not concise.
 - Example: "Architected and deployed a distributed system using Kubernetes" → "Deployed Kubernetes system"
 
 LEVEL 2 - AGGRESSIVE REPHRASING (if simple trimming won't fit):
@@ -189,10 +193,11 @@ LEVEL 2 - AGGRESSIVE REPHRASING (if simple trimming won't fit):
 - Use slash notation: "risk and yield balance" → "risk/yield balance"
 - Merge clauses: "designed, implemented, and tested" → "implemented"
 - Example: "Built Python optimization system balancing portfolio risk, yield, correlation" (105 chars, fits 110-char limit)
+- Restructuring must not change WHAT MODIFIES WHAT: cutting a connector like "for"/"through" can silently flip meaning (e.g. "QA tool for fMRI datasets" → "fMRI QA datasets" wrongly implies the datasets are for QA, not that you built a QA tool). Re-read your output as a sentence — if it now claims something different than the original, revise.
 
 CRITICAL RULES:
 1. CONSTRAINT IS ABSOLUTE: If your trimmed text exceeds the limit, REPHRASE MORE CONCISELY
-2. ALL mandatory keywords MUST stay (listed in each bullet)
+2. ALL mandatory keywords MUST stay (listed in each bullet) — this includes existing technology/skill names (e.g. "JavaScript", "D3.js"), not just newly-added ones. Never treat a must_keep keyword as removable padding/filler. If a must_keep term makes the limit hard to hit, cut other words instead.
 3. NEVER fabricate or omit numbers/metrics
 4. ALWAYS return trimmed text (never null, empty, or untrimmed)
 5. MAXIMIZE space: Aim for 90-100% of available chars, not 50%
@@ -235,9 +240,10 @@ REPHRASING CHECKLIST (when simple trim fails):
 □ Remove ALL adjectives: scalable, robust, modular, seamless, efficient, innovative, successful
 □ Shorten verbs: "built and deployed" → "deployed", "designed and implemented" → "designed"
 □ Use slash notation: "risk and yield" → "risk/yield", "testing and QA" → "testing/QA"
-□ Abbreviate: "per second" → "/sec", "requirements" → "req", "HTTP API" → "API"
+□ Abbreviate with STANDARD resume shorthand only: "per second" → "/sec", "HTTP API" → "API". Never invent informal truncations like "req"/"impl" — cut a different word instead.
 □ Merge concepts: "optimization for A, B, C balance" instead of "optimization system for allocation solving balance"
-□ Remove filler: "to", "through", "by", "for", "from" (if meaning survives)
+□ Remove filler words ("to", "by", "with") only when the sentence's meaning is fully unchanged. Do NOT drop a connector ("for", "through") if that would reorder which noun modifies which (e.g. "QA tool for fMRI datasets" ≠ "fMRI QA datasets") — that's a meaning change, not a trim.
+□ Never drop a must_keep item while doing any of the above — it is not filler, no matter how aggressive the rephrase gets.
 
 RETURN FORMAT (JSON only, no markdown):
 
@@ -267,9 +273,9 @@ DIAGNOSIS: Your trimmed text was too long. This means:
 
 LEVEL 1 - AGGRESSIVE TRIMMING (try this first):
 1. CUT ALL descriptive words (scalable, efficient, modular, seamless, innovative, robust, successful, effective, powerful)
-2. Remove ALL filler: "and", "to", "through", "by", "for", "from", "with" unless critical to meaning
+2. Remove filler words ("and", "to", "by", "with") only where meaning is fully unchanged — do NOT cut "for"/"through" if it would reorder which noun modifies which
 3. Use shortest verbs: "Deployed" not "Built and deployed", "Designed" not "Designed and implemented"
-4. Aggressive abbreviation: "per second" → "/sec", "requirements" → "req", "implementation" → "impl", "approximately" → "~"
+4. Aggressive abbreviation with STANDARD resume shorthand only: "per second" → "/sec", "approximately" → "~". Never invent informal truncations like "req"/"impl" — they read as sloppy, not concise.
 5. Combine words: "HTTP API" → "API", "software system" → "system", "data pipeline" → "pipeline"
 
 EXAMPLE: "Successfully architected and deployed a robust distributed system" → "Deployed distributed system"

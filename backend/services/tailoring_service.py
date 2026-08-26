@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from typing import Optional
 
 from backend.analysis.job_analyzer import JobAnalyzer
+from backend.analysis.skill_dedup import dedupe_skill_names, is_duplicate_skill
 from backend.models.job_description import JobAnalysis
 from backend.models.resume_content import ResumeContent, SectionType
 from backend.models.resume_ir import ResumeIR
@@ -33,10 +35,30 @@ from backend.models.tailoring import (
     TailoringResult,
 )
 from backend.services.resume_bank_service import generate_bank_from_ir
-from backend.tailoring.claim_validator import ClaimValidator
+from backend.tailoring.claim_validator import TECH_TERMS, ClaimValidator
 from backend.tailoring.tailoring_engine import TailoringEngine
 
 logger = logging.getLogger(__name__)
+
+
+def _tech_terms_present(text: str) -> list[str]:
+    """Find known technology/skill terms (from `claim_validator.TECH_TERMS`)
+    already present in `text`, returned with their original casing.
+
+    Used to protect pre-existing skill keywords (e.g. "JavaScript", "D3.js")
+    from being silently dropped during batch trimming. `target_keywords`
+    only tracks JD terms the main tailoring pass newly added to a bullet —
+    it says nothing about terms that were already there, so without this,
+    an "aggressive rephrasing" trim pass is free to treat them as ordinary
+    padding and cut them.
+    """
+    lowered = text.lower()
+    found = []
+    for term in TECH_TERMS:
+        match = re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", lowered)
+        if match:
+            found.append(text[match.start():match.end()])
+    return found
 
 
 class TailoringService:
@@ -124,9 +146,9 @@ class TailoringService:
                 )
 
                 for cat, skills in engine_result.skill_reorders.items():
-                    result.reordered_skills[cat] = skills
+                    result.reordered_skills[cat] = dedupe_skill_names(skills)
                 for cat, skills in engine_result.skill_additions.items():
-                    result.added_skills[cat] = skills
+                    result.added_skills[cat] = dedupe_skill_names(skills)
 
             # === STAGE 2B: Optimize Skills Section (separate pass) ===
             # Skills are metadata and should be optimized independently
@@ -142,10 +164,10 @@ class TailoringService:
                     # Merge skills optimizations into result
                     for cat, skills in skills_result.get("skill_reorders", {}).items():
                         if cat not in result.reordered_skills:
-                            result.reordered_skills[cat] = skills
+                            result.reordered_skills[cat] = dedupe_skill_names(skills)
                     for cat, skills in skills_result.get("skill_additions", {}).items():
                         if cat not in result.added_skills:
-                            result.added_skills[cat] = skills
+                            result.added_skills[cat] = dedupe_skill_names(skills)
                     # Note: skill_removals are tracked in the debug log for transparency
                     removals = skills_result.get("skill_removals", {})
                     if removals:
@@ -405,12 +427,21 @@ class TailoringService:
                     f"overflow: \"{overflow_text[:30]}\")"
                 )
 
+                # Protect both JD keywords the main pass added AND any
+                # pre-existing tech/skill terms already in the bullet text —
+                # otherwise the trim pass can drop things like "JavaScript"
+                # or "D3.js" as if they were ordinary padding.
+                must_keep = list(dict.fromkeys(
+                    list(change.target_keywords or [])
+                    + _tech_terms_present(change.tailored_text)
+                ))
+
                 batch_items.append({
                     "bullet_id": change.bullet_id,
                     "text": change.tailored_text,
                     "break_index": break_idx,
                     "max_chars": char_cap,
-                    "keywords": change.target_keywords or [],
+                    "keywords": must_keep,
                 })
 
             # Single LLM call for all overflowing bullets (with failure history on retry)
@@ -480,7 +511,19 @@ class TailoringService:
                     continue
 
                 trim_m = measurer.measure(trimmed)
-                if trim_m.fits_one_line:
+                batch_item = next(
+                    (b for b in batch_items if b["bullet_id"] == change.bullet_id),
+                    None,
+                )
+                # Fitting the line isn't enough — confirm the trim didn't drop
+                # a required keyword (JD term or pre-existing skill/tech term)
+                # while "aggressively rephrasing" to save space.
+                missing_keywords = [
+                    kw for kw in (batch_item["keywords"] if batch_item else [])
+                    if kw.lower() not in trimmed.lower()
+                ]
+
+                if trim_m.fits_one_line and not missing_keywords:
                     change.reason = (
                         (change.reason or "") + " (trimmed to fit)"
                     )
@@ -490,6 +533,27 @@ class TailoringService:
                         f"{trim_m.rendered_width_pt:.0f}pt "
                         f"(round {round_num + 1})"
                     )
+                elif trim_m.fits_one_line and missing_keywords:
+                    result.debug_log.append(
+                        f"TRIM DROPPED KEYWORDS {change.bullet_id}: "
+                        f"{missing_keywords} missing from \"{trimmed}\""
+                    )
+                    if is_final:
+                        result.debug_log.append(
+                            f"REVERTED {change.bullet_id}: "
+                            f"trim dropped required keywords"
+                        )
+                        change.tailored_text = change.original_text
+                        change.action = "keep"
+                        change.reason = "Rewrite too long, trim dropped required keywords"
+                    else:
+                        still_overflowing.append(change)
+                        failure_history[change.bullet_id] = {
+                            "previous_attempt": trimmed,
+                            "overflow_chars": 0,
+                            "prev_char_count": len(trimmed),
+                            "missing_keywords": missing_keywords,
+                        }
                 elif len(trimmed) >= len(original_text):
                     # Stuck — no progress
                     result.debug_log.append(
@@ -1138,32 +1202,37 @@ class TailoringService:
             elif section.type == SectionType.SKILLS:
                 for cat in section.skill_categories:
                     if cat.category in result.added_skills:
-                        existing = {s.lower() for s in cat.skills}
                         for new_skill in result.added_skills[cat.category]:
                             key = f"{cat.category}:{new_skill}"
                             accepted = result.additions_accepted.get(key, True)
-                            if accepted and new_skill.lower() not in existing:
+                            # Compare against unmarked text — variant-aware
+                            # (case, punctuation, and known pairs like
+                            # "HTML"/"HTML5" or "Git"/"GitHub"), re-checked
+                            # against skills added earlier in this same loop.
+                            plain_existing = [
+                                s.replace("[LLM]", "") for s in cat.skills
+                            ]
+                            if accepted and not is_duplicate_skill(new_skill, plain_existing):
                                 # === CHANGE: Mark LLM-added skills with internal marker ===
                                 # When skills fitting trims the row, it can see which skills
                                 # came from the LLM (JD-matched) vs original resume.
                                 # Trim the original skills first; protect the LLM additions.
                                 marked_skill = f"[LLM]{new_skill}"
                                 cat.skills.append(marked_skill)
-                                existing.add(new_skill.lower())
 
                     if cat.category in result.reordered_skills:
                         accepted = result.reorder_accepted.get(
                             cat.category, True,
                         )
                         if accepted:
-                            reordered = list(
-                                result.reordered_skills[cat.category]
+                            # The LLM's own reordered list can itself contain
+                            # duplicates/near-duplicates (e.g. "Python" twice,
+                            # or "Git" and "GitHub") — dedupe before trusting it.
+                            reordered = dedupe_skill_names(
+                                list(result.reordered_skills[cat.category])
                             )
-                            existing_reordered = {
-                                s.lower() for s in reordered
-                            }
                             for s in cat.skills:
-                                if s.lower() not in existing_reordered:
+                                if not is_duplicate_skill(s, reordered):
                                     reordered.append(s)
                             cat.skills = reordered
 

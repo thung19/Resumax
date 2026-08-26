@@ -37,6 +37,7 @@ from backend.models.job_description import (
     EligibilityGate,
 )
 from backend.prompts import JD_ANALYSIS_SYSTEM_V1, JD_ANALYSIS_USER_TEMPLATE
+from backend.analysis.skill_dedup import find_redundant_variants
 
 logger = logging.getLogger(__name__)
 
@@ -263,36 +264,20 @@ class JobAnalyzer:
         - "node.js" vs "nodejs" → keep "node.js" (canonical form)
         - "vue.js" vs "vue" → keep "vue.js" (more complete)
         - "next.js" vs "nextjs" → keep "next.js" (canonical form)
-        """
-        # Define variant relationships: (less_specific, more_specific)
-        variant_pairs = [
-            ("git", "github"),          # github is more specific
-            ("node", "node.js"),        # node.js is canonical
-            ("nodejs", "node.js"),      # node.js is canonical
-            ("vue", "vue.js"),          # vue.js is more complete
-            ("vuejs", "vue.js"),        # vue.js is canonical
-            ("next", "next.js"),        # next.js is canonical
-            ("nextjs", "next.js"),      # next.js is canonical
-            ("nest", "nest.js"),        # nest.js is canonical
-            ("nestjs", "nest.js"),      # nest.js is canonical
-            ("tailwind", "tailwindcss"),# tailwindcss is more complete
-            ("rest", "restful"),        # restful is more specific
-        ]
 
+        Shared with the resume-tailoring side (`skill_dedup.py`), which applies
+        the same variant table when merging LLM skill suggestions into a resume.
+        """
         for list_obj in [
             analysis.frameworks, analysis.tools, analysis.programming_languages,
             analysis.databases, analysis.infrastructure,
         ]:
-            existing_lower = {item.name.lower(): item for item in list_obj}
-
-            # For each variant pair, remove the less specific if more specific exists
-            for less_specific, more_specific in variant_pairs:
-                if more_specific.lower() in existing_lower and less_specific.lower() in existing_lower:
-                    # Remove the less specific variant
-                    list_obj[:] = [
-                        item for item in list_obj
-                        if item.name.lower() != less_specific.lower()
-                    ]
+            redundant = find_redundant_variants([item.name for item in list_obj])
+            if redundant:
+                list_obj[:] = [
+                    item for item in list_obj
+                    if item.name.lower() not in redundant
+                ]
 
     def _extract_responsibilities(self, text: str, analysis: JobAnalysis):
         lines = text.split("\n")

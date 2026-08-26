@@ -402,3 +402,37 @@ class TestEngineJsonParsing:
         assert len(parsed["bullet_changes"]) == 4
         for change in parsed["bullet_changes"]:
             assert change.action == "keep"
+
+
+class TestTechTermsPresent:
+    """`_tech_terms_present` protects pre-existing skill/tech words (not just
+    JD keywords the main pass newly added) from being silently dropped by
+    the batch-trim "aggressive rephrasing" pass.
+
+    Regression coverage for: "Enhanced a Vue and Vite JavaScript QA tool..."
+    getting trimmed down to "Enhanced Vue/Vite web application..." — losing
+    "JavaScript" entirely because it was never in `target_keywords`.
+    """
+
+    def test_finds_known_tech_terms_with_original_casing(self):
+        from backend.services.tailoring_service import _tech_terms_present
+
+        text = "Enhanced a Vue and Vite JavaScript QA tool improving D3.js visuals"
+        found = _tech_terms_present(text)
+        assert "JavaScript" in found
+        assert "Vue" in found
+        assert "D3.js" in found
+
+    def test_word_boundaries_avoid_false_positives(self):
+        from backend.services.tailoring_service import _tech_terms_present
+
+        # "r" and "go" are TECH_TERMS (R, Go the languages) but must not
+        # match inside unrelated words like "for" or "going".
+        text = "Translated researcher requirements for going forward"
+        found = _tech_terms_present(text)
+        assert found == []
+
+    def test_no_tech_terms_returns_empty(self):
+        from backend.services.tailoring_service import _tech_terms_present
+
+        assert _tech_terms_present("Led weekly standups with stakeholders") == []
