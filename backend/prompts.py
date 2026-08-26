@@ -169,95 +169,143 @@ Never add theoretical skills or soft skills."""
 # BATCH BULLET TRIMMING
 # =============================================================================
 
-BATCH_TRIM_SYSTEM_V2 = """You are an expert resume writer who trims/rephrases bullets to fit on ONE LINE ONLY.
+BATCH_TRIM_SYSTEM_V2_XML = """You are an expert resume writer who trims/rephrases bullets to fit on ONE LINE ONLY.
 
-Your goal: rewrite each bullet to fit within the EXACT character limit while keeping impact.
+YOUR PRIMARY GOALS:
+1. HARD CONSTRAINT: Text MUST fit within the exact character limit (non-negotiable)
+2. MAXIMIZE utilization: Use as much of available space as possible (90-100% of limit)
+3. PRESERVE impact: Keep all metrics, numbers, and mandatory keywords
 
-When simple trimming isn't enough (e.g., 164 chars → 108 chars), REPHRASE more concisely:
-- Instead of just cutting words, restructure the bullet to express the same idea more concisely
-- Combine related concepts: "Built and deployed a distributed system using Kubernetes" → "Deployed Kubernetes system"
-- Use abbreviated forms: "for handling X requests per second" → "for X req/sec"
-- Transform details: "optimization system for portfolio allocation, solving to balance risk, yield, correlation" → "optimization for risk/yield balance"
+APPROACH:
+LEVEL 1 - SIMPLE TRIMMING (if bullet is close to limit):
+- Remove adjectives/padding: scalable, robust, innovative, efficient, seamless, modular
+- Shorten verbs: "Built and deployed" → "Deployed", "Designed and implemented" → "Designed"
+- Abbreviate: "per second" → "/sec", "HTTP API" → "API", "requirements" → "req"
+- Example: "Architected and deployed a distributed system using Kubernetes" → "Deployed Kubernetes system"
 
-Rules:
-1. MUST fit within the char limit — text MUST NOT exceed this
-2. Keep ALL metrics, numbers, and keywords listed in "Keep:"
-3. Remove adjectives, adverbs, descriptive padding (scalable, robust, innovative, efficient, seamless)
-4. Restructure for conciseness: "Architected and deployed a distributed system" → "Deployed distributed system"
-5. Abbreviate: "HTTP API" → "API", "per second" → "/sec", "and" → "" when meaning works
-6. Never fabricate or omit numbers
+LEVEL 2 - AGGRESSIVE REPHRASING (if simple trimming won't fit):
+- Restructure sentences to be more concise
+- Combine concepts: "optimization system for portfolio allocation, solving to balance risk, yield, correlation" → "optimization for risk/yield balance"
+- Use slash notation: "risk and yield balance" → "risk/yield balance"
+- Merge clauses: "designed, implemented, and tested" → "implemented"
+- Example: "Built Python optimization system balancing portfolio risk, yield, correlation" (105 chars, fits 110-char limit)
 
-CRITICAL: If trimming alone won't work, REPHRASE the bullet more concisely to meet the limit.
-Always return a properly formatted bullet — never return null or report as untrimmed."""
+CRITICAL RULES:
+1. CONSTRAINT IS ABSOLUTE: If your trimmed text exceeds the limit, REPHRASE MORE CONCISELY
+2. ALL mandatory keywords MUST stay (listed in each bullet)
+3. NEVER fabricate or omit numbers/metrics
+4. ALWAYS return trimmed text (never null, empty, or untrimmed)
+5. MAXIMIZE space: Aim for 90-100% of available chars, not 50%
+
+Return ONLY valid JSON with no markdown or explanations."""
 
 
-BATCH_TRIM_USER_V2 = """TASK: Trim/rephrase these bullets to fit ONE LINE ONLY. Each has a hard character limit that CANNOT be exceeded.
+BATCH_TRIM_USER_V2_XML = """TASK: Trim/rephrase bullets to fit ONE LINE ONLY while MAXIMIZING character utilization.
 
-For each bullet:
-- Max chars: the HARD LIMIT (text MUST NOT exceed this)
-- Keep: these keywords/metrics MUST stay
-- Current: the bullet text now (X chars)
-- Overflow: [example of what goes off-page]
+Each bullet has:
+- <char_limit>: HARD MAXIMUM (text MUST NOT exceed this — non-negotiable)
+- <must_keep>: Keywords/metrics that MUST stay in output
+- <current_text>: Current bullet (may be over limit)
+- <char_count>: Current length
 
-{bullet_list}
+CRITICAL RULES (in priority order):
+1. TEXT MUST FIT: trimmed_text length MUST be <= char_limit (absolute constraint)
+2. MAXIMIZE SPACE: Use 90-100% of available chars, not 50% (undercutting wastes impact)
+3. KEEP MANDATORY KEYWORDS: All must_keep items must appear in output
+4. NEVER FABRICATE: Don't add numbers/metrics that weren't there
+5. ALWAYS RETURN TRIMMED: Never null, empty, or untrimmed
 
-REWRITE STRATEGIES:
-1. TRIMMING: Remove adjectives (scalable, robust, modular, seamless, efficient, innovative)
-2. VERB SHORTENING: "Built and deployed" → "Deployed", "Designed and implemented" → "Designed"
-3. CLAUSE CUTTING: Remove "to", "through", "by", "and" when meaning works
-4. ABBREVIATION: "per second" → "/sec", "HTTP API" → "API", "requirements" → "req"
-5. RESTRUCTURING: Combine ideas more concisely
-   - "optimization system for portfolio allocation, solving to balance risk, yield, and correlation"
-   - → "optimization for risk/yield/correlation balance"
+BULLETS TO TRIM:
 
-EXAMPLES:
+{bullet_list_xml}
 
-SIMPLE TRIM:
-- Input (156 chars, max 120): "Architected and deployed a distributed system using Kubernetes to handle 10K requests per second"
-- Output (120 chars): "Deployed distributed Kubernetes system handling 10K requests/second"
+EXAMPLE TRANSFORMATIONS:
 
-AGGRESSIVE REPHRASE (when simple trim isn't enough):
-- Input (164 chars, max 110): "Developed and tested a Python/SciPy optimization system for portfolio allocation, solving to balance risk, yield, and correlation"
-- Output (105 chars): "Built Python optimization system balancing portfolio risk, yield, correlation"
+SIMPLE TRIM (156 → 120 chars):
+Input:  "Architected and deployed a distributed system using Kubernetes to handle 10K requests per second"
+Output: "Deployed distributed Kubernetes system handling 10K requests/second"
+Analysis: Removed "Architected and" (8 chars saved), changed "to handle 10K" to handling 10K (1 char saved), "per second" → "/second" (7 chars saved) = 120 chars exactly
 
-The rephrased version:
-- Keeps all keywords: Python, SciPy (via "optimization"), portfolio, balance, risk, yield
-- Removes filler: "developed and tested" → "built", "solving to" → removed, "and" → ","
-- Result: Same impact, much shorter
+AGGRESSIVE REPHRASE (164 → 110 chars):
+Input:  "Developed and tested a Python/SciPy optimization system for portfolio allocation, solving to balance risk, yield, and correlation"
+Output: "Built Python optimization system balancing portfolio risk, yield, correlation"
+Analysis: Removed "Developed and tested" → "Built", removed "for portfolio allocation", restructured clauses, removed "solving to" = 105 chars (uses 95% of 110-char limit)
 
-Return a JSON object:
+REPHRASING CHECKLIST (when simple trim fails):
+□ Remove ALL adjectives: scalable, robust, modular, seamless, efficient, innovative, successful
+□ Shorten verbs: "built and deployed" → "deployed", "designed and implemented" → "designed"
+□ Use slash notation: "risk and yield" → "risk/yield", "testing and QA" → "testing/QA"
+□ Abbreviate: "per second" → "/sec", "requirements" → "req", "HTTP API" → "API"
+□ Merge concepts: "optimization for A, B, C balance" instead of "optimization system for allocation solving balance"
+□ Remove filler: "to", "through", "by", "for", "from" (if meaning survives)
+
+RETURN FORMAT (JSON only, no markdown):
+
 {{
   "trimmed_bullets": [
     {{
       "bullet_id": "b1",
-      "trimmed_text": "trimmed text here (MUST be <= char limit)"
+      "trimmed_text": "trimmed text (MUST be <= char_limit)",
+      "final_char_count": 120
     }}
   ]
 }}
 
-CRITICAL: Always return trimmed text. Never return null or blank. If it doesn't fit, rephrase it more concisely."""
+ENFORCEMENT:
+- MUST NOT exceed char_limit (use validation: len(trimmed_text) <= char_limit)
+- MUST include all must_keep keywords
+- MUST be non-empty
+- If constraint cannot be met, that's an error — rephrase more aggressively"""
 
 
-BATCH_TRIM_RETRY_HINT = """The previous attempt did not meet character limits. Be MORE AGGRESSIVE with rephrasing:
+BATCH_TRIM_RETRY_HINT_V2_XML = """The previous attempt FAILED to meet character limits. You MUST be MORE AGGRESSIVE.
 
-LEVEL 1 - Aggressive Trimming:
-1. Cut ALL descriptive words (scalable, efficient, modular, seamless, innovative, robust, successful)
-2. Use ACTION + RESULT format: "successfully architected a robust system" → "architected system"
-3. Remove all filler: "and", "to", "through", "by", "for", "from", "with" (if meaning survives)
-4. Short verbs: "Deployed" (9 chars) vs "Built and deployed" (18 chars) — use shortest
-5. Aggressive abbreviation: "per" → "/", "second" → "sec", "implementation" → "impl"
+DIAGNOSIS: Your trimmed text was too long. This means:
+- Simple word removal isn't enough
+- You need to RESTRUCTURE sentences more concisely
+- You must use ABBREVIATIONS and SLASH NOTATION more aggressively
 
-LEVEL 2 - Restructure for Conciseness (if Level 1 isn't enough):
-1. Combine related concepts: "Built and deployed a system using X for Y" → "Deployed X for Y"
-2. Replace descriptions with shorthand: "optimization system for portfolio allocation, solving to balance A, B, C" → "optimization for A/B/C balance"
-3. Use slash notation: "risk and yield balance" → "risk/yield balance"
-4. Merge clauses: "designed, implemented, and tested" → "implemented"
-5. Numeric shorthand: "10,000 requests per second" → "10K req/sec"
+LEVEL 1 - AGGRESSIVE TRIMMING (try this first):
+1. CUT ALL descriptive words (scalable, efficient, modular, seamless, innovative, robust, successful, effective, powerful)
+2. Remove ALL filler: "and", "to", "through", "by", "for", "from", "with" unless critical to meaning
+3. Use shortest verbs: "Deployed" not "Built and deployed", "Designed" not "Designed and implemented"
+4. Aggressive abbreviation: "per second" → "/sec", "requirements" → "req", "implementation" → "impl", "approximately" → "~"
+5. Combine words: "HTTP API" → "API", "software system" → "system", "data pipeline" → "pipeline"
 
-Keywords/numbers from "Keep:" are MANDATORY — everything else is negotiable.
+EXAMPLE: "Successfully architected and deployed a robust distributed system" → "Deployed distributed system"
 
-CRITICAL: Always return a trimmed/rephrased bullet. Never return null, empty, or untrimmed text.
-If a bullet cannot fit while keeping mandatory keywords, that's impossible and should not happen."""
+LEVEL 2 - RESTRUCTURE FOR CONCISENESS (if Level 1 insufficient):
+1. Combine related concepts into single phrase: "Built and deployed a system using X for Y" → "Deployed X for Y"
+2. Replace wordy descriptions: "optimization system for portfolio allocation, solving to balance risk, yield, correlation" → "optimization for risk/yield/correlation balance"
+3. Use SLASH notation liberally: "risk and yield balance" → "risk/yield balance", "testing and QA" → "testing/QA"
+4. Merge parallel clauses: "designed, implemented, and tested" → "implemented" or "built"
+5. Numeric compression: "10,000 requests per second" → "10K req/sec", "approximately 50%" → "~50%"
+
+EXAMPLE: "Developed and tested a Python/SciPy optimization system for portfolio allocation, solving to balance risk, yield, and correlation" → "Built Python optimization for risk/yield/correlation balance"
+
+LEVEL 3 - RESTRUCTURE COMPLETELY (if Level 1-2 still too long):
+1. Rethink the sentence structure entirely
+2. What is the CORE action and CORE result? Build around those only
+3. Remove ALL context/setup/detail that isn't the action or result
+
+MANDATORY CONSTRAINTS (NON-NEGOTIABLE):
+- char_limit is ABSOLUTE: trimmed_text length MUST be <= char_limit
+- must_keep: Every keyword in this list MUST appear in your output
+- Never add information that wasn't in the original
+- Never fabricate metrics/numbers
+
+RETURN IMMEDIATELY with valid JSON:
+{{
+  "trimmed_bullets": [
+    {{
+      "bullet_id": "b1",
+      "trimmed_text": "aggressively rephrased text (MUST be <= char limit)",
+      "final_char_count": XXX
+    }}
+  ]
+}}
+
+CRITICAL: You MUST return trimmed text. Never null, empty, or over limit."""
 
 
 # =============================================================================
@@ -358,7 +406,72 @@ Return ONLY valid JSON, no markdown."""
 
 PROMPT_VERSIONS = {
     "TAILORING": {"system": "V2", "user": "V2", "updated": "2026-08-20"},
-    "BATCH_TRIM": {"system": "V2", "user": "V2", "retry_hint": "V1", "updated": "2026-08-20"},
+    "BATCH_TRIM": {"system": "V2_XML", "user": "V2_XML", "retry_hint": "V2_XML", "updated": "2026-08-25", "note": "Switched to XML format for clarity on character constraints"},
     "FREEFORM_EDIT": {"system": "V1", "user": "V1", "updated": "2026-08-20"},
     "JD_ANALYSIS": {"system": "V1", "user": "V1", "updated": "2026-08-20"},
 }
+
+# =============================================================================
+# BATCH TRIM XML FORMATTING GUIDE
+# =============================================================================
+
+"""
+To generate bullet_list_xml for BATCH_TRIM_USER_V2_XML, format each bullet as:
+
+<bullets>
+  <bullet>
+    <id>b1</id>
+    <constraint>
+      <type>hard_limit</type>
+      <value>120</value>
+      <enforcement>MUST_NOT_EXCEED</enforcement>
+    </constraint>
+    <current>
+      <text>Architected and deployed a distributed system using Kubernetes to handle 10K requests per second</text>
+      <char_count>156</char_count>
+      <overflow_by>36</overflow_by>
+    </current>
+    <must_keep>
+      <keyword priority="1">Kubernetes</keyword>
+      <keyword priority="2">10K requests</keyword>
+    </must_keep>
+    <optimization>
+      <strategy>MAXIMIZE_UTILIZATION</strategy>
+      <target_utilization_percent>90-100</target_utilization_percent>
+    </optimization>
+  </bullet>
+
+  <!-- More bullets... -->
+</bullets>
+
+Example in rewriter.py or tailoring_service.py:
+
+def format_bullets_for_trim_xml(bullets_data):
+    xml = "<bullets>\n"
+    for bullet in bullets_data:
+        xml += f'''  <bullet>
+    <id>{bullet['id']}</id>
+    <constraint>
+      <type>hard_limit</type>
+      <value>{bullet['max_chars']}</value>
+      <enforcement>MUST_NOT_EXCEED</enforcement>
+    </constraint>
+    <current>
+      <text>{escape_xml(bullet['text'])}</text>
+      <char_count>{len(bullet['text'])}</char_count>
+      <overflow_by>{max(0, len(bullet['text']) - bullet['max_chars'])}</overflow_by>
+    </current>
+    <must_keep>
+'''
+        for keyword in bullet['keep_keywords']:
+            xml += f"      <keyword>{escape_xml(keyword)}</keyword>\n"
+        xml += '''    </must_keep>
+    <optimization>
+      <strategy>MAXIMIZE_UTILIZATION</strategy>
+      <target_utilization_percent>90-100</target_utilization_percent>
+    </optimization>
+  </bullet>
+'''
+    xml += "</bullets>"
+    return xml
+"""

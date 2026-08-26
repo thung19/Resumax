@@ -27,9 +27,9 @@ from backend.prompts import (
     TAILORING_USER_V3,
     TAILORING_SKILLS_SYSTEM_V1,
     TAILORING_SKILLS_USER_V1,
-    BATCH_TRIM_SYSTEM_V2,
-    BATCH_TRIM_USER_V2,
-    BATCH_TRIM_RETRY_HINT,
+    BATCH_TRIM_SYSTEM_V2_XML,
+    BATCH_TRIM_USER_V2_XML,
+    BATCH_TRIM_RETRY_HINT_V2_XML,
     FREEFORM_EDIT_SYSTEM_V1,
     FREEFORM_EDIT_USER_TEMPLATE,
 )
@@ -366,55 +366,55 @@ class TailoringEngine:
         except ImportError:
             return {b["bullet_id"]: None for b in bullets}
 
-        # Build per-bullet entries with failure history if available
-        entries: list[str] = []
+        # Build XML-formatted bullet entries with failure history if available
+        def escape_xml(s: str) -> str:
+            """Escape XML special characters."""
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+
+        xml_entries: list[str] = []
         for b in bullets:
-            fits = b["text"][:b["break_index"]]
-            overflows = b["text"][b["break_index"]:]
             chars_over = len(b["text"]) - b["max_chars"]
-            kw_text = ", ".join(b["keywords"]) if b["keywords"] else "the key terms"
 
-            entry = (
-                f"[{b['bullet_id']}] (max {b['max_chars']} chars, "
-                f"currently {len(b['text'])}, cut at least {chars_over})\n"
-                f"  Keep: {kw_text}\n"
-                f"  {fits}|{overflows}"
-            )
+            xml = f'  <bullet>\n    <id>{b["bullet_id"]}</id>\n'
+            xml += f'    <constraint>\n      <type>hard_limit</type>\n      <value>{b["max_chars"]}</value>\n      <enforcement>MUST_NOT_EXCEED</enforcement>\n    </constraint>\n'
+            xml += f'    <current>\n      <text>{escape_xml(b["text"])}</text>\n      <char_count>{len(b["text"])}</char_count>\n      <overflow_by>{max(0, chars_over)}</overflow_by>\n    </current>\n'
+            xml += '    <must_keep>\n'
+            for kw in (b["keywords"] if b["keywords"] else []):
+                xml += f'      <keyword>{escape_xml(kw)}</keyword>\n'
+            xml += '    </must_keep>\n'
+            xml += '    <optimization>\n      <strategy>MAXIMIZE_UTILIZATION</strategy>\n      <target_utilization_percent>90-100</target_utilization_percent>\n    </optimization>\n'
 
-            # If this bullet failed before, show the previous attempt and how much it overflowed
+            # If this bullet failed before, add failure context
             if failure_history and b["bullet_id"] in failure_history:
                 history = failure_history[b["bullet_id"]]
                 prev_text = history.get("previous_attempt", "")
                 overflow = history.get("overflow_chars", 0)
                 if prev_text and overflow > 0:
-                    entry += (
-                        f"\n  ❌ Previous attempt ({len(prev_text)} chars): "
-                        f"\"{prev_text}\" (STILL {overflow} chars over)\n"
-                        f"     Try removing more adjectives or less important words"
-                    )
+                    xml += f'    <failure_context>\n      <previous_attempt>{escape_xml(prev_text)}</previous_attempt>\n      <still_over_by>{overflow}</still_over_by>\n      <guidance>Try removing more adjectives or restructure more aggressively</guidance>\n    </failure_context>\n'
 
-            entries.append(entry)
+            xml += '  </bullet>\n'
+            xml_entries.append(xml)
 
-        bullet_list = "\n\n".join(entries)
+        bullet_list_xml = "<bullets>\n" + "".join(xml_entries) + "</bullets>"
 
         # Build retry hint with specific failure context
         retry_hint = ""
         if is_retry:
-            retry_hint = f"\n\n{BATCH_TRIM_RETRY_HINT}"
+            retry_hint = f"\n\n{BATCH_TRIM_RETRY_HINT_V2_XML}"
             if failure_history:
                 retry_hint += (
-                    "\n\nThese bullets FAILED in the previous round and are STILL TOO LONG. "
-                    "Show exactly what you're cutting and why."
+                    "\n\n⚠️ CRITICAL: These bullets FAILED in the previous round. "
+                    "They are STILL TOO LONG. You MUST be more aggressive with restructuring."
                 )
 
-        user_msg = BATCH_TRIM_USER_V2.format(bullet_list=bullet_list) + retry_hint
+        user_msg = BATCH_TRIM_USER_V2_XML.format(bullet_list_xml=bullet_list_xml) + retry_hint
 
         try:
             client = anthropic.Anthropic(api_key=api_key)
             response = client.messages.create(
                 model=self._model,
                 max_tokens=2048,
-                system=BATCH_TRIM_SYSTEM_V2,
+                system=BATCH_TRIM_SYSTEM_V2_XML,
                 messages=[{"role": "user", "content": user_msg}],
             )
             response_text = None
