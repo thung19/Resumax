@@ -52,6 +52,7 @@ _SERIF = {"garamond", "georgia", "times", "times new roman", "palatino", "cambri
 _SANS = {"arial", "helvetica", "calibri", "verdana", "tahoma", "segoe ui"}
 
 _registered_fonts: set[str] = set()
+_warned_missing_fonts: set[str] = set()
 
 
 def find_font_file(family: str) -> Optional[str]:
@@ -113,7 +114,26 @@ def register_and_resolve(family: str, bold: bool = False, italic: bool = False) 
         except Exception as e:
             logger.warning(f"Failed to register font '{family}': {e}")
 
-    return builtin_fallback(fl, bold, italic)
+    # find_font_file() returned nothing (no exception, just not found) —
+    # this used to fall through to builtin_fallback with zero logging.
+    # Calibri/Cambria/Aptos have been Word's default body/heading fonts
+    # for roughly two decades and aren't installed on most non-Windows
+    # servers, so this is expected to trigger for a large share of real
+    # uploaded resumes, silently substituting Helvetica/Times metrics
+    # for whatever font the document actually specifies with no record
+    # anywhere that it happened — makes a bad width measurement much
+    # harder to debug later. Logged once per family, not on every call,
+    # since this can be checked many times per resume.
+    fallback = builtin_fallback(fl, bold, italic)
+    if fl not in _warned_missing_fonts:
+        _warned_missing_fonts.add(fl)
+        logger.warning(
+            f"Font '{family}' not found on this system (bundled or "
+            f"installed) — falling back to builtin '{fallback}' metrics, "
+            f"which may not match the real font's character widths."
+        )
+
+    return fallback
 
 
 def builtin_fallback(family_lower: str, bold: bool, italic: bool) -> str:

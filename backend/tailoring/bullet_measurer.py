@@ -166,12 +166,33 @@ class BulletMeasurer:
             self._max_original_chars = max_chars
 
         if max_width > 0 and bullet_count >= 3:
-            logger.info(
-                f"Calibrated line width: {max_width:.1f}pt "
-                f"(from {bullet_count} bullets, "
-                f"geometric: {self._geometric_width_pt:.1f}pt)"
-            )
-            return max_width
+            # Clamp to the physical page width: the invariant this method
+            # relies on ("every bullet in the uploaded resume fits on one
+            # line") isn't actually verified anywhere — if the source
+            # document's widest bullet was already borderline/overflowing
+            # (common with copy-pasted resumes or a measurement font
+            # that renders wider than the true original font), the
+            # "calibrated safe width" balloons past what physically fits
+            # on the page. Every downstream width budget (safe_width_pt,
+            # max_chars_for_line, batch-trim char caps) inherits that
+            # inflation, so a bullet judged "fits one line" can still
+            # visibly wrap to a second line in the rendered PDF.
+            calibrated = min(max_width, self._geometric_width_pt)
+            if calibrated < max_width:
+                logger.warning(
+                    f"Calibrated line width {max_width:.1f}pt exceeds the "
+                    f"physical page width {self._geometric_width_pt:.1f}pt "
+                    f"(from {bullet_count} bullets) — clamping. The source "
+                    f"resume's widest original bullet may already overflow "
+                    f"its line."
+                )
+            else:
+                logger.info(
+                    f"Calibrated line width: {calibrated:.1f}pt "
+                    f"(from {bullet_count} bullets, "
+                    f"geometric: {self._geometric_width_pt:.1f}pt)"
+                )
+            return calibrated
 
         return self._geometric_width_pt
 

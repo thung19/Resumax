@@ -150,7 +150,16 @@ class PageFitter:
         # Step 5: Reduce font size (last resort)
         current_font = self._get_bullet_font_size()
         while current_font > self._min_font:
-            current_font -= 0.5
+            # max(..., self._min_font): the loop guard checks
+            # current_font BEFORE this decrement, so when the starting
+            # size isn't an exact 0.5pt increment above the floor (e.g.
+            # 10.3pt — a plausible size for a resume with a custom/odd
+            # point size), the last iteration could apply a value below
+            # the documented minimum-readable floor with no check
+            # (confirmed: a 10.3pt start bottomed out at 8.3pt against
+            # an 8.5pt floor). Clamping here means every applied size is
+            # guaranteed >= the floor, not just the loop's exit check.
+            current_font = max(current_font - 0.5, self._min_font)
             self._set_all_body_font_size(current_font)
             self._report.font_adjusted = True
             self._report.actions_taken.append(f"Reduced body font to {current_font}pt")
