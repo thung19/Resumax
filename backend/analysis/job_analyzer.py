@@ -396,13 +396,29 @@ class JobAnalyzer:
 
         for line in lines:
             lower = line.strip().lower()
-            if any(kw in lower for kw in ["required", "must have", "qualificat", "minimum", "what you'll need"]):
+            # "requirement"/"requirements" separately from "required" —
+            # "required" isn't actually a substring of "requirements"
+            # (require-MENTS vs require-D), so a JD section literally
+            # titled "Requirements:" (an extremely common header) never
+            # triggered this at all before.
+            if any(kw in lower for kw in ["required", "requirement", "must have", "qualificat", "minimum", "what you'll need"]):
                 in_required = True
                 in_preferred = False
+                # The trigger phrase and the actual requirement often
+                # share one line ("Must have Kubernetes experience and
+                # strong Python skills...") — extract from this line
+                # too, not just the ones after it, or an inline
+                # requirement is silently never classified as required
+                # at all (it just falls through with baseline
+                # importance, as if never mentioned as required).
+                for kw in self._extract_keywords_from_text(line):
+                    required_keywords.add(kw.lower())
                 continue
             if any(kw in lower for kw in ["preferred", "nice to have", "bonus", "plus", "desired"]):
                 in_required = False
                 in_preferred = True
+                for kw in self._extract_keywords_from_text(line):
+                    preferred_keywords.add(kw.lower())
                 continue
             if any(kw in lower for kw in ["responsibilit", "about us", "benefits", "compensation"]):
                 in_required = False

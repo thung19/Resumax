@@ -152,12 +152,20 @@ def _text_contains_keyword_direct(text_lower: str, keyword: str) -> bool:
     Used for bullet scoring — no IMPLIES inflation.
     """
     for alias in _expand_aliases(keyword):
-        if len(alias) <= 2:
-            if re.search(rf"\b{re.escape(alias)}\b", text_lower):
-                return True
-        else:
-            if alias in text_lower:
-                return True
+        # Boundary-checked regardless of alias length. This used to only
+        # apply to aliases of length <=2, falling back to a raw substring
+        # check ("alias in text_lower") for everything longer — but a
+        # plain substring check has no length floor at all: "api" (3
+        # chars) matched inside "rapid", "java" matched inside
+        # "javascript", "aws" matched inside "draws". Confirmed at the
+        # real coverage-percentage level: a resume that never mentions
+        # APIs could show 100% coverage of a required "API" skill purely
+        # from the word "rapid". (?<!\w)/(?!\w) rather than \b, matching
+        # the fix already applied to claim_validator.py's tech-term
+        # check, since \b can't match a term ending in punctuation (e.g.
+        # "c++", "c#") against surrounding whitespace.
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", text_lower):
+            return True
     return False
 
 

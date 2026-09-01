@@ -112,6 +112,10 @@ def _tech_terms_present(text: str) -> list[str]:
     return found
 
 
+# Synthetic bullet_id for the Skills-section pseudo-snapshot built by
+# _build_bullet_snapshots — see its docstring for why this exists.
+_SKILLS_SNAPSHOT_ID = "__skills_section__"
+
 # Same-length-ish, past-tense synonyms for common resume action verbs,
 # shortest-first so a swap is more likely to still fit the line-width
 # budget after batch trimming has already run. Used by
@@ -446,7 +450,7 @@ class TailoringService:
         # IMPORTANT: This must be AFTER safety net and trimming so snapshots
         # reflect the FINAL state of each bullet (after any reverts)
         try:
-            self._build_bullet_snapshots(result, jd)
+            self._build_bullet_snapshots(result, jd, content=ir.content)
             result.debug_log.append(
                 f"Bullet snapshots built: {len(result.bullet_snapshots)} snapshots "
                 f"for fast accept/reject recalculation"
@@ -1110,7 +1114,80 @@ class TailoringService:
     # Build bullet snapshots
     # ------------------------------------------------------------------
 
-    def _build_bullet_snapshots(self, result: TailoringResult, jd: JobAnalysis):
+    @staticmethod
+    def _snapshot_for_text(bullet_id: str, text_lower: str, jd: JobAnalysis):
+        """Build one BulletSnapshot's matches against `text_lower` (already
+        _normalize()-d). Factored out of _build_bullet_snapshots so the
+        same matching logic can run against a real bullet's text or
+        against a synthetic "text" built from the Skills section.
+        """
+        from backend.models.tailoring import BulletSnapshot
+        from backend.tailoring.matcher import (
+            _text_contains_keyword_direct,
+            match_jd_requirement,
+            match_deliverable,
+        )
+
+        snapshot = BulletSnapshot(bullet_id=bullet_id)
+
+        # OLD APPROACH (kept for backward compatibility):
+        # Match required skills (DIRECT only — no IMPLIES)
+        for skill in jd.required_skills:
+            if _text_contains_keyword_direct(text_lower, skill.name):
+                snapshot.matched_required_skills.append(skill.name)
+
+        # Match technical keywords (non-required, DIRECT only — no IMPLIES)
+        for skill in jd.all_skills_flat():
+            if skill not in jd.required_skills:
+                if _text_contains_keyword_direct(text_lower, skill.name):
+                    snapshot.matched_technical_keywords.append(skill.name)
+
+        # Match responsibilities (DIRECT keyword matching only)
+        for resp in jd.responsibilities:
+            matched = any(
+                _text_contains_keyword_direct(text_lower, kw)
+                for kw in resp.keywords
+            ) or any(
+                _text_contains_keyword_direct(text_lower, word)
+                for word in resp.text.split() if len(word) > 4
+            )
+            if matched:
+                snapshot.matched_responsibilities.append(resp.text[:100])
+
+        # NEW APPROACH (Phase 4):
+        # Also check categorized requirements for richer matching
+        # This enables tracking of both explicit and inferred matches
+        if jd.technical_requirements:
+            for req in jd.technical_requirements:
+                match = match_jd_requirement(text_lower, req)
+                if match.ats_found or match.human_understandable:
+                    # Track that this requirement is satisfied
+                    if req not in snapshot.matched_required_skills:
+                        if req.requirement_level == "required":
+                            snapshot.matched_required_skills.append(req.keyword_phrase)
+                        else:
+                            snapshot.matched_technical_keywords.append(req.keyword_phrase)
+                    # ALSO track in new field for cleaner metrics
+                    if req.keyword_phrase not in snapshot.matched_technical_requirements:
+                        snapshot.matched_technical_requirements.append(req.keyword_phrase)
+
+        if jd.deliverables:
+            for deliverable in jd.deliverables:
+                match = match_deliverable(text_lower, deliverable)
+                if match.ats_found:
+                    snapshot.matched_responsibilities.append(deliverable.phrase)
+                    # ALSO track in new field for cleaner metrics
+                    if deliverable.phrase not in snapshot.matched_deliverables:
+                        snapshot.matched_deliverables.append(deliverable.phrase)
+
+        return snapshot
+
+    def _build_bullet_snapshots(
+        self,
+        result: TailoringResult,
+        jd: JobAnalysis,
+        content: Optional[ResumeContent] = None,
+    ):
         """Build snapshots from FINAL bullet state (after all reverting).
 
         IMPORTANT: This is called LAST, after safety net and trimming,
@@ -1123,14 +1200,18 @@ class TailoringService:
         inflated coverage percentages. Only explicit keywords count.
 
         Phase 4: Now also uses categorized requirements for more sophisticated matching.
+
+        `content`: when provided, also builds one synthetic snapshot
+        (bullet_id=_SKILLS_SNAPSHOT_ID) from the resume's Skills section
+        text. Without this, a JD skill listed ONLY in the Skills section
+        (never repeated in a bullet — an extremely common resume
+        pattern) was reported "missing" from the headline coverage %
+        and detail breakdown, even though a separate keyword list built
+        elsewhere (main.py's _recalculate_coverage) DID scan the Skills
+        section and could show the same skill as "matched" — the two
+        could directly contradict each other in the UI.
         """
-        from backend.models.tailoring import BulletSnapshot
-        from backend.tailoring.matcher import (
-            _text_contains_keyword_direct,
-            _normalize,
-            match_jd_requirement,
-            match_deliverable,
-        )
+        from backend.tailoring.matcher import _normalize
 
         result.bullet_snapshots = []  # Clear any previous snapshots
 
@@ -1144,59 +1225,22 @@ class TailoringService:
             final_text = change.tailored_text if change.action == "rewrite" else change.original_text
             text_lower = _normalize(final_text)
 
-            snapshot = BulletSnapshot(bullet_id=change.bullet_id)
+            result.bullet_snapshots.append(
+                self._snapshot_for_text(change.bullet_id, text_lower, jd)
+            )
 
-            # OLD APPROACH (kept for backward compatibility):
-            # Match required skills (DIRECT only — no IMPLIES)
-            for skill in jd.required_skills:
-                if _text_contains_keyword_direct(text_lower, skill.name):
-                    snapshot.matched_required_skills.append(skill.name)
-
-            # Match technical keywords (non-required, DIRECT only — no IMPLIES)
-            for skill in jd.all_skills_flat():
-                if skill not in jd.required_skills:
-                    if _text_contains_keyword_direct(text_lower, skill.name):
-                        snapshot.matched_technical_keywords.append(skill.name)
-
-            # Match responsibilities (DIRECT keyword matching only)
-            for resp in jd.responsibilities:
-                matched = any(
-                    _text_contains_keyword_direct(text_lower, kw)
-                    for kw in resp.keywords
-                ) or any(
-                    _text_contains_keyword_direct(text_lower, word)
-                    for word in resp.text.split() if len(word) > 4
+        if content is not None:
+            skills_text_parts = []
+            for section in content.sections:
+                if section.type != SectionType.SKILLS:
+                    continue
+                for cat in section.skill_categories:
+                    skills_text_parts.append(f"{cat.category}: {', '.join(cat.skills)}")
+            if skills_text_parts:
+                skills_text_lower = _normalize(" ".join(skills_text_parts))
+                result.bullet_snapshots.append(
+                    self._snapshot_for_text(_SKILLS_SNAPSHOT_ID, skills_text_lower, jd)
                 )
-                if matched:
-                    snapshot.matched_responsibilities.append(resp.text[:100])
-
-            # NEW APPROACH (Phase 4):
-            # Also check categorized requirements for richer matching
-            # This enables tracking of both explicit and inferred matches
-            if jd.technical_requirements:
-                for req in jd.technical_requirements:
-                    match = match_jd_requirement(text_lower, req)
-                    if match.ats_found or match.human_understandable:
-                        # Track that this requirement is satisfied
-                        if req not in snapshot.matched_required_skills:
-                            if req.requirement_level == "required":
-                                snapshot.matched_required_skills.append(req.keyword_phrase)
-                            else:
-                                snapshot.matched_technical_keywords.append(req.keyword_phrase)
-                        # ALSO track in new field for cleaner metrics
-                        if req.keyword_phrase not in snapshot.matched_technical_requirements:
-                            snapshot.matched_technical_requirements.append(req.keyword_phrase)
-
-            if jd.deliverables:
-                for deliverable in jd.deliverables:
-                    match = match_deliverable(text_lower, deliverable)
-                    if match.ats_found:
-                        snapshot.matched_responsibilities.append(deliverable.phrase)
-                        # ALSO track in new field for cleaner metrics
-                        if deliverable.phrase not in snapshot.matched_deliverables:
-                            snapshot.matched_deliverables.append(deliverable.phrase)
-
-            result.bullet_snapshots.append(snapshot)
 
     # ------------------------------------------------------------------
     # Calculate coverage from snapshots (single source of truth)
@@ -1220,6 +1264,14 @@ class TailoringService:
 
         # Build snapshot lookup
         snapshots_by_id = {s.bullet_id: s for s in result.bullet_snapshots}
+
+        # The Skills-section pseudo-snapshot (see _build_bullet_snapshots)
+        # isn't tied to any BulletChange, so it's never picked up by the
+        # loop above — include it explicitly whenever it exists, so a
+        # skill listed only in the Skills section counts toward coverage
+        # the same way a skill mentioned in a bullet does.
+        if _SKILLS_SNAPSHOT_ID in snapshots_by_id:
+            included_bullet_ids.add(_SKILLS_SNAPSHOT_ID)
 
         # === COVERAGE METRICS (top percentages) ===
         required = jd.required_skills
@@ -1258,7 +1310,14 @@ class TailoringService:
             for resp in responsibilities:
                 for bid in included_bullet_ids:
                     snapshot = snapshots_by_id.get(bid)
-                    if snapshot and any(r in snapshot.matched_responsibilities for r in resp.text[:100].split()):
+                    # Membership check against the full stored snippet —
+                    # not "does any single WORD of resp.text equal a full
+                    # multi-word snippet string", which is essentially
+                    # never true and made this metric report ~0% coverage
+                    # regardless of how well-matched the resume actually
+                    # was (snapshot.matched_responsibilities stores full
+                    # resp.text[:100] snippets, see _build_bullet_snapshots).
+                    if snapshot and resp.text[:100] in snapshot.matched_responsibilities:
                         matched_importance += resp.importance
                         break
             total_importance = sum(r.importance for r in responsibilities)
@@ -1333,7 +1392,7 @@ class TailoringService:
             found = False
             for bid in included_bullet_ids:
                 snapshot = snapshots_by_id.get(bid)
-                if snapshot and any(r in snapshot.matched_responsibilities for r in resp.text[:100].split()):
+                if snapshot and resp.text[:100] in snapshot.matched_responsibilities:
                     found = True
                     break
             if found:
@@ -1877,6 +1936,7 @@ class TailoringService:
         result: TailoringResult,
         edited_bullets: dict[str, str],  # bullet_id -> new_text
         jd: JobAnalysis,
+        content: Optional[ResumeContent] = None,
     ) -> TailoringResult:
         """Save user-edited bullet text and recalculate coverage metrics.
 
@@ -1887,6 +1947,10 @@ class TailoringService:
             result: Current TailoringResult with user's edits
             edited_bullets: {bullet_id: new_text} for bullets that were edited
             jd: Job description (for recalculating coverage)
+            content: current resume content, so coverage also accounts for
+                the Skills section (see _build_bullet_snapshots) — optional
+                for backward compatibility, but coverage undercounts
+                Skills-section-only matches without it.
 
         Returns:
             Updated TailoringResult with new text and recalculated metrics
@@ -1901,7 +1965,7 @@ class TailoringService:
                 change.accepted = True  # User explicitly edited it
 
         # Rebuild snapshots with edited text
-        self._build_bullet_snapshots(result, jd)
+        self._build_bullet_snapshots(result, jd, content=content)
 
         # Recalculate coverage from updated snapshots
         self._calculate_coverage_from_snapshots(result, jd)

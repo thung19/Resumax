@@ -687,7 +687,7 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         # The IR has been updated by apply_tailoring(), so we need fresh snapshots
         from backend.services.tailoring_service import TailoringService
         service = TailoringService()
-        service._build_bullet_snapshots(result, jd)
+        service._build_bullet_snapshots(result, jd, content=ir.content)
 
         # NOW recalculate coverage from the rebuilt snapshots
         service._calculate_coverage_from_snapshots(result, jd)
@@ -927,15 +927,19 @@ async def save_edited_bullets(resume_id: str, req: SaveEditedBulletsRequest):
     if jd is None:
         raise HTTPException(404, "No JD found for this resume")
 
-    # Use service to save edits and recalculate
+    # Use service to save edits and recalculate. content= lets coverage
+    # also account for skills listed only in the Skills section, not
+    # just bullet text (see TailoringService._build_bullet_snapshots).
+    ir = _load_ir(resume_id)
     service = TailoringService(use_llm=False)
-    updated_result = service.save_edited_bullets(result, req.edited_bullets, jd)
+    updated_result = service.save_edited_bullets(
+        result, req.edited_bullets, jd, content=ir.content,
+    )
 
     # Update stored result
     _tailoring_store[resume_id] = updated_result
 
     # Re-apply tailoring to get updated IR
-    ir = _load_ir(resume_id)
     tailored_ir = service.apply_tailoring(ir, updated_result)
     _tailored_ir_store[resume_id] = tailored_ir
 
