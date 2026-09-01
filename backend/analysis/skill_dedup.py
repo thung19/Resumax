@@ -20,8 +20,17 @@ import re
 # Known variant relationships: (less_specific, more_specific).
 # When both forms are present in the same list, the less specific one is
 # dropped and the more specific/canonical one is kept.
+#
+# Unlike every other pair here (a genuine same-technology spelling/version
+# variant — "Node.js" vs "nodejs" is the same runtime, "html" vs "html5"
+# the same markup language at different specificity), Git and GitHub are
+# two different, if related, things: a CLI version-control tool vs. a
+# hosting platform built by a different company. A resume — or a JD —
+# listing both is plausibly deliberate, and a JD requiring "Git"
+# specifically shouldn't have that requirement silently unmatched because
+# the resume's "Git" entry got dropped in favor of "GitHub". No pair for
+# them here; they're intentionally treated as distinct.
 VARIANT_PAIRS: list[tuple[str, str]] = [
-    ("git", "github"),          # github is more specific
     ("node", "node.js"),        # node.js is canonical
     ("nodejs", "node.js"),      # node.js is canonical
     ("vue", "vue.js"),          # vue.js is more complete
@@ -38,13 +47,23 @@ VARIANT_PAIRS: list[tuple[str, str]] = [
 
 
 def normalize_skill_name(name: str) -> str:
-    """Lowercase and strip punctuation/whitespace for loose comparison.
+    """Lowercase and strip decorative punctuation/whitespace for loose
+    comparison.
 
     Catches spacing/punctuation-only variants like "Node.js" vs "nodejs"
     or "CI/CD" vs "CI CD" without merging unrelated skills that merely
     share a substring (e.g. "React" and "React Native" stay distinct).
+
+    "+" and "#" are kept rather than stripped: stripping them collapsed
+    "C", "C++", and "C#" — three genuinely distinct, extremely common
+    languages — into the same normalized "c", so listing more than one
+    silently dropped all but one. Unlike the punctuation this strips
+    (dots, spaces, slashes — purely decorative formatting differences),
+    +/# are semantically significant: they're what makes C# and C++
+    different languages from C and from each other, not a spelling
+    variant of the same thing.
     """
-    return "".join(ch for ch in name.lower() if ch.isalnum())
+    return "".join(ch for ch in name.lower() if ch.isalnum() or ch in "+#")
 
 
 def split_combo_skill(name: str) -> list[str]:

@@ -50,9 +50,29 @@ class TestDedupeSkillNames:
         assert dedupe_skill_names(["Python", "python", "SQL"]) == ["Python", "SQL"]
 
     def test_known_variant_pair_keeps_more_specific(self):
-        assert dedupe_skill_names(["Git", "GitHub", "Docker"]) == ["GitHub", "Docker"]
+        assert dedupe_skill_names(["Node", "Node.js", "Docker"]) == ["Node.js", "Docker"]
         assert dedupe_skill_names(["HTML", "CSS", "HTML5"]) == ["CSS", "HTML5"]
         assert dedupe_skill_names(["Tailwind", "TailwindCSS"]) == ["TailwindCSS"]
+
+    def test_git_and_github_are_not_treated_as_variants(self):
+        # Regression: Git (a CLI tool) and GitHub (a hosting platform)
+        # used to be paired as a "less specific/more specific" variant
+        # like Node/Node.js, silently dropping "Git" whenever both were
+        # listed — even though a JD requiring "Git" specifically would
+        # then never find it. They're related but genuinely different
+        # things, not a spelling/version variant of the same technology.
+        assert dedupe_skill_names(["Git", "GitHub", "Docker"]) == ["Git", "GitHub", "Docker"]
+
+    def test_c_cpp_csharp_stay_distinct(self):
+        # Regression: normalize_skill_name used to strip ALL punctuation,
+        # including "+" and "#" — collapsing "C", "C++", and "C#" (three
+        # genuinely distinct, extremely common languages) to the same
+        # normalized "c". Listing more than one silently dropped all but
+        # one; an explicitly user-accepted "C++" addition could vanish
+        # with no error and no way to notice.
+        assert dedupe_skill_names(["C", "C++", "C#"]) == ["C", "C++", "C#"]
+        assert is_duplicate_skill("C++", ["C"]) is False
+        assert is_duplicate_skill("C#", ["C++"]) is False
 
     def test_punctuation_only_variant_collapsed(self):
         assert dedupe_skill_names(["Node.js", "nodejs", "React"]) == ["Node.js", "React"]
@@ -85,7 +105,7 @@ class TestDedupeSkillNames:
 
 class TestFindRedundantVariants:
     def test_returns_lowercased_less_specific_form(self):
-        assert find_redundant_variants(["Git", "GitHub"]) == {"git"}
+        assert find_redundant_variants(["Node", "Node.js"]) == {"node"}
 
     def test_no_pair_present_returns_empty(self):
         assert find_redundant_variants(["Python", "SQL"]) == set()
@@ -98,12 +118,12 @@ class TestJobAnalyzerUsesSharedDedup:
         analyzer = JobAnalyzer()
         analysis = JobAnalysis(raw_text="test")
         analysis.frameworks = [
-            WeightedItem(name="Git", importance=1.0),
-            WeightedItem(name="GitHub", importance=1.0),
+            WeightedItem(name="Node", importance=1.0),
+            WeightedItem(name="Node.js", importance=1.0),
             WeightedItem(name="Docker", importance=1.0),
         ]
         analyzer._deduplicate_variants(analysis)
-        assert [f.name for f in analysis.frameworks] == ["GitHub", "Docker"]
+        assert [f.name for f in analysis.frameworks] == ["Node.js", "Docker"]
 
 
 class TestApplyTailoringSkillsMerge:
@@ -117,14 +137,16 @@ class TestApplyTailoringSkillsMerge:
     def test_reordered_skills_with_internal_duplicate_are_deduped(self):
         ir = _skills_ir("Languages", ["Python", "SQL", "AWS"])
         result = TailoringResult(resume_id="r1")
-        # LLM repeats "AWS" and returns a Git/GitHub variant pair.
+        # LLM repeats "AWS"; Git and GitHub are both present but are NOT
+        # a variant pair (see test_git_and_github_are_not_treated_as_variants
+        # in TestDedupeSkillNames) so both survive, only the AWS repeat dedupes.
         result.reordered_skills["Languages"] = ["AWS", "Python", "AWS", "Git", "GitHub"]
 
         service = TailoringService()
         new_ir = service.apply_tailoring(ir, result, fit_skills=False)
 
         skills = new_ir.content.sections[0].skill_categories[0].skills
-        assert skills == ["AWS", "Python", "GitHub", "SQL"]
+        assert skills == ["AWS", "Python", "Git", "GitHub", "SQL"]
 
     def test_added_skill_that_is_a_variant_of_existing_is_not_appended(self):
         ir = _skills_ir("Interests", ["Photography", "HTML5"])
@@ -137,6 +159,22 @@ class TestApplyTailoringSkillsMerge:
 
         skills = new_ir.content.sections[0].skill_categories[0].skills
         assert skills == ["Photography", "HTML5"]
+
+    def test_accepted_cpp_addition_survives_alongside_existing_c(self):
+        # Full-pipeline regression for the C/C++/C# normalize_skill_name
+        # bug: a user explicitly accepting a "C++" addition, when the
+        # resume already lists plain "C", must not silently vanish.
+        ir = _skills_ir("Languages", ["C", "Python"])
+        result = TailoringResult(resume_id="r1")
+        result.added_skills["Languages"] = ["C++"]
+        result.additions_accepted["Languages:C++"] = True
+
+        service = TailoringService()
+        new_ir = service.apply_tailoring(ir, result, fit_skills=False)
+
+        skills = new_ir.content.sections[0].skill_categories[0].skills
+        assert "[LLM]C++" in skills
+        assert "C" in skills
 
     def test_genuinely_new_addition_still_appended(self):
         ir = _skills_ir("Languages", ["Python"])
@@ -353,6 +391,43 @@ class TestApplyTailoringSkillsMerge:
         skills = new_ir.content.sections[0].skill_categories[0].skills
         assert "[LLM]Jenkins" in skills
 
+    def test_category_name_mismatch_logs_a_debug_warning(self):
+        # Regression: if the LLM's proposed category name doesn't match
+        # any of the resume's actual skill categories exactly (e.g. it
+        # said "Programming Languages" but the resume's category is
+        # "Languages"), the whole addition/reorder for that category
+        # silently no-ops -- apply_tailoring only ever looks things up
+        # by "cat.category in result.X". There's no safe way to
+        # auto-recover this (no reliable way to guess which existing
+        # category was meant), but it must not be entirely silent.
+        ir = _skills_ir("Languages", ["Python", "Java"])
+        result = TailoringResult(resume_id="r1")
+        result.added_skills["Programming Languages"] = ["Go", "Rust"]
+        result.reordered_skills["Programming Languages"] = ["Go", "Python", "Java", "Rust"]
+
+        service = TailoringService()
+        new_ir = service.apply_tailoring(ir, result, fit_skills=False)
+
+        # Confirms the no-op: nothing crashes, nothing silently
+        # "fuzzy-matches" onto the wrong category.
+        skills = new_ir.content.sections[0].skill_categories[0].skills
+        assert skills == ["Python", "Java"]
+        assert any(
+            "Programming Languages" in line and "MISMATCH" in line
+            for line in result.debug_log
+        )
+
+    def test_matching_category_name_does_not_log_a_mismatch(self):
+        ir = _skills_ir("Languages", ["Python"])
+        result = TailoringResult(resume_id="r1")
+        result.added_skills["Languages"] = ["Go"]
+        result.additions_accepted["Languages:Go"] = True
+
+        service = TailoringService()
+        service.apply_tailoring(ir, result, fit_skills=False)
+
+        assert not any("MISMATCH" in line for line in result.debug_log)
+
 
 class TestDedupeAdditionsAcrossCategories:
     """Regression (live bug report): `tailor()`'s two independent LLM
@@ -378,11 +453,11 @@ class TestDedupeAdditionsAcrossCategories:
 
     def test_variant_pair_across_categories_also_caught(self):
         added = {
-            "Databases & Tools": ["GitHub"],
-            "Technologies": ["Git"],
+            "Databases & Tools": ["Node.js"],
+            "Technologies": ["Node"],
         }
         deduped = _dedupe_additions_across_categories(added)
-        assert deduped == {"Databases & Tools": ["GitHub"]}
+        assert deduped == {"Databases & Tools": ["Node.js"]}
 
     def test_unrelated_additions_in_different_categories_all_kept(self):
         added = {

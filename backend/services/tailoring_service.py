@@ -1630,6 +1630,30 @@ class TailoringService:
                         claimed.append(plain)
                     cat.skills = kept
 
+                # A category name in added_skills/reordered_skills that
+                # never matched any of the resume's actual skill
+                # categories (above, both are only ever looked up by
+                # "cat.category in result.X") means the LLM's proposal
+                # for that whole category silently never applied — no
+                # error, nothing in the rendered resume, and no
+                # indication in the UI that a decision was even possible.
+                # This can't be safely auto-recovered (there's no
+                # reliable way to guess which existing category the LLM
+                # actually meant, and creating a brand new one risks a
+                # confusing near-duplicate category), but it should at
+                # least be visible for debugging rather than silent.
+                actual_categories = {c.category for c in section.skill_categories}
+                unmatched = (
+                    set(result.added_skills) | set(result.reordered_skills)
+                ) - actual_categories
+                for name in sorted(unmatched):
+                    result.debug_log.append(
+                        f"SKILLS CATEGORY MISMATCH: '{name}' from the LLM's "
+                        f"proposal doesn't match any of this resume's actual "
+                        f"skill categories ({sorted(actual_categories)}) — "
+                        f"its additions/reorder were silently never applied."
+                    )
+
         if fit_skills:
             self._fit_skills_to_line(new_ir, result)
 
