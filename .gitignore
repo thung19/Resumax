@@ -12,3 +12,10 @@ frontend/node_modules/
 frontend/.next/
 
 .DS_Store
+
+# User-generated/runtime data — uploaded resumes, parsed IR, generated
+# tailored output, and resume-fact banks. Real PII (names, emails, work
+# history) lives in these files; they must never be committed. Existing
+# tracked copies were removed from the index in a separate commit — see
+# the accompanying history-purge for removing them from past commits too.
+data/
