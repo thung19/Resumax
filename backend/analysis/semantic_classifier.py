@@ -102,25 +102,6 @@ class SemanticClassifier:
                     return section_type
         return SectionType.CUSTOM
 
-    def validate_content(self, content: ResumeContent) -> list[dict]:
-        """Validate section assignments and return suggestions.
-
-        Returns a list of {section_id, current_type, suggested_type, reason}.
-        """
-        suggestions = []
-
-        for section in content.sections:
-            suggested = self._validate_section(section)
-            if suggested and suggested != section.type:
-                suggestions.append({
-                    "section_id": section.id,
-                    "current_type": section.type.value,
-                    "suggested_type": suggested.value,
-                    "reason": self._explain_suggestion(section, suggested),
-                })
-
-        return suggestions
-
     def _validate_section(self, section: ResumeSection) -> Optional[SectionType]:
         """Check if a section's content matches its type."""
         # Title-based classification
@@ -156,12 +137,6 @@ class SemanticClassifier:
             return SectionType.PROJECTS
 
         return None
-
-    def _explain_suggestion(self, section: ResumeSection, suggested: SectionType) -> str:
-        title_type = self.classify_section_title(section.title)
-        if title_type == suggested:
-            return f"Title '{section.title}' matches {suggested.value} pattern"
-        return f"Content analysis suggests {suggested.value}"
 
     def reclassify(self, content: ResumeContent) -> ResumeContent:
         """Apply classification corrections to content."""

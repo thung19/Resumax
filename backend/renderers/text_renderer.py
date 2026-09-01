@@ -57,18 +57,6 @@ class TextRenderer:
 
         return "\n".join(lines) + "\n"
 
-    def render_section(self, section: ResumeSection) -> str:
-        """Render a single section as text (for copy mode)."""
-        return "\n".join(self._render_section(section))
-
-    def render_experience(self, entry: ExperienceEntry) -> str:
-        """Render a single experience entry."""
-        return "\n".join(self._render_experience_entry(entry))
-
-    def render_bullet(self, text: str) -> str:
-        """Render a single bullet as copyable text."""
-        return f"- {text}"
-
     def _render_section(self, section: ResumeSection) -> list[str]:
         lines: list[str] = []
 

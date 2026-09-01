@@ -7,6 +7,7 @@ save/load them, and list available templates.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,34 @@ from backend.models.resume_ir import ResumeIR
 from backend.models.resume_layout import ResumeLayout
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "templates"
+
+# template_id is used directly to build a filesystem path
+# (TEMPLATES_DIR / f"{template_id}.json") in every function below. A caller
+# could otherwise pass a name containing "/" or ".." (e.g. via the JSON
+# body of POST /templates/save/{resume_id}, which isn't constrained the
+# way a URL path segment is) and read, overwrite, or delete an arbitrary
+# .json file outside TEMPLATES_DIR. Every function that touches the
+# filesystem revalidates against this — it's the actual I/O, so it
+# shouldn't trust its caller to have sanitized anything.
+_TEMPLATE_ID_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+_TEMPLATE_ID_UNSAFE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify_template_id(name: str) -> str:
+    """Turn a user-supplied template name into a safe filesystem id.
+
+    The only place a template_id should be derived from free-text input —
+    every write/read path below revalidates against _TEMPLATE_ID_PATTERN
+    regardless, so this can't silently drift out of sync with what's
+    actually allowed on disk.
+    """
+    slug = _TEMPLATE_ID_UNSAFE_RE.sub("_", name.strip().lower()).strip("_")[:64]
+    return slug or "template"
+
+
+def _validate_template_id(template_id: str) -> None:
+    if not _TEMPLATE_ID_PATTERN.match(template_id):
+        raise ValueError(f"Invalid template ID: {template_id!r}")
 
 
 def extract_template(ir: ResumeIR, name: str = "", description: str = "") -> FormatTemplate:
@@ -64,6 +93,7 @@ def extract_template(ir: ResumeIR, name: str = "", description: str = "") -> For
 
 def save_template(template: FormatTemplate, template_id: str):
     """Save a template to disk."""
+    _validate_template_id(template_id)
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
     path = TEMPLATES_DIR / f"{template_id}.json"
     path.write_text(template.model_dump_json(indent=2))
@@ -71,6 +101,7 @@ def save_template(template: FormatTemplate, template_id: str):
 
 def load_template(template_id: str) -> Optional[FormatTemplate]:
     """Load a template from disk."""
+    _validate_template_id(template_id)
     path = TEMPLATES_DIR / f"{template_id}.json"
     if not path.exists():
         return None
@@ -104,6 +135,7 @@ def list_templates() -> list[dict]:
 
 def delete_template(template_id: str) -> bool:
     """Delete a template."""
+    _validate_template_id(template_id)
     path = TEMPLATES_DIR / f"{template_id}.json"
     if path.exists():
         path.unlink()

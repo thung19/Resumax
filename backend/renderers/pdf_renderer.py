@@ -86,7 +86,10 @@ class OverflowInfo:
     def __init__(self):
         self.page_count: int = 1
         self.overflow: bool = False
-        self.overflow_elements: list[dict] = []
+        # Vertical space (in points) left below the last line of content on
+        # the final page. Lets callers detect "fits, but way underfull" —
+        # not just the binary page_count/overflow this class started with.
+        self.whitespace_pt: float = 0.0
 
 
 # ------------------------------------------------------------------
@@ -191,6 +194,12 @@ class PdfRenderer:
 
         self._overflow.page_count = doc.page
         self._overflow.overflow = doc.page > 1
+        # `frame` is mutated in place by ReportLab as flowables are laid
+        # out — after build(), frame._y is the y-coordinate where the next
+        # flowable would have started on the last page used, and frame._y1
+        # is the bottom margin's y-coordinate. Their gap is exactly the
+        # unused vertical space below the last line of content.
+        self._overflow.whitespace_pt = max(0.0, frame._y - frame._y1)
         return buf.getvalue()
 
     def get_overflow_info(self) -> OverflowInfo:

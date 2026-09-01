@@ -98,11 +98,6 @@ def _twips_to_in(twips: Optional[int]) -> Optional[float]:
     return twips / 1440.0 if twips is not None else None
 
 
-def _emu_to_in(emu: Optional[int]) -> Optional[float]:
-    """Convert EMU (1/914400 inch) to inches."""
-    return emu / 914400.0 if emu is not None else None
-
-
 def _twips_to_pt(twips: Optional[int]) -> Optional[float]:
     """Convert twips (1/20 pt) to points."""
     return twips / 20.0 if twips is not None else None
@@ -1003,33 +998,68 @@ class DocxImporter:
             tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
 
             if tag == "r":
-                rf = self._capture_run_format(child)
-                pf.runs.append(rf)
+                pf.runs.extend(self._capture_run_formats(child))
 
             elif tag == "hyperlink":
                 # Hyperlink: extract runs inside it
                 rid = child.get(qn("r:id"))
                 url = hyperlinks.get(rid, "") if rid else ""
                 for r in child.findall(qn("w:r")):
-                    rf = self._capture_run_format(r)
-                    rf.hyperlink_url = url
-                    pf.runs.append(rf)
+                    for rf in self._capture_run_formats(r):
+                        rf.hyperlink_url = url
+                        pf.runs.append(rf)
 
         return pf
 
-    def _capture_run_format(self, r_elem: etree._Element) -> RunFormat:
-        """Capture exact formatting of a single run."""
+    def _capture_run_formats(self, r_elem: etree._Element) -> list[RunFormat]:
+        """Capture a run, split into one RunFormat per tab/text segment.
+
+        A single OOXML <w:r> can legally contain more than one content
+        child in sequence — e.g. <w:tab/><w:t>Jun 2025 - Aug 2025</w:t>
+        together in ONE run is exactly what Word writes when you press
+        Tab then keep typing without changing formatting (no new run is
+        needed just for that). RunFormat models "one run = one
+        homogeneous piece" (is_tab XOR text) — capturing a combined run
+        as a single RunFormat used to silently drop the text, since
+        every renderer treats is_tab=True as "just emit a tab, there's
+        nothing else here" (see docx_renderer.py). Splitting once, here,
+        means every renderer (docx/pdf/html/txt) sees the same shape a
+        "normal" tab-then-separate-run entry already produces.
+        """
+        template = self._capture_run_properties(r_elem)
+
+        pieces: list[RunFormat] = []
+        text_buf: list[str] = []
+
+        def flush_text() -> None:
+            if text_buf:
+                rf = template.model_copy()
+                rf.text = "".join(text_buf)
+                pieces.append(rf)
+                text_buf.clear()
+
+        for child in r_elem:
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if tag == "t":
+                text_buf.append(child.text or "")
+            elif tag == "tab":
+                flush_text()
+                rf = template.model_copy()
+                rf.is_tab = True
+                pieces.append(rf)
+        flush_text()
+
+        if not pieces:
+            # No text/tab content at all (e.g. a bare formatting-only
+            # run) — keep prior behavior of emitting one empty RunFormat.
+            pieces.append(template.model_copy())
+
+        return pieces
+
+    def _capture_run_properties(self, r_elem: etree._Element) -> RunFormat:
+        """Capture a run's formatting (font/size/bold/etc.) as a template
+        RunFormat with no text/is_tab set — see _capture_run_formats."""
         rf = RunFormat()
-
-        # Text
-        texts = []
-        for t in r_elem.findall(qn("w:t")):
-            texts.append(t.text or "")
-        rf.text = "".join(texts)
-
-        # Tab
-        if r_elem.findall(qn("w:tab")):
-            rf.is_tab = True
 
         # Run properties
         rPr = r_elem.find(qn("w:rPr"))

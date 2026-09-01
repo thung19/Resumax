@@ -35,7 +35,6 @@ class ContactInfo(BaseModel):
     name: str = ""
     email: Optional[str] = None
     phone: Optional[str] = None
-    location: Optional[str] = None
     linkedin: Optional[str] = None
     github: Optional[str] = None
     website: Optional[str] = None
@@ -99,8 +98,6 @@ class GenericEntry(BaseModel):
     id: str
     title: Optional[str] = None
     subtitle: Optional[str] = None
-    date: Optional[str] = None
-    description: Optional[str] = None
     bullets: list[Bullet] = Field(default_factory=list)
 
 

@@ -15,6 +15,8 @@ extraction, not for merging LLM skill suggestions into the resume.
 
 from __future__ import annotations
 
+import re
+
 # Known variant relationships: (less_specific, more_specific).
 # When both forms are present in the same list, the less specific one is
 # dropped and the more specific/canonical one is kept.
@@ -43,6 +45,38 @@ def normalize_skill_name(name: str) -> str:
     share a substring (e.g. "React" and "React Native" stay distinct).
     """
     return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def split_combo_skill(name: str) -> list[str]:
+    """Split a slash-combined skill entry like "JavaScript/TypeScript" into
+    its individual parts. Returns [name] unchanged if there's nothing to
+    split (a single part, or a slash that's part of a canonical name like
+    "Next.js" — those never contain a "/").
+    """
+    parts = [p.strip() for p in re.split(r"\s*/\s*", name) if p.strip()]
+    return parts if len(parts) > 1 else [name]
+
+
+def _drop_standalone_covered_by_combo(names: list[str]) -> list[str]:
+    """Drop standalone entries already covered by a combo entry's parts.
+
+    E.g. given ["JavaScript/TypeScript", "TypeScript", "JavaScript"], the
+    combo already lists both languages, so the two standalone entries are
+    redundant and get dropped, leaving just the combo.
+    """
+    combo_parts_lower: set[str] = set()
+    for n in names:
+        parts = split_combo_skill(n)
+        if len(parts) > 1:
+            combo_parts_lower.update(p.lower() for p in parts)
+
+    if not combo_parts_lower:
+        return names
+
+    return [
+        n for n in names
+        if len(split_combo_skill(n)) > 1 or n.lower() not in combo_parts_lower
+    ]
 
 
 def find_redundant_variants(names: list[str]) -> set[str]:
@@ -92,15 +126,20 @@ def dedupe_skill_names(names: list[str]) -> list[str]:
         seen_exact.add(lowered)
         exact_deduped.append(stripped)
 
-    # Step 2: drop the less-specific side of any known variant pair
+    # Step 2: drop standalone entries already covered by a combo entry's
+    # parts (e.g. "TypeScript" and "JavaScript" when "JavaScript/TypeScript"
+    # is also present).
+    combo_deduped = _drop_standalone_covered_by_combo(exact_deduped)
+
+    # Step 3: drop the less-specific side of any known variant pair
     # (e.g. "Git" when "GitHub" is also present).
-    redundant = find_redundant_variants(exact_deduped)
+    redundant = find_redundant_variants(combo_deduped)
     variant_deduped = (
-        [n for n in exact_deduped if n.lower() not in redundant]
-        if redundant else exact_deduped
+        [n for n in combo_deduped if n.lower() not in redundant]
+        if redundant else combo_deduped
     )
 
-    # Step 3: collapse any remaining punctuation/spacing-only duplicates
+    # Step 4: collapse any remaining punctuation/spacing-only duplicates
     # not covered by an explicit pair (e.g. "CI/CD" vs "CI CD").
     final: list[str] = []
     seen_normalized: set[str] = set()
@@ -131,6 +170,19 @@ def is_duplicate_skill(candidate: str, existing: list[str]) -> bool:
     candidate_norm = normalize_skill_name(candidate)
     for item in existing:
         if item.lower() == candidate_lower or normalize_skill_name(item) == candidate_norm:
+            return True
+        # Candidate already covered by a combo entry, e.g. candidate
+        # "JavaScript" vs. existing "JavaScript/TypeScript".
+        if candidate_lower in {p.lower() for p in split_combo_skill(item)}:
+            return True
+
+    # Candidate is itself a combo whose parts are all already present
+    # separately, e.g. candidate "JavaScript/TypeScript" vs. existing
+    # ["JavaScript", "TypeScript"] — adds nothing new.
+    candidate_parts = split_combo_skill(candidate)
+    if len(candidate_parts) > 1:
+        existing_lower = {e.lower() for e in existing}
+        if all(p.lower() in existing_lower for p in candidate_parts):
             return True
 
     redundant = find_redundant_variants(list(existing) + [candidate])

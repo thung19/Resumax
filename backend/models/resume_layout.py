@@ -74,7 +74,6 @@ class TabStop(BaseModel):
 
 class FontSpec(BaseModel):
     family: str = "Arial"
-    fallback: Optional[str] = None
     size_pt: float = 10.0
     bold: bool = False
     italic: bool = False
@@ -82,7 +81,6 @@ class FontSpec(BaseModel):
     strikethrough: bool = False
     small_caps: bool = False
     color: Optional[str] = None
-    letter_spacing_pt: Optional[float] = None
 
 
 class SpacingSpec(BaseModel):
@@ -171,7 +169,6 @@ class ParagraphFormat(BaseModel):
 
     # Borders
     bottom_border: Optional[BorderDef] = None
-    top_border: Optional[BorderDef] = None
 
     # Drawing/shape
     has_drawing: bool = False
@@ -237,11 +234,6 @@ class PageSetup(BaseModel):
     margin_footer_in: float = 0.5
 
 
-class HeaderFooter(BaseModel):
-    enabled: bool = False
-    content: Optional[str] = None
-
-
 # --- Style definition (kept for pattern detection) ---
 
 class StyleDef(BaseModel):
@@ -250,22 +242,12 @@ class StyleDef(BaseModel):
     indent: IndentSpec = Field(default_factory=IndentSpec)
     alignment: Alignment = Alignment.LEFT
     layout_mode: LayoutMode = LayoutMode.NORMAL
-    top_border: Optional[BorderDef] = None
     bottom_border: Optional[BorderDef] = None
-    left_border: Optional[BorderDef] = None
-    right_border: Optional[BorderDef] = None
     bullet: Optional[BulletSpec] = None
     tab_stops: list[TabStop] = Field(default_factory=list)
     keep_with_next: bool = False
     keep_lines_together: bool = False
-    page_break_before: bool = False
     source_word_style: Optional[str] = None
-
-
-class ElementStyleBinding(BaseModel):
-    element_id: Optional[str] = None
-    semantic_role: Optional[str] = None
-    style_ref: str
 
 
 # --- Top-level layout ---
@@ -276,13 +258,6 @@ class ResumeLayout(BaseModel):
 
     # Named styles (from pattern detection)
     styles: dict[str, StyleDef] = Field(default_factory=dict)
-
-    # Element-to-style bindings
-    bindings: list[ElementStyleBinding] = Field(default_factory=list)
-
-    # Header/footer
-    header: HeaderFooter = Field(default_factory=HeaderFooter)
-    footer: HeaderFooter = Field(default_factory=HeaderFooter)
 
     # Global defaults
     default_font: FontSpec = Field(default_factory=FontSpec)
@@ -298,9 +273,6 @@ class ResumeLayout(BaseModel):
 
     # Normalized spacer size (most common across all spacer elements)
     spacer_size_half_pt: int = 10  # 5pt default
-
-    # Section ordering
-    section_order: list[str] = Field(default_factory=list)
 
     # Horizontal rules
     horizontal_rules: dict[str, HorizontalRule] = Field(default_factory=dict)

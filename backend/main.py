@@ -434,8 +434,10 @@ async def fit_page(resume_id: str):
         "actions_taken": report.actions_taken,
         "bullets_shortened": report.bullets_shortened,
         "bullets_removed": report.bullets_removed,
+        "bullets_restored": report.bullets_restored,
         "spacing_adjusted": report.spacing_adjusted,
         "font_adjusted": report.font_adjusted,
+        "whitespace_pt": report.whitespace_pt,
     }
 
 
@@ -645,6 +647,8 @@ async def tailor_resume(resume_id: str, req: TailorRequest, request: Request):
             "fits": report.fits,
             "page_count": report.page_count,
             "actions_taken": report.actions_taken,
+            "bullets_restored": report.bullets_restored,
+            "whitespace_pt": report.whitespace_pt,
         }
 
     _tailored_ir_store[resume_id] = tailored_ir
@@ -970,7 +974,7 @@ async def export_tailored_docx(resume_id: str, filename: str | None = None):
         filename = ir.source_filename or "resume"
         if filename.endswith(".docx"):
             filename = filename[:-5]
-    filename = filename + "_tailored.docx"
+    filename = filename + ".docx"
 
     return Response(
         content=docx_bytes,
@@ -1150,12 +1154,14 @@ class SaveTemplateRequest(BaseModel):
 @app.post("/templates/save/{resume_id}")
 async def save_format_template(resume_id: str, req: SaveTemplateRequest):
     """Save the formatting style of an uploaded resume as a reusable template."""
-    from backend.services.template_service import extract_template, save_template
+    from backend.services.template_service import (
+        extract_template, save_template, slugify_template_id,
+    )
 
     ir = _load_ir(resume_id)
     template = extract_template(ir, name=req.name, description=req.description)
 
-    template_id = req.name.lower().replace(" ", "_").replace("-", "_")
+    template_id = slugify_template_id(req.name)
     save_template(template, template_id)
 
     return {
@@ -1186,7 +1192,10 @@ async def list_format_templates():
 async def get_format_template(template_id: str):
     """Get a specific format template."""
     from backend.services.template_service import load_template
-    template = load_template(template_id)
+    try:
+        template = load_template(template_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid template ID format")
     if template is None:
         raise HTTPException(404, f"Template '{template_id}' not found")
     return template.model_dump()
@@ -1198,7 +1207,10 @@ async def apply_format_template(resume_id: str, template_id: str):
     from backend.services.template_service import load_template, apply_template
 
     ir = _load_ir(resume_id)
-    template = load_template(template_id)
+    try:
+        template = load_template(template_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid template ID format")
     if template is None:
         raise HTTPException(404, f"Template '{template_id}' not found")
 
@@ -1228,7 +1240,11 @@ async def apply_format_template(resume_id: str, template_id: str):
 async def delete_format_template(template_id: str):
     """Delete a format template."""
     from backend.services.template_service import delete_template
-    if not delete_template(template_id):
+    try:
+        deleted = delete_template(template_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid template ID format")
+    if not deleted:
         raise HTTPException(404, f"Template '{template_id}' not found")
     return {"status": "deleted"}
 

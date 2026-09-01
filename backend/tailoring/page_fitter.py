@@ -31,8 +31,10 @@ class OverflowReport:
     actions_taken: list[str] = field(default_factory=list)
     bullets_shortened: list[str] = field(default_factory=list)
     bullets_removed: list[str] = field(default_factory=list)
+    bullets_restored: list[str] = field(default_factory=list)
     spacing_adjusted: bool = False
     font_adjusted: bool = False
+    whitespace_pt: float = 0.0
 
 
 @dataclass
@@ -72,11 +74,9 @@ class PageFitter:
         """Attempt to fit the resume. Returns (modified IR, report)."""
         # Check current page count
         pages = self._check_pages()
-        self._report.page_count = pages
 
         if pages <= self._target:
-            self._report.fits = True
-            return self._ir, self._report
+            return self._finish(pages)
 
         # Collect all bullets with metadata
         bullets = self._collect_bullets()
@@ -96,9 +96,7 @@ class PageFitter:
 
                 pages = self._check_pages()
                 if pages <= self._target:
-                    self._report.fits = True
-                    self._report.page_count = pages
-                    return self._ir, self._report
+                    return self._finish(pages)
 
         # Step 2: Shorten medium-length bullets
         for b_info in bullets:
@@ -112,9 +110,7 @@ class PageFitter:
 
                 pages = self._check_pages()
                 if pages <= self._target:
-                    self._report.fits = True
-                    self._report.page_count = pages
-                    return self._ir, self._report
+                    return self._finish(pages)
 
         # Step 3: Remove lowest-relevance bullets
         if self._allow_removal:
@@ -139,9 +135,7 @@ class PageFitter:
 
                 pages = self._check_pages()
                 if pages <= self._target:
-                    self._report.fits = True
-                    self._report.page_count = pages
-                    return self._ir, self._report
+                    return self._finish(pages)
 
         # Step 4: Compress spacing
         if self._allow_spacing:
@@ -151,9 +145,7 @@ class PageFitter:
 
             pages = self._check_pages()
             if pages <= self._target:
-                self._report.fits = True
-                self._report.page_count = pages
-                return self._ir, self._report
+                return self._finish(pages)
 
         # Step 5: Reduce font size (last resort)
         current_font = self._get_bullet_font_size()
@@ -165,20 +157,105 @@ class PageFitter:
 
             pages = self._check_pages()
             if pages <= self._target:
-                self._report.fits = True
-                self._report.page_count = pages
-                return self._ir, self._report
+                return self._finish(pages)
 
         # Could not fit
         self._report.fits = False
         self._report.page_count = self._check_pages()
         return self._ir, self._report
 
-    def _check_pages(self) -> int:
-        """Render PDF and return page count."""
+    def _finish(self, pages: int) -> tuple[ResumeIR, OverflowReport]:
+        """Record a successful fit and, if the page is left noticeably
+        under-full, try to restore some of what tailoring shortened before
+        handing back to the caller.
+        """
+        self._report.fits = True
+        self._report.page_count = pages
+        self._fill_whitespace()
+        return self._ir, self._report
+
+    def _render_metrics(self) -> tuple[int, float]:
+        """Render once and return (page_count, whitespace_pt)."""
         renderer = PdfRenderer(self._ir)
         renderer.render()
-        return renderer.get_overflow_info().page_count
+        info = renderer.get_overflow_info()
+        return info.page_count, info.whitespace_pt
+
+    def _check_pages(self) -> int:
+        """Render PDF and return page count."""
+        pages, _ = self._render_metrics()
+        return pages
+
+    def _fill_whitespace(self, min_whitespace_pt: float = 28.0):
+        """If the page has significantly more room than needed, restore
+        bullets that tailoring shortened back toward their fuller,
+        pre-tailoring text — so a resume that fits with room to spare
+        doesn't read as sparse.
+
+        This only lengthens bullets that are still present (it does not
+        re-insert bullets removed by the main tailoring pass or by Step 3
+        above — recovering those needs their original position, which
+        isn't preserved past that point; a natural follow-up, not done
+        here). One bullet at a time, most room-to-grow first, re-checking
+        fit after each — any restoration that would push the resume back
+        over the target page count is undone rather than accepted.
+        """
+        if not self._tailoring:
+            return
+
+        pages, whitespace = self._render_metrics()
+        self._report.whitespace_pt = whitespace
+        if pages > self._target or whitespace < min_whitespace_pt:
+            return
+
+        bullet_lookup = {b.bullet_id: b for b in self._collect_bullets()}
+
+        # Candidates: bullets tailoring rewrote where the pre-tailoring
+        # text is meaningfully longer than what's on the page now (which
+        # may itself already reflect further shortening from Steps 1-2
+        # above, if this run started out overflowing).
+        candidates = []
+        for change in self._tailoring.bullet_changes:
+            if change.action != "rewrite" or not change.original_text:
+                continue
+            b_info = bullet_lookup.get(change.bullet_id)
+            if b_info is None:
+                continue
+            if len(change.original_text) <= len(b_info.text) + 10:
+                continue
+            candidates.append(b_info)
+
+        # Most potential length gained first, so we need the fewest
+        # restorations to use up the available whitespace.
+        original_by_id = {
+            c.bullet_id: c.original_text for c in self._tailoring.bullet_changes
+        }
+        candidates.sort(
+            key=lambda b: len(original_by_id[b.bullet_id]) - len(b.text),
+            reverse=True,
+        )
+
+        for b_info in candidates:
+            current_text = b_info.text
+            fuller_text = original_by_id[b_info.bullet_id]
+
+            self._update_bullet(b_info, fuller_text)
+            pages, whitespace = self._render_metrics()
+
+            if pages > self._target:
+                # Restoring this one broke the fit — undo it and keep
+                # trying smaller candidates rather than stopping outright.
+                self._update_bullet(b_info, current_text)
+                continue
+
+            self._report.bullets_restored.append(b_info.bullet_id)
+            self._report.actions_taken.append(
+                f"Restored bullet {b_info.bullet_id} toward its pre-tailoring "
+                f"length to reduce trailing whitespace"
+            )
+            self._report.whitespace_pt = whitespace
+            if whitespace < min_whitespace_pt:
+                break
 
     def _collect_bullets(self) -> list[BulletInfo]:
         """Collect all bullets with metadata."""
@@ -256,6 +333,10 @@ class PageFitter:
     def _update_bullet(self, b_info: BulletInfo, new_text: str):
         """Update a bullet's text in the IR and layout elements."""
         section = self._ir.content.sections[b_info.section_idx]
+        # Capture BEFORE overwriting b_info.text below — the layout element
+        # search has to match on what the bullet used to say, not what
+        # we're about to change it to.
+        original_prefix = b_info.text[:30]
         if b_info.entry_type == "experience":
             section.experience_entries[b_info.entry_idx].bullets[b_info.bullet_idx].text = new_text
         elif b_info.entry_type == "project":
@@ -266,8 +347,6 @@ class PageFitter:
         # Sync layout elements so renderers see the updated text
         if self._ir.layout.elements:
             from backend.models.resume_layout import ElementType, RunFormat
-            # Find the matching bullet element by matching the start of the original text
-            original_prefix = b_info.text[:30]
             for el in self._ir.layout.elements:
                 if el.element_type == ElementType.BULLET:
                     el_text = "".join(

@@ -226,12 +226,3 @@ def get_config() -> PipelineConfig:
     if _global_config is None:
         _global_config = PipelineConfig.from_env()
     return _global_config
-
-
-def reset_config(config: PipelineConfig | None = None) -> None:
-    """Reset the global configuration (used for testing)."""
-    global _global_config
-    if config is None:
-        _global_config = PipelineConfig.default()
-    else:
-        _global_config = config

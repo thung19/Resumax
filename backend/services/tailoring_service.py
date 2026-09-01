@@ -41,6 +41,57 @@ from backend.tailoring.tailoring_engine import TailoringEngine
 logger = logging.getLogger(__name__)
 
 
+def _dedupe_marked_skills(skills: list[str]) -> list[str]:
+    """Like `dedupe_skill_names`, but aware of the "[LLM]" marker prefix
+    used to track newly-added skills.
+
+    Without this, "[LLM]GraphQL" (added via `skill_additions`) and plain
+    "GraphQL" (present via a separate `skill_reorders` list) don't compare
+    equal to any of the exact/normalized/variant checks — the marker
+    survives until `_fit_skills_to_line` strips it later, at which point
+    both entries become identical text and the duplicate becomes visible.
+    This dedupes by the marker-stripped form while preserving whichever
+    original (marked or not) string appeared first.
+    """
+    plain_to_original: dict[str, str] = {}
+    ordered_plain: list[str] = []
+    for s in skills:
+        plain = s.replace("[LLM]", "").strip()
+        if not plain or plain in plain_to_original:
+            continue
+        plain_to_original[plain] = s
+        ordered_plain.append(plain)
+
+    return [plain_to_original[p] for p in dedupe_skill_names(ordered_plain)]
+
+
+def _dedupe_additions_across_categories(
+    added_skills: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Keep each proposed new skill under only the first category that
+    claims it.
+
+    Two independent LLM calls (`TailoringEngine.tailor()` and
+    `.optimize_skills()`) each propose skill additions, and neither sees
+    the other's output — they can independently propose adding the *same*
+    skill under two *different* category names (e.g. "Jenkins" under both
+    "Databases & Tools" and "Technologies"). The per-category "cat not in
+    added_skills" guard at the call site only stops a whole category's
+    list from being overwritten; it never catches this cross-category
+    collision. Left unmerged, the skill shows up as two separate "Skills
+    Added" review cards — reject one and the other silently survives,
+    since accept/reject is tracked per `"category:skill"` key.
+    """
+    deduped: dict[str, list[str]] = {}
+    claimed: list[str] = []
+    for cat, skills in added_skills.items():
+        kept = [s for s in skills if not is_duplicate_skill(s, claimed)]
+        claimed.extend(kept)
+        if kept:
+            deduped[cat] = kept
+    return deduped
+
+
 def _tech_terms_present(text: str) -> list[str]:
     """Find known technology/skill terms (from `claim_validator.TECH_TERMS`)
     already present in `text`, returned with their original casing.
@@ -59,6 +110,127 @@ def _tech_terms_present(text: str) -> list[str]:
         if match:
             found.append(text[match.start():match.end()])
     return found
+
+
+# Same-length-ish, past-tense synonyms for common resume action verbs,
+# shortest-first so a swap is more likely to still fit the line-width
+# budget after batch trimming has already run. Used by
+# _enforce_verb_variety to break up an overused leading verb — the trim
+# pass under character-budget pressure tends to fall back to the same
+# generic, short verb ("Built") for every bullet it has to shorten,
+# since it's the safest word to reach for.
+ACTION_VERB_SYNONYMS: dict[str, list[str]] = {
+    "built": ["Made", "Wrote", "Formed", "Coded", "Created", "Assembled", "Engineered", "Constructed"],
+    "created": ["Made", "Built", "Formed", "Devised", "Authored", "Established", "Engineered"],
+    "developed": ["Built", "Coded", "Crafted", "Engineered", "Designed", "Constructed"],
+    "designed": ["Built", "Shaped", "Crafted", "Architected", "Engineered", "Structured"],
+    "implemented": ["Built", "Coded", "Deployed", "Executed", "Rolled out", "Established"],
+    "led": ["Ran", "Drove", "Headed", "Guided", "Directed", "Spearheaded", "Chaired"],
+    "managed": ["Ran", "Oversaw", "Directed", "Handled", "Supervised", "Coordinated"],
+    "automated": ["Streamlined", "Scripted", "Mechanized", "Systematized"],
+    "integrated": ["Connected", "Linked", "Combined", "Unified", "Merged", "Embedded"],
+    "improved": ["Boosted", "Refined", "Upgraded", "Enhanced", "Strengthened", "Elevated"],
+    "optimized": ["Tuned", "Refined", "Streamlined", "Accelerated", "Sharpened"],
+    "reduced": ["Cut", "Lowered", "Trimmed", "Shrank", "Slashed", "Curbed"],
+    "increased": ["Grew", "Raised", "Lifted", "Boosted", "Expanded", "Scaled"],
+    "deployed": ["Shipped", "Launched", "Released", "Rolled out", "Published"],
+    "maintained": ["Ran", "Sustained", "Upheld", "Supported", "Preserved"],
+    "tested": ["Verified", "Validated", "Vetted", "Audited", "Checked"],
+    "wrote": ["Authored", "Drafted", "Composed", "Produced", "Penned"],
+    "analyzed": ["Studied", "Examined", "Assessed", "Evaluated", "Investigated"],
+}
+
+
+def _enforce_verb_variety(result: TailoringResult, measurer) -> None:
+    """Cap any single leading action verb at two uses across the final
+    resume, swapping in a synonym for the third-and-later rewritten
+    bullets that use it.
+
+    Only ever rewrites bullets this pass is already allowed to touch
+    (action == "rewrite") — an original, untouched ("keep") bullet is
+    never edited just to vary its wording, since that's the candidate's
+    own authentic phrasing, not something tailoring produced. Counting
+    still includes "keep" bullets, though: if two original bullets
+    already say "Built" and a rewrite lands on "Built" too, the reader
+    sees it three times regardless of which ones we technically changed,
+    so the count has to reflect the whole visible resume, not just our
+    own edits.
+
+    Only swaps to a verb not already used elsewhere as a leading word,
+    and only if the swapped bullet still fits its line (via `measurer`,
+    same calibrated check the trim pass itself uses) — a failed swap is
+    left as-is rather than risk overflow, and logged either way.
+    """
+    def leading_word(text: str) -> tuple[str, str]:
+        stripped = text.strip()
+        parts = stripped.split(maxsplit=1)
+        if not parts:
+            return "", ""
+        first = parts[0].strip(",.;:()–—")
+        rest = parts[1] if len(parts) > 1 else ""
+        return first, rest
+
+    used_lower: set[str] = set()
+    counts: dict[str, int] = {}
+    for change in result.bullet_changes:
+        if change.action not in ("rewrite", "keep"):
+            continue
+        first, _ = leading_word(change.tailored_text)
+        if first:
+            used_lower.add(first.lower())
+
+    for change in result.bullet_changes:
+        if change.action not in ("rewrite", "keep"):
+            continue
+        first, rest = leading_word(change.tailored_text)
+        if not first:
+            continue
+        key = first.lower()
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] <= 2:
+            continue
+        if change.action != "rewrite":
+            # Never rewrite an untouched original bullet just to vary its
+            # wording — that's the candidate's own phrasing. Still worth
+            # surfacing that the resume-as-a-whole repeats it, though.
+            result.debug_log.append(
+                f"VERB REPEATED '{first}' ({counts[key]}x) in "
+                f"{change.bullet_id} — unedited original bullet, left as-is"
+            )
+            continue
+
+        synonyms = ACTION_VERB_SYNONYMS.get(key)
+        if not synonyms:
+            result.debug_log.append(
+                f"VERB REPEATED '{first}' ({counts[key]}x) in "
+                f"{change.bullet_id} — no known synonym, left as-is"
+            )
+            continue
+
+        for candidate in synonyms:
+            if candidate.lower() in used_lower:
+                continue
+            new_text = f"{candidate} {rest}" if rest else candidate
+            if measurer is not None:
+                measurement = measurer.measure(new_text)
+                if not measurement.fits_one_line:
+                    continue
+            change.tailored_text = new_text
+            change.reason = (
+                (change.reason or "")
+                + f" | Varied repeated verb: '{first}' -> '{candidate}'"
+            ).strip(" |")
+            used_lower.add(candidate.lower())
+            result.debug_log.append(
+                f"VARIED {change.bullet_id}: '{first}' -> '{candidate}' "
+                f"(was repeated {counts[key]}x)"
+            )
+            break
+        else:
+            result.debug_log.append(
+                f"VERB REPEATED '{first}' ({counts[key]}x) in "
+                f"{change.bullet_id} — no unused synonym fit the line, left as-is"
+            )
 
 
 class TailoringService:
@@ -193,6 +365,13 @@ class TailoringService:
                 logger.warning(
                     f"Tailoring engine failed: {engine_result.llm_error}"
                 )
+
+            # See _dedupe_additions_across_categories: the two independent
+            # skill-proposing LLM calls above can each add the same skill
+            # under a different category name.
+            result.added_skills = _dedupe_additions_across_categories(
+                result.added_skills
+            )
 
         # If LLM didn't produce results, fall back to keep-all
         if not result.bullet_changes:
@@ -361,8 +540,11 @@ class TailoringService:
         if measurer:
             self._batch_trim_overflows(result, measurer, validator, bank, ir)
 
-        # Dedup pass: check for repeated adjectives/descriptors
-        self._dedup_adjectives(result)
+        # Cap any repeated leading verb at 2 uses (runs last since the
+        # trim pass above is the main source of collapsing bullets onto
+        # the same generic verb under character-budget pressure).
+        _enforce_verb_variety(result, measurer)
+        self._log_repeated_descriptors(result)
 
     def _batch_trim_overflows(
         self,
@@ -621,15 +803,22 @@ class TailoringService:
                 )
 
     @staticmethod
-    def _dedup_adjectives(result: TailoringResult):
-        """Flag rewrites that overuse the same adjective/descriptor.
+    def _log_repeated_descriptors(result: TailoringResult):
+        """Log (not fix) other descriptive words repeated 3+ times.
 
-        If the same descriptive word appears in 3+ rewritten bullets,
-        log a warning. Common verbs and tech terms are excluded.
+        Leading-verb repetition is actually fixed by
+        _enforce_verb_variety; this is a lighter-weight diagnostic pass
+        over everything else a rewrite adds mid-bullet (e.g. "scalable",
+        "robust") — safely auto-swapping an arbitrary mid-sentence
+        adjective risks awkward grammar in a way swapping a leading verb
+        doesn't, so this stays informational, surfaced in the debug
+        panel rather than silently rewriting more of the bullet.
         """
         from collections import Counter
 
-        # Words that are fine to repeat (tech terms, common verbs)
+        # Words that are fine to repeat (tech terms, common verbs —
+        # verbs are excluded here since _enforce_verb_variety already
+        # handles leading-verb repetition; no need to double-report).
         EXEMPT = {
             "python", "react", "javascript", "typescript", "sql",
             "fastapi", "node.js", "docker", "mongodb", "postgresql",
@@ -1201,10 +1390,46 @@ class TailoringService:
 
             elif section.type == SectionType.SKILLS:
                 for cat in section.skill_categories:
+                    # Capture what was already on the resume BEFORE this
+                    # category is touched — used below so a rejected
+                    # addition can't sneak back in via the separate
+                    # skill_reorders list (see rejected_additions).
+                    original_skills = [
+                        s.replace("[LLM]", "") for s in cat.skills
+                    ]
+
                     if cat.category in result.added_skills:
                         for new_skill in result.added_skills[cat.category]:
                             key = f"{cat.category}:{new_skill}"
-                            accepted = result.additions_accepted.get(key, True)
+                            if key in result.additions_accepted:
+                                accepted = result.additions_accepted[key]
+                            else:
+                                # No explicit addition decision yet. The LLM's
+                                # skill_reorders list for this category often
+                                # independently repeats the same new skill (it
+                                # describes the whole desired final order, new
+                                # items included) — from the user's point of
+                                # view, seeing that skill via the "Skills
+                                # Reordered" card and rejecting it there IS
+                                # rejecting the skill, even though addition/
+                                # reorder are tracked as separate decisions.
+                                # Without this, an explicit reorder-reject was
+                                # silently ignored: this loop still defaulted
+                                # to True and appended the skill anyway, and
+                                # it landed at the very end of the line since
+                                # the (rejected) reorder step that would have
+                                # positioned it never ran.
+                                in_reorder = (
+                                    cat.category in result.reordered_skills
+                                    and is_duplicate_skill(
+                                        new_skill,
+                                        result.reordered_skills[cat.category],
+                                    )
+                                )
+                                reorder_decision = result.reorder_accepted.get(
+                                    cat.category
+                                )
+                                accepted = not (in_reorder and reorder_decision is False)
                             # Compare against unmarked text — variant-aware
                             # (case, punctuation, and known pairs like
                             # "HTML"/"HTML5" or "Git"/"GitHub"), re-checked
@@ -1231,10 +1456,68 @@ class TailoringService:
                             reordered = dedupe_skill_names(
                                 list(result.reordered_skills[cat.category])
                             )
+                            # A skill the user explicitly rejected as an
+                            # ADDITION must not sneak back in just because
+                            # the separate reorder list also happens to
+                            # include it — additions/reorders are tracked
+                            # independently, so accepting a reorder says
+                            # nothing about a specific addition decision.
+                            # Only filters genuinely-new items; a skill that
+                            # was already on the resume before tailoring
+                            # stays regardless of any addition rejection.
+                            # Variant-aware on both sides in case the
+                            # spelling in the reorder list doesn't exactly
+                            # match how the addition was rejected.
+                            rejected_additions = [
+                                key.split(":", 1)[1]
+                                for key, accepted in result.additions_accepted.items()
+                                if not accepted
+                                and key.startswith(f"{cat.category}:")
+                            ]
+                            reordered = [
+                                s for s in reordered
+                                if is_duplicate_skill(s, original_skills)
+                                or not is_duplicate_skill(s, rejected_additions)
+                            ]
                             for s in cat.skills:
-                                if not is_duplicate_skill(s, reordered):
+                                # Compare unmarked — "s" may already carry an
+                                # "[LLM]" marker from the additions step just
+                                # above, which would otherwise never match a
+                                # plain entry already in "reordered" (they'd
+                                # only collide later, once the marker is
+                                # stripped for display, as a visible dupe).
+                                if not is_duplicate_skill(s.replace("[LLM]", ""), reordered):
                                     reordered.append(s)
                             cat.skills = reordered
+
+                    # Always clean up the final list, even for categories the
+                    # LLM never touched — a category can already contain
+                    # duplicates from the source resume itself (e.g. "GraphQL"
+                    # listed twice, or "TypeScript" alongside "JavaScript/
+                    # TypeScript"), and those would otherwise pass through
+                    # tailoring untouched. Marker-aware so a "[LLM]"-tagged
+                    # addition and a plain entry for the same skill collapse
+                    # into one instead of surviving as look-alike duplicates.
+                    cat.skills = _dedupe_marked_skills(cat.skills)
+
+                # Cross-category cleanup: every check above only compared a
+                # category against itself, so the same skill could still be
+                # claimed by two different buckets (e.g. "GraphQL" added to
+                # both "Technologies" and "Concepts" by the two independent
+                # LLM calls, each blind to what the other — or any other
+                # category — decided). Walk the whole section once, keeping
+                # a running set of what's already been claimed; first
+                # category in the resume's own order wins.
+                claimed: list[str] = []
+                for cat in section.skill_categories:
+                    kept = []
+                    for s in cat.skills:
+                        plain = s.replace("[LLM]", "")
+                        if is_duplicate_skill(plain, claimed):
+                            continue
+                        kept.append(s)
+                        claimed.append(plain)
+                    cat.skills = kept
 
         if fit_skills:
             self._fit_skills_to_line(new_ir, result)
