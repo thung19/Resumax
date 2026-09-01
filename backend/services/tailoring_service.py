@@ -233,6 +233,30 @@ def _enforce_verb_variety(result: TailoringResult, measurer) -> None:
             )
 
 
+def _flag_if_still_overflowing(change: BulletChange, measurer) -> None:
+    """After giving up on trimming a bullet (batch trim exhausted its 3
+    rounds), check whether whatever text got shipped actually fits one
+    line.
+
+    Every "give up" branch in _batch_trim_overflows used to
+    unconditionally revert to original_text with no check that the
+    original itself fits — a bullet whose original text was already
+    borderline/overflowing in the source document (or became so under
+    an inflated calibrated char-cap) could ship still wrapping to a
+    second line, with the only evidence being a debug_log line easy to
+    miss. This surfaces it directly on the bullet's own `reason`, which
+    is what the accept/reject review UI actually shows the user.
+    """
+    if measurer is None:
+        return
+    if not measurer.measure(change.tailored_text).fits_one_line:
+        change.reason = (
+            (change.reason or "").rstrip(" —")
+            + " — still may wrap to a second line; could not fit within "
+            "the character budget after 3 trim attempts"
+        ).strip(" —")
+
+
 class TailoringService:
     """Orchestrate resume tailoring with unified LLM pipeline."""
 
@@ -666,6 +690,7 @@ class TailoringService:
                         change.tailored_text = change.original_text
                         change.action = "keep"
                         change.reason = "Rewrite too long, trim failed"
+                        _flag_if_still_overflowing(change, measurer)
                     else:
                         still_overflowing.append(change)
                         # Track failure for retry: LLM returned nothing
@@ -694,6 +719,7 @@ class TailoringService:
                     change.tailored_text = change.original_text
                     change.action = "keep"
                     change.reason = "Rewrite too long, trim failed"
+                    _flag_if_still_overflowing(change, measurer)
                     if not is_final:
                         # Track failure for retry: validation failed
                         failure_history[change.bullet_id] = {
@@ -742,6 +768,7 @@ class TailoringService:
                         change.tailored_text = change.original_text
                         change.action = "keep"
                         change.reason = "Rewrite too long, trim dropped required keywords"
+                        _flag_if_still_overflowing(change, measurer)
                     else:
                         still_overflowing.append(change)
                         failure_history[change.bullet_id] = {
@@ -763,6 +790,7 @@ class TailoringService:
                         change.tailored_text = change.original_text
                         change.action = "keep"
                         change.reason = "Rewrite too long, trim failed"
+                        _flag_if_still_overflowing(change, measurer)
                     else:
                         still_overflowing.append(change)
                         # Track failure for retry: made no progress
@@ -782,13 +810,23 @@ class TailoringService:
                         f"{trim_m.rendered_width_pt:.0f}pt"
                     )
                     if is_final:
+                        # Unlike the other give-up branches, `trimmed`
+                        # here already passed fabrication validation
+                        # (line ~711 above) AND is strictly shorter than
+                        # original_text (guaranteed by the `elif
+                        # len(trimmed) >= len(original_text)` branch
+                        # above not having matched) — reverting to the
+                        # longer, MORE-overflowing original would be
+                        # strictly worse for layout while gaining
+                        # nothing. Keep the shorter, validated attempt.
                         result.debug_log.append(
-                            f"REVERTED {change.bullet_id}: "
-                            f"still overflows after 3 rounds"
+                            f"KEPT PARTIAL TRIM {change.bullet_id}: "
+                            f"{len(trimmed)} chars, still overflows after "
+                            f"3 rounds but is shorter than the {len(original_text)}-char original"
                         )
-                        change.tailored_text = change.original_text
-                        change.action = "keep"
-                        change.reason = "Rewrite too long, trim failed"
+                        change.tailored_text = trimmed
+                        change.reason = (change.reason or "") + " (partially trimmed, could not fully fit)"
+                        _flag_if_still_overflowing(change, measurer)
                     else:
                         still_overflowing.append(change)
                         # Track failure for retry: still overflowing despite progress

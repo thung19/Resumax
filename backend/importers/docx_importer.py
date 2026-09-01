@@ -144,29 +144,90 @@ class ParagraphFormatting:
         self.is_empty: bool = True
 
 
-def _extract_run_formatting(r_elem: etree._Element) -> dict:
-    """Extract formatting from a single w:r element."""
+def _extract_run_formattings(r_elem: etree._Element) -> list[dict]:
+    """Extract formatting from a single w:r element, split at tab
+    boundaries into one dict per text/tab segment, in document order.
+
+    A single OOXML <w:r> can legally contain tabs and text in any
+    sequence — e.g. <w:t>Acme Corp</w:t><w:tab/> (text-then-tab, exactly
+    what Word writes when you type a company name, hit Tab, and keep
+    the same formatting) just as easily as <w:tab/><w:t>date</w:t>
+    (tab-then-text). The previous version of this function concatenated
+    all text from every <w:t> child and separately counted tabs with no
+    positional information, so _split_left_right (which assumes a run's
+    text always comes AFTER any tabs in that run) silently glued the
+    text-then-tab case onto whatever followed instead of ending the left
+    column there — e.g. "Acme Corp" + tab in one run, followed by a date
+    in the next run, collapsed into "Acme CorpJun 2020 - Aug 2021" with
+    no way to recover the date. Splitting into ordered segments here,
+    each holding either pure text or a single pure tab, lets
+    _split_left_right's existing per-segment tab_count check work
+    correctly regardless of which order Word happened to write things in.
+
+    <w:br/> (manual line break) is also handled here: it doesn't start a
+    new column the way a tab does, but leaving it out entirely (the
+    prior behavior) silently glues the text before and after it together
+    with no separator at all, which can join two unrelated words. It's
+    represented as a space in the accumulated text instead — an
+    imperfect but safe stand-in that at least prevents word-gluing,
+    since none of this module's paragraph-splitting logic has a real
+    concept of an in-paragraph line break to preserve properly.
+    """
     rPr = r_elem.find(qn("w:rPr"))
-    run_info = {
-        "text": "",
-        "bold": False,
-        "italic": False,
-        "underline": False,
-        "font_family": None,
-        "font_size_pt": None,
-        "color": None,
-        "small_caps": False,
-    }
 
-    # Collect text from w:t elements
-    for t in r_elem.findall(qn("w:t")):
-        run_info["text"] += t.text or ""
+    def base_info() -> dict:
+        info = {
+            "text": "",
+            "tab_count": 0,
+            "bold": False,
+            "italic": False,
+            "underline": False,
+            "font_family": None,
+            "font_size_pt": None,
+            "color": None,
+            "small_caps": False,
+        }
+        _apply_run_properties(info, rPr)
+        return info
 
-    # Count tabs
-    run_info["tab_count"] = len(r_elem.findall(qn("w:tab")))
+    pieces: list[dict] = []
+    text_buf: list[str] = []
 
+    def flush_text() -> None:
+        if text_buf:
+            info = base_info()
+            info["text"] = "".join(text_buf)
+            pieces.append(info)
+            text_buf.clear()
+
+    for child in r_elem:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "t":
+            text_buf.append(child.text or "")
+        elif tag == "br":
+            text_buf.append(" ")
+        elif tag == "tab":
+            flush_text()
+            info = base_info()
+            info["tab_count"] = 1
+            pieces.append(info)
+    flush_text()
+
+    if not pieces:
+        # No text/tab/br content at all (e.g. a bare formatting run) —
+        # keep prior behavior of emitting one empty entry so callers
+        # that assume one dict per <w:r> aren't broken by an empty list.
+        pieces.append(base_info())
+
+    return pieces
+
+
+def _apply_run_properties(run_info: dict, rPr: Optional[etree._Element]) -> None:
+    """Fill in font/size/bold/italic/etc. on `run_info` from a shared
+    w:rPr element — factored out of _extract_run_formattings so every
+    split piece of a run gets identical formatting."""
     if rPr is None:
-        return run_info
+        return
 
     # Font
     rFonts = rPr.find(qn("w:rFonts"))
@@ -210,8 +271,6 @@ def _extract_run_formatting(r_elem: etree._Element) -> dict:
     smallCaps = rPr.find(qn("w:smallCaps"))
     if smallCaps is not None:
         run_info["small_caps"] = True
-
-    return run_info
 
 
 def _extract_paragraph_formatting(
@@ -338,9 +397,9 @@ def _extract_paragraph_formatting(
     runs = []
     full_text_parts = []
     for r in p_elem.findall(qn("w:r")):
-        run_info = _extract_run_formatting(r)
-        runs.append(run_info)
-        full_text_parts.append(run_info["text"])
+        for run_info in _extract_run_formattings(r):
+            runs.append(run_info)
+            full_text_parts.append(run_info["text"])
 
     fmt.runs = runs
     fmt.text = "".join(full_text_parts).strip()
@@ -1228,9 +1287,21 @@ class DocxImporter:
         if p.has_numbering or text.startswith("•") or text.startswith("-") or text.startswith("–"):
             return "bullet"
 
+        # Bold text with tabs (company/date row) — computed before the
+        # skills-row colon check below, since it's used there too.
+        has_tabs = any(r.get("tab_count", 0) > 0 for r in p.runs)
+
         # Skills/label row: "Label: value, value, value" pattern (even if bold)
-        # Detect this BEFORE entry_header to avoid misclassifying skills rows
-        if ":" in text:
+        # Detect this BEFORE entry_header to avoid misclassifying skills rows.
+        # Excludes tab-separated lines: a real skills row is a single run of
+        # "Label: value, value" with no columns, but an entry header whose
+        # company/project name happens to contain a colon (e.g. "Acme Inc:
+        # A Case Study", "Client: Big Corp") still has its date right-tabbed
+        # on the same line, and would otherwise falsely match this pattern —
+        # corrupting the entry (company/dates lost, bullets silently
+        # reattached under a fabricated header) rather than just mislabeling
+        # a skills line.
+        if ":" in text and not has_tabs:
             colon_pos = text.index(":")
             label = text[:colon_pos].strip()
             # Short label (1-3 words) followed by comma-separated values
@@ -1239,8 +1310,6 @@ class DocxImporter:
                 if "," in remainder or len(remainder.split()) >= 2:
                     return "skills_row"
 
-        # Bold text with tabs (company/date row)
-        has_tabs = any(r.get("tab_count", 0) > 0 for r in p.runs)
         if p.bold and has_tabs:
             return "entry_header"
 
@@ -1367,9 +1436,17 @@ class DocxImporter:
 
         if bold_segments:
             result["company"] = bold_segments[0]
-            # Check remaining segments for dates
+            # Check remaining segments for dates. Word-boundary guarded —
+            # unbounded, this matched "mar" inside "SmartNote", "aug"
+            # inside "August Industries", "present" inside
+            # "Presentation Skills", etc., misfiling a location or
+            # company-name segment as a date. Matches the DATE_RE pattern
+            # already fixed for this exact reason in docx_renderer.py.
             for seg in bold_segments[1:]:
-                if re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|present|\d{4})", seg, re.I):
+                if re.search(
+                    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|present)\b|\b\d{4}\b",
+                    seg, re.I,
+                ):
                     result["start_date"] = self._extract_start_date(seg)
                     result["end_date"] = self._extract_end_date(seg)
 
@@ -1821,7 +1898,17 @@ class DocxImporter:
         """Detect section type from title text."""
         title_lower = title.lower().strip()
 
-        if any(kw in title_lower for kw in ["experience", "work", "employment"]):
+        # "work" is checked with a word boundary, not a plain substring —
+        # unbounded it matched inside "Coursework" (misfiling an
+        # education section as experience), "Networking" and "Framework
+        # Proficiencies" (misfiling a skills section). "experience" and
+        # "employment" are long/specific enough not to need the same
+        # guard in practice.
+        if (
+            "experience" in title_lower
+            or "employment" in title_lower
+            or re.search(r"\bwork\b", title_lower)
+        ):
             return SectionType.EXPERIENCE
         if any(kw in title_lower for kw in ["education", "academic"]):
             return SectionType.EDUCATION
