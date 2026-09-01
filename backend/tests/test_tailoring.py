@@ -183,6 +183,158 @@ class TestAllowedTerms:
         assert result.valid
 
 
+# --- Regression: fabrication safety-net holes found by a proactive audit ---
+# _check_new_technologies' \b-based regex could never match a term ending
+# in punctuation ("c#", "c++") against following whitespace, since \b needs
+# a word/non-word transition and both sides are non-word there -- the
+# check was structurally dead code for those two extremely common
+# languages. _check_fabricated_metrics separately exempted any fabricated
+# number 10-or-under, and only ever compared bare digit identity with no
+# concept of what a number was attached to.
+
+class TestCPlusPlusAndCSharpFabricationCaught:
+    def test_fabricated_csharp_rejected(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built internal tools for the data team using Python scripts.",
+            tailored_text="Built internal tools for the data team using C# and Python scripts.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("c#" in issue.lower() for issue in result.issues)
+
+    def test_fabricated_cpp_rejected(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built internal tools for the data team using Python scripts.",
+            tailored_text="Built internal tools for the data team using C++ and Python scripts.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("c++" in issue.lower() for issue in result.issues)
+
+    def test_genuinely_present_csharp_still_allowed(self):
+        # The fix must not become "always reject C#/C++" -- it should
+        # still pass when genuinely present in source.
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built a C# desktop application for internal use.",
+            tailored_text="Engineered a C# desktop application streamlining internal workflows.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+
+
+class TestSmallFabricatedNumbersCaught:
+    def test_fabricated_team_size_under_eleven_rejected(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Led a project to migrate the reporting service.",
+            tailored_text="Led a team of 8 engineers to migrate the reporting service.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("8" in issue for issue in result.issues)
+
+    def test_fabricated_multiplier_under_eleven_rejected(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Migrated the reporting service to a new pipeline.",
+            tailored_text="Migrated the reporting service, cutting deploy time by 9x.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("9x" in issue for issue in result.issues)
+
+    def test_genuine_small_number_from_source_still_allowed(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Led a team of 4 engineers on the migration.",
+            tailored_text="Directed a team of 4 engineers through the service migration.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+
+
+class TestMetricUnitMismatchCaught:
+    def test_percent_claim_not_validated_by_unrelated_bare_number(self):
+        """A number appearing anywhere in source for something unrelated
+        must not validate a differently-unitted, fabricated claim built
+        from the same digits."""
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Managed a support queue handling 40 tickets per week.",
+            tailored_text="Improved system reliability, boosting uptime by 40%.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("40%" in issue for issue in result.issues)
+
+    def test_genuine_percent_claim_from_source_still_allowed(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Improved system reliability, boosting uptime by 40%.",
+            tailored_text="Increased platform reliability, lifting uptime 40%.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+
+    def test_number_with_letter_suffix_like_250m_still_extracted(self):
+        # Regression guard: an earlier version of this fix required a
+        # word-boundary after the digits, which broke extraction of
+        # numbers immediately followed by a letter unit (e.g. "$250M")
+        # since neither side of that boundary is a word/non-word
+        # transition-free zone. Dropping "$250M" entirely from a rewrite
+        # must still warn as a preservation loss, not go unnoticed.
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Processed $250M in portfolios reducing risk by 15%",
+            tailored_text="Processed portfolios and reduced risk significantly",
+            action="rewrite",
+        )
+        result = validator.validate(
+            change, [{"id": "f1", "text": "Processed $250M in portfolios, reduced risk by 15%"}],
+        )
+        assert result.valid
+        assert any("250" in w for w in result.metric_warnings)
+
+
+class TestExpandedTechTerms:
+    """A handful of common technologies confirmed absent from TECH_TERMS
+    -- previously structurally undetectable as fabrications, since
+    _check_new_technologies only ever tests membership in that set."""
+
+    @pytest.mark.parametrize("tech", ["SQL", "Spark", "Airflow", "Grafana", "Snowflake"])
+    def test_fabricated_technology_now_caught(self, tech):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built internal tools for the data team.",
+            tailored_text=f"Built internal tools using {tech} for the data team.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any(tech.lower() in issue.lower() for issue in result.issues)
+
+
 # --- Test: Matcher direct scoring (no IMPLIES inflation) ---
 
 class TestMatcherScoring:
