@@ -335,6 +335,103 @@ class TestExpandedTechTerms:
         assert any(tech.lower() in issue.lower() for issue in result.issues)
 
 
+# --- Regression: false positives that reverted legitimate rewrites ---
+# Found by the same audit as the holes above. Both are the opposite
+# failure mode: the safety net was too strict, rejecting a purely
+# cosmetic, correct rewrite as if it were fabrication.
+
+class TestCompoundSpellingNotFalsePositive:
+    def test_reactjs_to_react_reformat_allowed(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built UI components using ReactJS for the dashboard.",
+            tailored_text="Built React UI components for the dashboard.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+
+    def test_nodejs_to_node_reformat_allowed(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built a backend service using NodeJS and Express.",
+            tailored_text="Built a Node backend service using Express.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+
+    def test_genuinely_different_framework_still_rejected(self):
+        # The fix must not become "any *js suffix is fine" -- a
+        # different, unrelated framework is still a fabrication.
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Built UI components using ReactJS for the dashboard.",
+            tailored_text="Built Vue UI components for the dashboard.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("vue" in issue.lower() for issue in result.issues)
+
+
+class TestScaleAbbreviationNotFalsePositive:
+    def test_250k_reformat_of_250000_allowed(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Processed 250,000 transactions per day.",
+            tailored_text="Processed 250K transactions per day.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+        assert result.metric_warnings == []
+
+    def test_reverse_direction_also_allowed(self):
+        # Original abbreviated, rewrite expands -- same equivalence,
+        # opposite direction.
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Processed 250K transactions per day.",
+            tailored_text="Processed 250,000 transactions per day.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert result.valid
+        assert result.metric_warnings == []
+
+    def test_genuinely_fabricated_scale_number_still_rejected(self):
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Processed transactions for the billing platform.",
+            tailored_text="Processed 250K transactions for the billing platform.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+        assert any("250k" in issue.lower() for issue in result.issues)
+
+    def test_percent_suffix_still_not_conflated_with_scale_equivalence(self):
+        # Regression guard: %/x suffixes must stay excluded from the
+        # k/m/b numeric-equivalence path -- "40%" is a different claim
+        # from bare "40", not a formatting variant of the same number.
+        validator = ClaimValidator()
+        change = BulletChange(
+            bullet_id="b1",
+            original_text="Managed a support queue handling 40 tickets per week.",
+            tailored_text="Improved system reliability, boosting uptime by 40%.",
+            action="rewrite",
+        )
+        result = validator.validate(change, [{"id": "f1", "text": change.original_text}])
+        assert not result.valid
+
+
 # --- Test: Matcher direct scoring (no IMPLIES inflation) ---
 
 class TestMatcherScoring:

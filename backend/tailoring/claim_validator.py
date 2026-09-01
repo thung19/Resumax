@@ -99,12 +99,15 @@ TECH_TERMS = {
 }
 
 
-_METRIC_NUMBER_RE = re.compile(r"(?<!\w)(\d[\d,]*)([%x])?", re.IGNORECASE)
+_METRIC_NUMBER_RE = re.compile(r"(?<!\w)(\d[\d,]*(?:\.\d+)?)([%x]|k|m|b)?", re.IGNORECASE)
+_SCALE_SUFFIXES = {"k", "m", "b"}
+_SCALE_MULTIPLIER = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
 
 
 def _extract_metric_tokens(text: str) -> set[str]:
     """Extract number tokens for fabrication/preservation checks, keeping
-    an immediately-attached %/x suffix (if present) as part of the token.
+    an immediately-attached %/x/k/m/b suffix (if present) as part of the
+    token.
 
     Without this, a bare-digit match anywhere in the source validated
     ANY claim built from the same digits regardless of what they meant —
@@ -118,6 +121,11 @@ def _extract_metric_tokens(text: str) -> set[str]:
     "a team of 8") still only compare bare digits — properly verifying
     that kind of claim needs real context/NLP understanding, out of
     scope for this thin, deterministic safety net.
+
+    k/m/b are handled differently from %/x once tokens reach
+    _metric_numeric_value(): unlike a %/x suffix (which changes what's
+    being *claimed*, not just how a magnitude is written), "250k" and
+    "250000" are the exact same number — see _metric_numeric_value.
     """
     tokens = set()
     for m in _METRIC_NUMBER_RE.finditer(text):
@@ -125,6 +133,40 @@ def _extract_metric_tokens(text: str) -> set[str]:
         suffix = (m.group(2) or "").lower()
         tokens.add(f"{digits}{suffix}")
     return tokens
+
+
+def _metric_numeric_value(token: str) -> Optional[float]:
+    """Numeric value of a metric token, expanding a k/m/b scale suffix
+    (e.g. "250k" -> 250000.0) so it can be compared against a
+    differently-formatted but equal value (e.g. bare "250000").
+
+    Returns None for %/x-suffixed tokens (a "40%" claim is not
+    equivalent to a bare "40" just because they'd expand to the same
+    number — the unit changes the meaning, not just the formatting) or
+    anything that isn't a plain number.
+    """
+    m = re.match(r"^(\d+(?:\.\d+)?)([kmb])?$", token, re.IGNORECASE)
+    if not m:
+        return None
+    value = float(m.group(1))
+    suffix = m.group(2)
+    if suffix:
+        value *= _SCALE_MULTIPLIER[suffix.lower()]
+    return value
+
+
+def _metric_token_matches(token: str, other_tokens: set[str]) -> bool:
+    """True if `token` is present in `other_tokens`, either exactly or
+    as a k/m/b-equivalent value (e.g. "250k" matches "250000" and vice
+    versa) — see _metric_numeric_value for why %/x tokens don't get this
+    equivalence.
+    """
+    if token in other_tokens:
+        return True
+    value = _metric_numeric_value(token)
+    if value is None:
+        return False
+    return any(_metric_numeric_value(t) == value for t in other_tokens)
 
 
 class ClaimValidator:
@@ -194,9 +236,21 @@ class ClaimValidator:
             pattern = rf"(?<!\w){re.escape(tech)}(?!\w)"
 
             in_rewrite = bool(re.search(pattern, rewritten, re.IGNORECASE))
-            in_source = bool(re.search(pattern, source, re.IGNORECASE))
+            if not in_rewrite:
+                continue
 
-            if in_rewrite and not in_source:
+            in_source = bool(re.search(pattern, source, re.IGNORECASE))
+            if not in_source:
+                # Same technology, common compound spelling with no
+                # separator (e.g. source says "ReactJS", rewrite says
+                # "React") -- a pure word-boundary match can never
+                # bridge this, since there's no boundary between "react"
+                # and "js" in "reactjs". Confirmed false-positive
+                # reverting a purely cosmetic, correct rewrite.
+                compound_pattern = rf"(?<!\w){re.escape(tech)}\.?js(?!\w)"
+                in_source = bool(re.search(compound_pattern, source, re.IGNORECASE))
+
+            if not in_source:
                 result.issues.append(
                     f"[REJECT] Technology '{tech}' appears in rewrite "
                     "but not in source facts"
@@ -214,7 +268,14 @@ class ClaimValidator:
             # "9x faster" is just as much a fabrication as a fabricated
             # large one — the prior ">10" threshold let any invented
             # number 10-or-under through with zero check.
-            if token not in source_tokens:
+            #
+            # _metric_token_matches (not a plain "in") also accepts a
+            # k/m/b-equivalent value — e.g. rewrite "250K" against source
+            # "250,000" — since those are the same number just formatted
+            # differently, not a new claim. Confirmed false-positive:
+            # this kind of reformat used to get rejected as if it
+            # fabricated a new metric.
+            if not _metric_token_matches(token, source_tokens):
                 result.issues.append(
                     f"[REJECT] Metric '{token}' appears in rewrite "
                     "but not in source facts"
@@ -236,7 +297,12 @@ class ClaimValidator:
         for token in orig_tokens:
             digits = re.sub(r"\D", "", token)
             if digits and int(digits) > 1:
-                if token in rewrite_tokens:
+                # k/m/b-equivalent match (e.g. original "250,000" vs
+                # rewrite "250K") counts as preserved — same fix as
+                # _check_fabricated_metrics, applied here so a
+                # reformatted-not-dropped number doesn't ALSO trigger a
+                # spurious "dropped metric" warning.
+                if _metric_token_matches(token, rewrite_tokens):
                     preserved += 1
                 else:
                     result.metric_warnings.append(
