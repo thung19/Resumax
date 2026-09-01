@@ -336,8 +336,16 @@ class TailoringEngine:
         bullets: list[dict],
         is_retry: bool = False,
         failure_history: Optional[dict[str, dict]] = None,
+        avoid_leading_verbs: Optional[list[str]] = None,
     ) -> dict[str, Optional[str]]:
         """Trim multiple overflowing bullets in a single LLM call.
+
+        avoid_leading_verbs: leading verbs already used by OTHER bullets
+            elsewhere in the resume (not part of this batch) — the model
+            still sees only this batch's bullets, so without this it has
+            no way to know a word like "Built" is already used 3 times
+            among bullets it never sees, and under length pressure tends
+            to converge on the same short, safe verb for everything.
 
         bullets: list of dicts with keys:
             - bullet_id: str
@@ -406,6 +414,23 @@ class TailoringEngine:
 
         bullet_list_xml = "<bullets>\n" + "".join(xml_entries) + "</bullets>"
 
+        # Verb-variety note: the model only ever sees this batch's
+        # bullets, so without explicitly telling it what's already used
+        # elsewhere in the resume, it has no way to avoid converging on
+        # the same short "safe" verb (e.g. "Built") that other,
+        # non-overflowing bullets already use.
+        verb_variety_note = ""
+        if avoid_leading_verbs:
+            verbs_list = ", ".join(sorted({v for v in avoid_leading_verbs if v}))
+            if verbs_list:
+                verb_variety_note = (
+                    "\n\nVERB VARIETY: Other bullets elsewhere in this resume "
+                    f"already start with: {verbs_list}. Don't start any "
+                    "trimmed bullet below with one of those words, and don't "
+                    "reuse the same opening word across bullets in this batch "
+                    "either — pick a different strong action verb for each one."
+                )
+
         # Build retry hint with specific failure context
         retry_hint = ""
         if is_retry:
@@ -416,7 +441,11 @@ class TailoringEngine:
                     "They are STILL TOO LONG. You MUST be more aggressive with restructuring."
                 )
 
-        user_msg = BATCH_TRIM_USER_V2_XML.format(bullet_list_xml=bullet_list_xml) + retry_hint
+        user_msg = (
+            BATCH_TRIM_USER_V2_XML.format(bullet_list_xml=bullet_list_xml)
+            + verb_variety_note
+            + retry_hint
+        )
 
         try:
             client = anthropic.Anthropic(api_key=api_key)

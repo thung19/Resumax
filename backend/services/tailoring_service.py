@@ -580,6 +580,19 @@ class TailoringService:
         if not overflow_changes:
             return
 
+        # Leading verbs already used by bullets NOT in this overflow batch
+        # (i.e. bullets that already fit and won't be touched here) — the
+        # trim LLM only ever sees the overflowing bullets themselves, so
+        # without this it has no way to know "Built" is already used
+        # elsewhere and tends to converge on it anyway under length
+        # pressure. See prompts.py's VERB VARIETY rule.
+        overflow_ids = {c.bullet_id for c in overflow_changes}
+        existing_leading_verbs = [
+            c.tailored_text.strip().split()[0].strip(",.;:()")
+            for c in result.bullet_changes
+            if c.bullet_id not in overflow_ids and c.tailored_text.strip()
+        ]
+
         trimmer = TailoringEngine()
         full_resume_text = self._build_full_resume_text(ir.content)
         failure_history: dict[str, dict] = {}  # Track failures for retry feedback
@@ -631,6 +644,7 @@ class TailoringService:
                 batch_items,
                 is_retry=(round_num > 0),
                 failure_history=failure_history if round_num > 0 else None,
+                avoid_leading_verbs=existing_leading_verbs,
             )
 
             # Validate each result individually

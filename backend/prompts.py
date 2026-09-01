@@ -201,6 +201,7 @@ CRITICAL RULES:
 3. NEVER fabricate or omit numbers/metrics
 4. ALWAYS return trimmed text (never null, empty, or untrimmed)
 5. MAXIMIZE space: Aim for 90-100% of available chars, not 50%
+6. VARY YOUR VERBS: You'll often be trimming several bullets in one request. Don't let more than one of them start with the same word — under length pressure it's tempting to collapse everything to the shortest safe verb ("Built"), but a resume where every bullet opens the same way reads as generic and repetitive. Rotate through comparable-length synonyms instead (Built/Developed/Created/Engineered/Shipped/Launched/Automated/Streamlined/etc., matched to what the bullet actually describes). The example below outputs "Built" for illustration only — don't treat it as your default answer.
 
 Return ONLY valid JSON with no markdown or explanations."""
 
@@ -219,6 +220,7 @@ CRITICAL RULES (in priority order):
 3. KEEP MANDATORY KEYWORDS: All must_keep items must appear in output
 4. NEVER FABRICATE: Don't add numbers/metrics that weren't there
 5. ALWAYS RETURN TRIMMED: Never null, empty, or untrimmed
+6. VARY LEADING VERBS: no two bullets in this batch should start with the same word — see VERB VARIETY note below if present
 
 BULLETS TO TRIM:
 
@@ -233,8 +235,9 @@ Analysis: Removed "Architected and" (8 chars saved), changed "to handle 10K" to 
 
 AGGRESSIVE REPHRASE (164 → 110 chars):
 Input:  "Developed and tested a Python/SciPy optimization system for portfolio allocation, solving to balance risk, yield, and correlation"
-Output: "Built Python optimization system balancing portfolio risk, yield, correlation"
-Analysis: Removed "Developed and tested" → "Built", removed "for portfolio allocation", restructured clauses, removed "solving to" = 105 chars (uses 95% of 110-char limit)
+Output: "Engineered Python optimization system balancing portfolio risk, yield, correlation"
+Analysis: Removed "Developed and tested" → "Engineered", removed "for portfolio allocation", restructured clauses, removed "solving to" = 82 chars (well under the 110-char limit here — a real trim should keep closer to 90-100% utilization than this example does; the point of this example is the restructuring technique, not the exact length)
+Note: the opening verbs in these two examples ("Deployed", "Engineered") are illustrations, not defaults — pick whichever verb best fits each bullet's actual content, and never let it collapse to the same word across bullets (see VERB VARIETY rule above).
 
 REPHRASING CHECKLIST (when simple trim fails):
 □ Remove ALL adjectives: scalable, robust, modular, seamless, efficient, innovative, successful
@@ -244,6 +247,7 @@ REPHRASING CHECKLIST (when simple trim fails):
 □ Merge concepts: "optimization for A, B, C balance" instead of "optimization system for allocation solving balance"
 □ Remove filler words ("to", "by", "with") only when the sentence's meaning is fully unchanged. Do NOT drop a connector ("for", "through") if that would reorder which noun modifies which (e.g. "QA tool for fMRI datasets" ≠ "fMRI QA datasets") — that's a meaning change, not a trim.
 □ Never drop a must_keep item while doing any of the above — it is not filler, no matter how aggressive the rephrase gets.
+□ Don't reuse the same opening verb across multiple bullets in this batch (or ones listed in a VERB VARIETY note, if present) — vary word choice instead of defaulting to whichever verb is shortest.
 
 RETURN FORMAT (JSON only, no markdown):
 
@@ -261,7 +265,8 @@ ENFORCEMENT:
 - MUST NOT exceed char_limit (use validation: len(trimmed_text) <= char_limit)
 - MUST include all must_keep keywords
 - MUST be non-empty
-- If constraint cannot be met, that's an error — rephrase more aggressively"""
+- If constraint cannot be met, that's an error — rephrase more aggressively
+- SHOULD NOT share an opening word with another bullet in this batch (see VERB VARIETY note below, if present)"""
 
 
 BATCH_TRIM_RETRY_HINT_V2_XML = """The previous attempt FAILED to meet character limits. You MUST be MORE AGGRESSIVE.
