@@ -38,3 +38,11 @@ Before implementing a feature:
 After changes:
 - run relevant tests
 - explain architectural decisions
+
+## Git
+
+- Commit as you go — after each distinct fix/feature, not once at the
+  end of a long session. Uncommitted work piling up across sessions is
+  how unrelated changes end up bundled into one unreviewable commit.
+- Never commit anything under `data/` (uploaded resumes, generated IR,
+  resume banks) — it's real user PII and is gitignored for that reason.
