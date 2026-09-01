@@ -652,6 +652,45 @@ class TestEngineJsonParsing:
         for change in parsed["bullet_changes"]:
             assert change.action == "keep"
 
+    def test_duplicate_bullet_id_deduplicated_keeping_last(self):
+        """Regression: nothing constrains the LLM's JSON to unique
+        bullet_ids. A duplicate used to produce two BulletChange entries
+        for the same bullet, and downstream consumers disagreed on which
+        one "won" — apply_tailoring's dict-building kept the last, but
+        POST /tailor/{id}/accept updated only the first list entry's
+        accepted/resolved flags. Deduping at the source (keeping the
+        last occurrence, matching what apply_tailoring already assumed)
+        means every consumer sees and agrees on the same single entry.
+        """
+        from backend.tailoring.tailoring_engine import TailoringEngine
+
+        engine = TailoringEngine()
+        content = _make_content()
+
+        response = json.dumps({"bullet_changes": [
+            {
+                "bullet_id": "b1", "action": "rewrite",
+                "new_text": "Engineered the payments platform using Python and AWS Lambda.",
+                "reason": "first",
+            },
+            {
+                "bullet_id": "b1", "action": "rewrite",
+                "new_text": "Migrated the legacy payments service to Kubernetes and improved throughput 3x.",
+                "reason": "second",
+            },
+        ]})
+        parsed = engine._parse_response(response, content)
+
+        b1_entries = [c for c in parsed["bullet_changes"] if c.bullet_id == "b1"]
+        assert len(b1_entries) == 1
+        assert b1_entries[0].tailored_text == (
+            "Migrated the legacy payments service to Kubernetes and improved throughput 3x."
+        )
+        # b2/b3 (and the project bullet) weren't mentioned by the LLM at
+        # all -- they should still be filled in as "keep", not affected
+        # by the b1 duplicate.
+        assert len(parsed["bullet_changes"]) == 4
+
 
 class TestTechTermsPresent:
     """`_tech_terms_present` protects pre-existing skill/tech words (not just

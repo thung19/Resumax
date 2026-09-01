@@ -677,8 +677,20 @@ class TailoringEngine:
                 for b in entry.bullets:
                     bullet_texts[b.id] = b.text
 
-        # Parse bullet changes from LLM (only changed bullets)
-        bullet_changes: list[BulletChange] = []
+        # Parse bullet changes from LLM (only changed bullets). Keyed by
+        # bullet_id (last one wins on a duplicate) rather than a plain
+        # list — nothing constrains the LLM's JSON to unique bullet_ids,
+        # and a duplicate used to silently produce two BulletChange
+        # entries for the same bullet. Downstream consumers disagreed on
+        # which one "won": apply_tailoring builds a dict keyed by
+        # bullet_id (last entry wins), while POST /tailor/{id}/accept
+        # updates only the first matching list entry's accepted/resolved
+        # flags — so a user's accept/reject decision on what the review
+        # UI showed them could silently not affect the entry that
+        # actually made it into the rendered resume. Deduping here, once,
+        # at the source, means every consumer sees and agrees on the same
+        # single entry.
+        bullet_changes_by_id: dict[str, BulletChange] = {}
         for item in data.get("bullet_changes", []):
             if not isinstance(item, dict):
                 continue
@@ -697,17 +709,25 @@ class TailoringEngine:
             else:
                 new_text = original
 
-            bullet_changes.append(BulletChange(
+            if bid in bullet_changes_by_id:
+                logger.warning(
+                    f"LLM response has duplicate bullet_id '{bid}' — "
+                    f"keeping the last occurrence"
+                )
+
+            bullet_changes_by_id[bid] = BulletChange(
                 bullet_id=bid,
                 original_text=original,
                 tailored_text=new_text,
                 action=action,
                 target_keywords=item.get("keywords_added", []),
                 reason=item.get("reason", ""),
-            ))
+            )
+
+        bullet_changes: list[BulletChange] = list(bullet_changes_by_id.values())
 
         # Fill in keeps for bullets the LLM didn't mention
-        seen_ids = {c.bullet_id for c in bullet_changes}
+        seen_ids = set(bullet_changes_by_id.keys())
         for bid, btext in bullet_texts.items():
             if bid not in seen_ids:
                 bullet_changes.append(BulletChange(
