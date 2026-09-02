@@ -738,6 +738,14 @@ class DocxRenderer:
                 date = ""
                 if e.start_date and e.end_date:
                     date = f"{e.start_date} \u2013 {e.end_date}"
+                elif e.start_date:
+                    # Currently-employed entries have a start_date and
+                    # no end_date \u2014 this used to render with no date at
+                    # all (pdf_renderer.py and text_renderer.py both
+                    # already fell back correctly here).
+                    date = e.start_date
+                elif e.end_date:
+                    date = e.end_date
                 self._add_lr_para(font, e.company, date, bold=True)
                 self._add_lr_para(font, e.role, e.location or "", italic=True)
                 for b in e.bullets:
@@ -750,10 +758,24 @@ class DocxRenderer:
             for i, e in enumerate(section.project_entries):
                 if i > 0:
                     self._add_empty_para(font)
-                para = self._doc.add_paragraph()
-                self._set_spacing(para, 240, "auto")
-                run = para.add_run(e.name)
-                self._set_run_font(run, font, bold=True)
+                # pdf_renderer.py/text_renderer.py both include the date
+                # range when present \u2014 this fallback never read
+                # start_date/end_date at all, so project dates were
+                # silently absent from this render path.
+                date = ""
+                if e.start_date and e.end_date:
+                    date = f"{e.start_date} \u2013 {e.end_date}"
+                elif e.start_date:
+                    date = e.start_date
+                elif e.end_date:
+                    date = e.end_date
+                if date:
+                    self._add_lr_para(font, e.name, date, bold=True)
+                else:
+                    para = self._doc.add_paragraph()
+                    self._set_spacing(para, 240, "auto")
+                    run = para.add_run(e.name)
+                    self._set_run_font(run, font, bold=True)
                 for b in e.bullets:
                     para = self._doc.add_paragraph()
                     self._set_spacing(para, 240, "auto")
@@ -768,6 +790,37 @@ class DocxRenderer:
                 self._set_run_font(r1, font, bold=True)
                 r2 = para.add_run(", ".join(cat.skills))
                 self._set_run_font(r2, font)
+
+        else:
+            # Certifications/Awards/Publications/Custom sections parse
+            # into GenericEntry, not one of the branches above \u2014 this
+            # had no else at all, so such a section rendered as just its
+            # bare heading with the entry (and any unstructured
+            # raw_lines) entirely dropped.
+            for i, e in enumerate(section.generic_entries):
+                if i > 0:
+                    self._add_empty_para(font)
+                if e.title:
+                    para = self._doc.add_paragraph()
+                    self._set_spacing(para, 240, "auto")
+                    run = para.add_run(e.title)
+                    self._set_run_font(run, font, bold=True)
+                if e.subtitle:
+                    para = self._doc.add_paragraph()
+                    self._set_spacing(para, 240, "auto")
+                    run = para.add_run(e.subtitle)
+                    self._set_run_font(run, font, italic=True)
+                for b in e.bullets:
+                    para = self._doc.add_paragraph()
+                    self._set_spacing(para, 240, "auto")
+                    run = para.add_run(f"\u2022 {b.text}")
+                    self._set_run_font(run, font)
+
+        for line in section.raw_lines:
+            para = self._doc.add_paragraph()
+            self._set_spacing(para, 240, "auto")
+            run = para.add_run(line)
+            self._set_run_font(run, font)
 
     # --- Simple helpers for fallback ---
 
