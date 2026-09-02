@@ -52,7 +52,7 @@ interface TailoringResultData {
 
 interface TailoringReviewProps {
   result: unknown;
-  onAcceptReject: (bulletId: string, accepted: boolean, resolved?: boolean) => void;
+  onAcceptReject: (bulletId: string, accepted: boolean, resolved?: boolean) => Promise<void>;
   onSkillChange?: (changeType: string, category: string, skill: string, accepted: boolean) => void;
   onSkillsAcceptAll?: (accepted: boolean) => void;
   onRedo?: () => void;
@@ -81,8 +81,32 @@ export function TailoringReview({ result, onAcceptReject, onSkillChange, onSkill
   const pending = rewrites.filter((c) => !c.resolved);
   const done = rewrites.filter((c) => c.resolved);
 
+  const [acceptAllLoading, setAcceptAllLoading] = useState(false);
+
   const handleAction = (bulletId: string, accepted: boolean) => {
     onAcceptReject(bulletId, accepted);
+  };
+
+  const handleAcceptAll = async () => {
+    // Sequential, not concurrent -- this used to be
+    // `pending.forEach((c) => handleAction(c.bullet_id, true))`, which
+    // fired every accept request at once with no ordering guarantee.
+    // Since every response independently overwrites the same
+    // tailoringResult (and error) state in page.tsx, that meant: a slow
+    // request resolving after a later one could silently revert the
+    // display to reflect fewer accepts than actually happened, and an
+    // error from one request could be masked by a later success clearing
+    // the error state -- so a genuinely failed accept could show no error
+    // at all. Awaiting each one in turn makes the final state deterministic
+    // and lets a real error surface and stay visible.
+    setAcceptAllLoading(true);
+    try {
+      for (const c of pending) {
+        await onAcceptReject(c.bullet_id, true);
+      }
+    } finally {
+      setAcceptAllLoading(false);
+    }
   };
 
   return (
@@ -367,12 +391,11 @@ export function TailoringReview({ result, onAcceptReject, onSkillChange, onSkill
           )}
           {pending.length > 0 && (
             <button
-              onClick={() => {
-                pending.forEach((c) => handleAction(c.bullet_id, true));
-              }}
-              className="px-2.5 py-1 text-[10px] font-medium bg-muted-green text-muted-green rounded hover:opacity-80"
+              onClick={handleAcceptAll}
+              disabled={acceptAllLoading}
+              className="px-2.5 py-1 text-[10px] font-medium bg-muted-green text-muted-green rounded hover:opacity-80 disabled:opacity-50"
             >
-              Accept all
+              {acceptAllLoading ? "Accepting..." : "Accept all"}
             </button>
           )}
         </div>

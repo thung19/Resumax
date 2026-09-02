@@ -45,6 +45,19 @@ export default function Home() {
   const previewEditsRef = useRef<Record<string, string>>({});
   const [saveEditLoading, setSaveEditLoading] = useState(false);
 
+  // Guards against stale responses clobbering newer state. handleTailor,
+  // handleAcceptReject, handleSkillChange, handleFreeformEdit, and
+  // handleSkillsAcceptAll all independently end with setTailoringResult(),
+  // with no ordering guarantee between them -- e.g. clicking Accept on a
+  // bullet, then immediately clicking Redo before the accept resolves, can
+  // let the accept's response land *after* Redo's and silently overwrite
+  // the fresh redo result with the stale pre-redo one. Every mutating
+  // request grabs the next generation number before firing; a response is
+  // only applied if its generation is still the latest when it resolves.
+  const requestGenRef = useRef(0);
+  const beginRequest = useCallback(() => ++requestGenRef.current, []);
+  const isStale = useCallback((gen: number) => requestGenRef.current !== gen, []);
+
   const handleUpload = useCallback(async (file: File) => {
     setLoading(true);
     setError(null);
@@ -84,6 +97,7 @@ export default function Home() {
   const handleTailor = useCallback(
     async (opts: { jdText: string; useLlm: boolean; enforceOnePage: boolean; oneLineBullets: boolean; enforceSingleLine: boolean; maxBulletChars: number }) => {
       if (!resumeId) return;
+      const gen = beginRequest();
       setLoading(true);
       setError(null);
       setLastTailorOpts(opts);
@@ -108,23 +122,26 @@ export default function Home() {
         }
 
         const data = await res.json();
+        if (isStale(gen)) return;
         setTailoringResult(data);
         setIsTailored(true);
         setShowDiff(true);
         setActiveTab("review");
         setPreviewKey((k) => k + 1);
       } catch (e) {
+        if (isStale(gen)) return;
         setError(e instanceof Error ? e.message : "Tailoring failed");
       } finally {
-        setLoading(false);
+        if (!isStale(gen)) setLoading(false);
       }
     },
-    [resumeId]
+    [resumeId, beginRequest, isStale]
   );
 
   const handleAcceptReject = useCallback(
     async (bulletId: string, accepted: boolean, resolved: boolean = true) => {
       if (!resumeId) return;
+      const gen = beginRequest();
 
       console.log(`[Accept] Sending: bulletId=${bulletId}, accepted=${accepted}, resolved=${resolved}`);
 
@@ -140,7 +157,7 @@ export default function Home() {
         if (!res.ok) {
           const errorData = await res.text();
           console.error(`[Accept] Server error: ${res.status}`, errorData);
-          setError(`Accept failed: ${res.status} - ${errorData}`);
+          if (!isStale(gen)) setError(`Accept failed: ${res.status} - ${errorData}`);
           return;
         }
 
@@ -148,38 +165,43 @@ export default function Home() {
         console.log(`[Accept] Updated result:`, updatedResult);
         console.log(`[Accept] Bullet changes:`, updatedResult.bullet_changes?.length, "items");
 
+        if (isStale(gen)) return;
         setTailoringResult(updatedResult);
         setError(null);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error(`[Accept] Network error:`, errorMsg);
-        setError(`Accept error: ${errorMsg}`);
+        if (!isStale(gen)) setError(`Accept error: ${errorMsg}`);
       }
 
-      setPreviewKey((k) => k + 1);
+      if (!isStale(gen)) setPreviewKey((k) => k + 1);
     },
-    [resumeId]
+    [resumeId, beginRequest, isStale]
   );
 
   const handleSkillChange = useCallback(
     async (changeType: string, category: string, skill: string, accepted: boolean) => {
       if (!resumeId) return;
+      const gen = beginRequest();
       const res = await fetch(`${API}/tailor/${resumeId}/skill`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ change_type: changeType, category, skill, accepted }),
       });
       if (res.ok) {
-        setTailoringResult(await res.json());
+        const data = await res.json();
+        if (isStale(gen)) return;
+        setTailoringResult(data);
       }
-      setPreviewKey((k) => k + 1);
+      if (!isStale(gen)) setPreviewKey((k) => k + 1);
     },
-    [resumeId]
+    [resumeId, beginRequest, isStale]
   );
 
   const handleFreeformEdit = useCallback(
     async (message: string) => {
       if (!resumeId) return;
+      const gen = beginRequest();
       const res = await fetch(`${API}/tailor/${resumeId}/edit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -187,27 +209,31 @@ export default function Home() {
       });
       if (res.ok) {
         const data = await res.json();
+        if (isStale(gen)) return;
         setTailoringResult(data.result);
         setPreviewKey((k) => k + 1);
       }
     },
-    [resumeId]
+    [resumeId, beginRequest, isStale]
   );
 
   const handleSkillsAcceptAll = useCallback(
     async (accepted: boolean) => {
       if (!resumeId) return;
+      const gen = beginRequest();
       const res = await fetch(`${API}/tailor/${resumeId}/skills/accept-all`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ accepted }),
       });
       if (res.ok) {
-        setTailoringResult(await res.json());
+        const data = await res.json();
+        if (isStale(gen)) return;
+        setTailoringResult(data);
       }
-      setPreviewKey((k) => k + 1);
+      if (!isStale(gen)) setPreviewKey((k) => k + 1);
     },
-    [resumeId]
+    [resumeId, beginRequest, isStale]
   );
 
   const handlePreviewEdit = useCallback(
