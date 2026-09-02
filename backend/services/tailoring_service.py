@@ -25,6 +25,7 @@ from typing import Optional
 
 from backend.analysis.job_analyzer import JobAnalyzer
 from backend.analysis.skill_dedup import dedupe_skill_names, is_duplicate_skill
+from backend.config import get_config
 from backend.models.job_description import JobAnalysis
 from backend.models.resume_content import ResumeContent, SectionType
 from backend.models.resume_ir import ResumeIR
@@ -277,10 +278,18 @@ class TailoringService:
         ir: ResumeIR,
         jd: JobAnalysis,
         bank: Optional[ResumeBank] = None,
-        max_bullets_per_entry: int = 4,
+        # Defaults sourced from config.py's LayoutConfig, which the
+        # LAYOUT_MAX_BULLETS/LAYOUT_SINGLE_LINE/LAYOUT_MAX_CHARS env vars
+        # were already documented to control but, before this fix, never
+        # actually reached -- these values were independently hardcoded
+        # literals that happened to match the config defaults. The live
+        # /tailor endpoint (main.py) always passes explicit values from
+        # TailorRequest regardless, so this mainly matters for any other
+        # caller (tests, scripts) that relies on tailor()'s own defaults.
+        max_bullets_per_entry: int = get_config().layout.max_bullets_per_entry,
         one_line_bullets: bool = True,
-        enforce_single_line: bool = True,
-        max_bullet_chars: int = 115,
+        enforce_single_line: bool = get_config().layout.enforce_single_line_bullets,
+        max_bullet_chars: int = get_config().layout.max_chars_per_line,
     ) -> TailoringResult:
         """Run the tailoring pipeline."""
         if bank is None:

@@ -38,6 +38,7 @@ from backend.models.job_description import (
 )
 from backend.prompts import JD_ANALYSIS_SYSTEM_V1, JD_ANALYSIS_USER_TEMPLATE
 from backend.analysis.skill_dedup import find_redundant_variants
+from backend.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +142,12 @@ def _find_matches(text_lower: str, dictionary: set[str]) -> list[str]:
 class JobAnalyzer:
     """Hybrid LLM + deterministic job description analyzer."""
 
-    def __init__(self, use_llm: bool = True, model: str = "claude-haiku-4-5-20251001"):
+    def __init__(self, use_llm: bool = True, model: Optional[str] = None):
         self._use_llm = use_llm
-        self._model = model
+        # Was previously always the hardcoded literal default, even when
+        # LLM_ANALYSIS_MODEL was set -- config.py's LLMConfig.analysis_model
+        # was read from that env var but never wired to any call site.
+        self._model = model or get_config().llm.analysis_model
         self._llm_used = False
         self._llm_error: Optional[str] = None
 
@@ -486,7 +490,7 @@ class JobAnalyzer:
 
         response = client.messages.create(
             model=self._model,
-            max_tokens=4096,
+            max_tokens=get_config().llm.analysis_max_tokens,
             system=JD_ANALYSIS_SYSTEM_V1,
             messages=[{"role": "user", "content": user_msg}],
         )

@@ -140,8 +140,10 @@ class LLMConfig:
     # Max tokens for tailoring pass
     tailoring_max_tokens: int = 4096
 
-    # Max tokens for JD analysis
-    analysis_max_tokens: int = 2048
+    # Max tokens for JD analysis. Matches the value the analysis call site
+    # actually used before this field was wired up (LLM_ANALYSIS_MAX_TOKENS
+    # was previously read here but never applied to any call).
+    analysis_max_tokens: int = 4096
 
     # Timeout for LLM calls (seconds)
     request_timeout: int = 60
@@ -163,7 +165,7 @@ class LLMConfig:
                 os.environ.get("LLM_TAILORING_MAX_TOKENS", "4096")
             ),
             analysis_max_tokens=int(
-                os.environ.get("LLM_ANALYSIS_MAX_TOKENS", "2048")
+                os.environ.get("LLM_ANALYSIS_MAX_TOKENS", "4096")
             ),
             request_timeout=int(
                 os.environ.get("LLM_REQUEST_TIMEOUT", "60")

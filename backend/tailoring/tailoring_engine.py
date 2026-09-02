@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from backend.config import get_config
 from backend.models.job_description import JobAnalysis
 from backend.models.resume_content import ResumeContent, SectionType
 from backend.models.tailoring import BulletChange, ResumeBank
@@ -157,9 +158,19 @@ class TailoringEngine:
     """Unified LLM tailoring pass."""
 
     def __init__(self, model: Optional[str] = None):
-        self._model = model or os.environ.get(
-            "ANTHROPIC_MODEL", "claude-sonnet-4-6"
+        # Precedence: explicit constructor arg > ANTHROPIC_MODEL env var
+        # (kept for backward compatibility with existing deployments that
+        # already set it) > the documented LLM_TAILORING_MODEL config knob
+        # (config.py's LLMConfig, previously read but never actually wired
+        # to any call site -- deployers setting LLM_TAILORING_MODEL saw no
+        # effect). Defaults agree ("claude-sonnet-4-6") so behavior is
+        # unchanged for anyone not setting either env var.
+        self._model = (
+            model
+            or os.environ.get("ANTHROPIC_MODEL")
+            or get_config().llm.tailoring_model
         )
+        self._max_tokens = get_config().llm.tailoring_max_tokens
 
     def tailor(
         self,
@@ -226,7 +237,7 @@ class TailoringEngine:
         try:
             response = client.messages.create(
                 model=self._model,
-                max_tokens=4096,
+                max_tokens=self._max_tokens,
                 system=TAILORING_SYSTEM_V2,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -301,7 +312,7 @@ class TailoringEngine:
         try:
             response = client.messages.create(
                 model=self._model,
-                max_tokens=4096,
+                max_tokens=self._max_tokens,
                 system=FREEFORM_EDIT_SYSTEM_V1,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -451,6 +462,10 @@ class TailoringEngine:
             client = anthropic.Anthropic(api_key=api_key)
             response = client.messages.create(
                 model=self._model,
+                # Intentionally a smaller, fixed budget than
+                # self._max_tokens (config.llm.tailoring_max_tokens) --
+                # trimming only returns short per-bullet text, not a full
+                # resume rewrite, so it doesn't need the larger budget.
                 max_tokens=2048,
                 system=BATCH_TRIM_SYSTEM_V2_XML,
                 messages=[{"role": "user", "content": user_msg}],
@@ -604,6 +619,8 @@ class TailoringEngine:
         try:
             response = client.messages.create(
                 model=self._model,
+                # See batch_trim_bullets above: skill optimization also
+                # returns a short structured list, not a full rewrite.
                 max_tokens=2048,
                 system=TAILORING_SKILLS_SYSTEM_V1,
                 messages=[{"role": "user", "content": user_msg}],
