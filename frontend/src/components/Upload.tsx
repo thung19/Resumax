@@ -18,13 +18,22 @@ export function Upload({ onUpload, loading, error }: UploadProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   const [loadedFile, setLoadedFile] = useState<{ name: string; size: number } | null>(null);
+  // The `accept=".docx"` attribute on the file input only filters the
+  // native file-picker dialog -- it does nothing for drag-and-drop, which
+  // calls handleFile directly. Dropping a .pdf/.doc file used to just
+  // silently do nothing: no error, no console log, no visual change,
+  // which looks like a broken/unresponsive dropzone rather than a
+  // rejected file type.
+  const [fileTypeError, setFileTypeError] = useState<string | null>(null);
 
   const handleFile = useCallback(
     (file: File) => {
       const ext = file.name.split(".").pop()?.toLowerCase();
       if (ext !== "docx") {
+        setFileTypeError(`"${file.name}" isn't a .docx file — please upload a Word document.`);
         return;
       }
+      setFileTypeError(null);
       setLoadedFile({ name: file.name, size: file.size });
       onUpload(file);
     },
@@ -101,9 +110,9 @@ export function Upload({ onUpload, loading, error }: UploadProps) {
         )}
       </div>
 
-      {error && (
+      {(fileTypeError || error) && (
         <div className="mt-2 text-sm text-gray-500 bg-gray-50 rounded px-3 py-2">
-          {error}
+          {fileTypeError || error}
         </div>
       )}
 
