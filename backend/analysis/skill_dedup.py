@@ -20,17 +20,8 @@ import re
 # Known variant relationships: (less_specific, more_specific).
 # When both forms are present in the same list, the less specific one is
 # dropped and the more specific/canonical one is kept.
-#
-# Unlike every other pair here (a genuine same-technology spelling/version
-# variant — "Node.js" vs "nodejs" is the same runtime, "html" vs "html5"
-# the same markup language at different specificity), Git and GitHub are
-# two different, if related, things: a CLI version-control tool vs. a
-# hosting platform built by a different company. A resume — or a JD —
-# listing both is plausibly deliberate, and a JD requiring "Git"
-# specifically shouldn't have that requirement silently unmatched because
-# the resume's "Git" entry got dropped in favor of "GitHub". No pair for
-# them here; they're intentionally treated as distinct.
 VARIANT_PAIRS: list[tuple[str, str]] = [
+    ("git", "github"),          # user call: treat as the same, keep github
     ("node", "node.js"),        # node.js is canonical
     ("nodejs", "node.js"),      # node.js is canonical
     ("vue", "vue.js"),          # vue.js is more complete
