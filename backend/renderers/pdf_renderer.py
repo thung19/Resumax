@@ -10,8 +10,11 @@ Falls back to content-based rendering when no elements are present.
 
 from __future__ import annotations
 
+import logging
 from io import BytesIO
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import letter
@@ -156,6 +159,64 @@ class PdfRenderer:
         self._default_font = default_font_from_layout(ir.layout)
         self._default_size = default_size_from_layout(ir.layout)
         self._spacer_height = self._detect_spacer_height()
+        self._warn_if_unrenderable_characters()
+
+    def _warn_if_unrenderable_characters(self) -> None:
+        """Log a warning if the resume contains characters the resolved
+        PDF font can't render.
+
+        _resolve_font() only ever emits ReportLab's built-in base-14
+        fonts (Helvetica/Times, etc.) — no TTF is registered anywhere in
+        this renderer, and those base fonts only cover WinAnsiEncoding
+        (~Latin-1: English plus accented Western-European characters).
+        Any character outside that — Chinese, Cyrillic, Arabic, emoji,
+        etc. — silently renders as a solid glyph box with no error
+        anywhere, which is a real risk for any resume with a non-English
+        name or content. Properly fixing this needs bundling and
+        registering a real Unicode-coverage font (e.g. a Noto Sans
+        family), a bigger, separate change — this at least makes the
+        failure visible instead of silent.
+        """
+        unrenderable: set[str] = set()
+        for text in self._all_text_fields():
+            for ch in text:
+                if ch in unrenderable or ch.isspace():
+                    continue
+                try:
+                    ch.encode("cp1252")
+                except UnicodeEncodeError:
+                    unrenderable.add(ch)
+        if unrenderable:
+            sample = "".join(sorted(unrenderable)[:20])
+            logger.warning(
+                f"PDF export: {len(unrenderable)} character(s) in this "
+                f"resume aren't supported by the built-in PDF fonts and "
+                f"will render as blank/missing glyphs: {sample!r}. No "
+                f"Unicode-coverage font is registered for PDF rendering."
+            )
+
+    def _all_text_fields(self) -> list[str]:
+        """Every user-authored text string in the resume, for the
+        font-coverage check above."""
+        texts: list[str] = [self._content.contact.name or ""]
+        for section in self._content.sections:
+            texts.append(section.title)
+            for e in section.experience_entries:
+                texts += [e.company, e.role, e.location or ""]
+                texts += [b.text for b in e.bullets]
+            for e in section.education_entries:
+                texts += [e.institution, e.degree or "", e.field_of_study or ""]
+            for e in section.project_entries:
+                texts += [e.name]
+                texts += [b.text for b in e.bullets]
+            for cat in section.skill_categories:
+                texts.append(cat.category)
+                texts += cat.skills
+            for e in section.generic_entries:
+                texts += [e.title or "", e.subtitle or ""]
+                texts += [b.text for b in e.bullets]
+            texts += section.raw_lines
+        return texts
 
     # ----------------------------------------------------------
     # Public API
