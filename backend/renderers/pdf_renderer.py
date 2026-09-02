@@ -309,8 +309,28 @@ class PdfRenderer:
         """
         story: list = []
         elements = self._layout.elements
+        i = 0
+        n = len(elements)
 
-        for el in elements:
+        while i < n:
+            el = elements[i]
+
+            if el.element_type == ElementType.ENTRY_HEADER:
+                # Group the header, an immediately-following subheader,
+                # and the first bullet after that into one KeepTogether
+                # block, so a job/entry header can never be orphaned
+                # alone at the bottom of a page with all its content
+                # pushed to the next one — nothing anywhere prevented
+                # that before (KeepTogether was imported but never
+                # actually used). Only these first few flowables are
+                # grouped, not the whole entry, so a long entry with
+                # many bullets still flows across a page break normally
+                # once its header is anchored.
+                group, consumed = self._build_entry_keep_together_group(elements, i)
+                story.append(KeepTogether(group) if len(group) > 1 else group[0])
+                i += consumed
+                continue
+
             fmt = extract_formatting(el, self._default_font, self._default_size)
 
             if el.element_type == ElementType.SPACER:
@@ -332,7 +352,10 @@ class PdfRenderer:
                         color=color,
                     ))
 
-            elif el.element_type in (ElementType.ENTRY_HEADER, ElementType.ENTRY_SUBHEADER):
+            elif el.element_type == ElementType.ENTRY_SUBHEADER:
+                # Only reached for a subheader NOT immediately preceded
+                # by an ENTRY_HEADER (already consumed above as part of
+                # a group) — e.g. a standalone role/location line.
                 if fmt.has_left_right:
                     story.append(self._el_left_right_row(fmt))
                 else:
@@ -347,7 +370,42 @@ class PdfRenderer:
             else:
                 story.append(self._el_paragraph(fmt))
 
+            i += 1
+
         return story
+
+    def _build_entry_keep_together_group(self, elements: list, start_idx: int) -> tuple[list, int]:
+        """Build a KeepTogether-safe group starting at an ENTRY_HEADER:
+        the header, an immediately-following ENTRY_SUBHEADER (if any),
+        and the first BULLET after that (if any).
+
+        Returns (flowables, elements_consumed).
+        """
+        group: list = []
+        i = start_idx
+        n = len(elements)
+
+        header_fmt = extract_formatting(elements[i], self._default_font, self._default_size)
+        if header_fmt.has_left_right:
+            group.append(self._el_left_right_row(header_fmt))
+        else:
+            group.append(self._el_paragraph(header_fmt))
+        i += 1
+
+        if i < n and elements[i].element_type == ElementType.ENTRY_SUBHEADER:
+            sub_fmt = extract_formatting(elements[i], self._default_font, self._default_size)
+            if sub_fmt.has_left_right:
+                group.append(self._el_left_right_row(sub_fmt))
+            else:
+                group.append(self._el_paragraph(sub_fmt))
+            i += 1
+
+        if i < n and elements[i].element_type == ElementType.BULLET:
+            bullet_fmt = extract_formatting(elements[i], self._default_font, self._default_size)
+            group.append(self._el_paragraph(bullet_fmt))
+            i += 1
+
+        return group, i - start_idx
 
     # --- element flowable builders ---
 
