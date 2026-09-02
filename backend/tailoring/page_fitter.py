@@ -346,6 +346,7 @@ class PageFitter:
         # search has to match on what the bullet used to say, not what
         # we're about to change it to.
         original_prefix = b_info.text[:30]
+        original_full_text = b_info.text
         if b_info.entry_type == "experience":
             section.experience_entries[b_info.entry_idx].bullets[b_info.bullet_idx].text = new_text
         elif b_info.entry_type == "project":
@@ -358,26 +359,79 @@ class PageFitter:
             from backend.models.resume_layout import ElementType, RunFormat
             for el in self._ir.layout.elements:
                 if el.element_type == ElementType.BULLET:
-                    el_text = "".join(
-                        r.text for r in el.paragraph_format.runs if not r.is_tab
-                    ).lstrip("• ").strip()
+                    non_tab_runs = [r for r in el.paragraph_format.runs if not r.is_tab]
+                    el_text = "".join(r.text for r in non_tab_runs).lstrip("• ").strip()
                     if el_text[:30] == original_prefix:
-                        # Update the element text with the new content
-                        if el.paragraph_format.runs:
-                            first_run = el.paragraph_format.runs[0]
-                            el.paragraph_format.runs = [RunFormat(
-                                text="• " + new_text,
-                                font_family=first_run.font_family,
-                                font_size_half_pt=first_run.font_size_half_pt,
-                                bold=first_run.bold,
-                                bold_cs=first_run.bold_cs,
-                                italic=first_run.italic,
-                                italic_cs=first_run.italic_cs,
-                                color=first_run.color,
-                            )]
-                        else:
-                            el.paragraph_format.runs = [RunFormat(text="• " + new_text)]
+                        el.paragraph_format.runs = self._retruncate_bullet_runs(
+                            non_tab_runs, original_full_text, new_text,
+                        )
                         break
+
+    def _retruncate_bullet_runs(
+        self,
+        non_tab_runs: list,
+        original_full_text: str,
+        new_text: str,
+    ) -> list:
+        """Truncate a bullet's runs to `new_text`, preserving each run's
+        own formatting for whatever portion of it survives.
+
+        _shorten_text() only ever cuts text from the END at a word
+        boundary — new_text is always a clean prefix of
+        original_full_text. That means per-run formatting (e.g. a
+        bolded metric partway through a bullet) can be preserved
+        exactly by truncating the run sequence in place, rather than
+        collapsing everything into a single new run copied from only
+        the first run's formatting — which silently discarded any
+        formatting change after the first run (a bolded "45%" mid-
+        bullet, for example, used to lose its bold when the bullet got
+        shortened during automatic page-fitting).
+
+        Falls back to the old single-run-replacement behavior if the
+        runs' concatenated text doesn't match original_full_text
+        exactly (e.g. an unexpected whitespace difference between the
+        content model and the layout elements) — correctness of the
+        text itself always wins over preserving formatting, so this
+        never risks producing misaligned/garbled text.
+
+        _update_bullet is also called from the whitespace-RESTORE path
+        (growing a previously-shortened bullet back toward its fuller
+        pre-tailoring text — see _fill_whitespace), where new_text is
+        LONGER than the current text and isn't a prefix of it at all.
+        Truncation logic doesn't apply there — falls back immediately
+        rather than silently truncating the restore to whatever the
+        (too-short) existing runs happen to contain.
+        """
+        from backend.models.resume_layout import RunFormat
+
+        if not non_tab_runs:
+            return [RunFormat(text="• " + new_text)]
+
+        if len(new_text) > len(original_full_text) or not original_full_text.startswith(new_text):
+            return [non_tab_runs[0].model_copy(update={"text": "• " + new_text})]
+
+        raw_concat = "".join(r.text for r in non_tab_runs)
+        # The bullet marker ("• " or similar) is a literal prefix of the
+        # first run's text — isolate it so length-counting below lines
+        # up with new_text, which never includes the marker.
+        body = raw_concat.lstrip("• ")
+        marker = raw_concat[: len(raw_concat) - len(body)]
+
+        if body != original_full_text:
+            return [non_tab_runs[0].model_copy(update={"text": "• " + new_text})]
+
+        target_len = len(marker) + len(new_text)
+        new_runs: list = []
+        consumed = 0
+        for run in non_tab_runs:
+            if consumed >= target_len:
+                break
+            take = min(len(run.text), target_len - consumed)
+            if take > 0:
+                new_runs.append(run.model_copy(update={"text": run.text[:take]}))
+            consumed += len(run.text)
+
+        return new_runs or [RunFormat(text="• " + new_text)]
 
     def _remove_bullet(self, b_info: BulletInfo):
         """Remove a bullet from both content and layout elements."""
