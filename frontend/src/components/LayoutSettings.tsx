@@ -35,12 +35,27 @@ export function LayoutSettings({ resumeId, apiUrl, onUpdate }: LayoutSettingsPro
   const [applyingTemplate, setApplyingTemplate] = useState(false);
 
   useEffect(() => {
+    // Without this guard, resumeId changing while the previous fetch is
+    // still in flight lets a stale response for the old resumeId land
+    // after the fresh one and overwrite it -- e.g. switching resumes
+    // right as a slow settings fetch for the old one was still pending
+    // would show the old resume's margins/fonts under the new resume.
+    // Matches the cancellation pattern already used correctly in
+    // Inspector.tsx.
+    let cancelled = false;
     fetch(`${apiUrl}/layout/${resumeId}/settings`)
       .then((r) => r.json())
-      .then(setSettings);
+      .then((data) => {
+        if (!cancelled) setSettings(data);
+      });
     fetch(`${apiUrl}/templates`)
       .then((r) => r.json())
-      .then((data) => setTemplates(data.templates || []));
+      .then((data) => {
+        if (!cancelled) setTemplates(data.templates || []);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [resumeId, apiUrl]);
 
   // Every NumberInput/select called `save()` directly on every keystroke,

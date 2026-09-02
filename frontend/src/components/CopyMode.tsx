@@ -79,19 +79,31 @@ export function CopyMode({ resumeId, apiUrl, isTailored }: CopyModeProps) {
   const [fullText, setFullText] = useState("");
 
   useEffect(() => {
+    // Without this guard, toggling `isTailored` while the previous fetch
+    // for the old value is still in flight lets the stale response land
+    // after the fresh one and silently overwrite it -- e.g. switching from
+    // tailored to original view right as a slow "tailored" text fetch was
+    // still pending would show the tailored text under the "original"
+    // toggle. Matches the cancellation pattern already used correctly in
+    // Inspector.tsx.
+    let cancelled = false;
+
     async function load() {
       // Load content
       const contentRes = await fetch(`${apiUrl}/inspect/${resumeId}/content`);
-      if (contentRes.ok) setData(await contentRes.json());
+      if (!cancelled && contentRes.ok) setData(await contentRes.json());
 
       // Load full text
       const textUrl = isTailored
         ? `${apiUrl}/export/${resumeId}/tailored/txt`
         : `${apiUrl}/export/${resumeId}/txt`;
       const textRes = await fetch(textUrl);
-      if (textRes.ok) setFullText(await textRes.text());
+      if (!cancelled && textRes.ok) setFullText(await textRes.text());
     }
     load();
+    return () => {
+      cancelled = true;
+    };
   }, [resumeId, apiUrl, isTailored]);
 
   if (!data) return <div className="p-4 text-sm text-gray-400">Loading...</div>;
