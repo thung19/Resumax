@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 
 interface LayoutSettingsProps {
   resumeId: string;
@@ -43,8 +43,31 @@ export function LayoutSettings({ resumeId, apiUrl, onUpdate }: LayoutSettingsPro
       .then((data) => setTemplates(data.templates || []));
   }, [resumeId, apiUrl]);
 
-  const save = useCallback(
-    async (updates: Record<string, unknown>) => {
+  // Every NumberInput/select called `save()` directly on every keystroke,
+  // each firing its own POST+GET round trip and onUpdate() (which forces a
+  // full Preview remount, see Preview.tsx/page.tsx). Typing a multi-digit
+  // value fired several overlapping request pairs with no ordering
+  // guarantee, so the *last GET to resolve* -- not the last keystroke sent
+  // -- determined what the field displayed, and the preview flickered/
+  // reflowed on every keystroke. pendingUpdatesRef accumulates fields
+  // across a debounce window (merging e.g. a margin edit and a font-size
+  // edit typed in quick succession into one request instead of two), and
+  // inFlightRef defers a debounce firing during an active save until that
+  // save finishes, then immediately flushes whatever queued up meanwhile
+  // -- so edits are never silently dropped, and there's at most one save
+  // in flight at a time.
+  const pendingUpdatesRef = useRef<Record<string, unknown>>({});
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inFlightRef = useRef(false);
+
+  const flushSave = useCallback(
+    async () => {
+      if (inFlightRef.current) return;
+      const updates = pendingUpdatesRef.current;
+      if (Object.keys(updates).length === 0) return;
+      pendingUpdatesRef.current = {};
+
+      inFlightRef.current = true;
       setSaving(true);
       try {
         const res = await fetch(`${apiUrl}/layout/${resumeId}/settings`, {
@@ -60,11 +83,34 @@ export function LayoutSettings({ resumeId, apiUrl, onUpdate }: LayoutSettingsPro
           onUpdate();
         }
       } finally {
+        inFlightRef.current = false;
         setSaving(false);
+        // More edits queued up while this save was in flight -- flush
+        // them now rather than waiting for another debounce to fire.
+        if (Object.keys(pendingUpdatesRef.current).length > 0) {
+          flushSave();
+        }
       }
     },
     [resumeId, apiUrl, onUpdate]
   );
+
+  const save = useCallback(
+    (updates: Record<string, unknown>) => {
+      pendingUpdatesRef.current = { ...pendingUpdatesRef.current, ...updates };
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      debounceRef.current = setTimeout(() => {
+        flushSave();
+      }, 400);
+    },
+    [flushSave]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, []);
 
   const applyTemplate = useCallback(
     async (templateId: string) => {
@@ -263,18 +309,47 @@ function NumberInput({
   max?: number;
   onChange: (value: number) => void;
 }) {
+  // `value` was bound directly to the numeric prop with no local buffer,
+  // so a fully-controlled input: pressing Backspace to clear the field
+  // before typing a new number made e.target.value "", parseFloat("") is
+  // NaN, onChange was skipped, and React immediately re-rendered the
+  // input back to the old numeric string -- the field visually snapped
+  // back and could never be cleared first, only overwritten in one
+  // select-all-and-type keystroke. Buffering the raw text locally lets the
+  // user freely clear/retype; an empty or invalid value just doesn't
+  // propagate upward until it becomes valid again, and blurring while
+  // invalid/empty restores the last known-good value instead of leaving
+  // the field blank.
+  const [text, setText] = useState(String(value));
+  // Reconciled during render rather than in a useEffect (React's
+  // recommended pattern for "adjust state when a prop changes" --
+  // https://react.dev/learn/you-might-not-need-an-effect): an effect
+  // would commit the stale text for one extra render before firing, and
+  // eslint's react-hooks/set-state-in-effect flags the setState-in-effect
+  // version as an anti-pattern.
+  const [prevValue, setPrevValue] = useState(value);
+  if (value !== prevValue) {
+    setPrevValue(value);
+    setText(String(value));
+  }
+
   return (
     <div>
       <label className="text-[10px] text-gray-400 block">{label}</label>
       <input
         type="number"
-        value={value}
+        value={text}
         step={step}
         min={min}
         max={max}
         onChange={(e) => {
-          const v = parseFloat(e.target.value);
+          const raw = e.target.value;
+          setText(raw);
+          const v = parseFloat(raw);
           if (!isNaN(v)) onChange(v);
+        }}
+        onBlur={() => {
+          if (text.trim() === "" || isNaN(parseFloat(text))) setText(String(value));
         }}
         className="w-full text-xs border border-gray-300 rounded px-2 py-1 mt-0.5"
       />
