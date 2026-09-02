@@ -444,6 +444,13 @@ async def fit_page(resume_id: str):
 @app.get("/inspect/{resume_id}/formatting")
 async def inspect_formatting(resume_id: str):
     """Return detected formatting patterns (requires re-parsing the uploaded file)."""
+    # Defense-in-depth: every other filesystem-path-building endpoint
+    # validates resume_id explicitly before touching disk. This one relied
+    # solely on the _store.get() miss below (safe in practice, since
+    # _store only ever contains server-generated uuid4-hex keys) -- made
+    # consistent with the rest of the file rather than relying on that
+    # indirection.
+    _validate_resume_id(resume_id)
     ir = _store.get(resume_id)
     if ir is None:
         raise HTTPException(404, "Resume not found (must be in memory for formatting analysis)")
@@ -670,11 +677,11 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
     """
     jd = _jd_store.get(resume_id)
     if jd is None:
-        print(f"DEBUG: No JD found in store for {resume_id} — coverage not recalculated")
+        logger.debug("No JD found in store for %s — coverage not recalculated", resume_id)
         return
 
     try:
-        print(f"DEBUG: Recalculating coverage from snapshots for {resume_id}")
+        logger.debug("Recalculating coverage from snapshots for %s", resume_id)
 
         # Track old values for logging
         old_req = result.required_skill_coverage
@@ -692,12 +699,15 @@ def _recalculate_coverage(resume_id: str, result: TailoringResult, ir: ResumeIR)
         # NOW recalculate coverage from the rebuilt snapshots
         service._calculate_coverage_from_snapshots(result, jd)
 
-        print(f"DEBUG: Coverage updated: "
-              f"Required {old_req:.0f}% → {result.required_skill_coverage:.0f}%, "
-              f"Technical {old_tech:.0f}% → {result.technical_keyword_coverage:.0f}%, "
-              f"Responsibility {old_resp:.0f}% → {result.responsibility_coverage:.0f}%, "
-              f"Skills {old_skills:.0f}% → {result.skills_matched_coverage:.0f}%, "
-              f"Activities {old_activities:.0f}% → {result.activities_matched_coverage:.0f}%")
+        logger.debug(
+            "Coverage updated: Required %.0f%% → %.0f%%, Technical %.0f%% → %.0f%%, "
+            "Responsibility %.0f%% → %.0f%%, Skills %.0f%% → %.0f%%, Activities %.0f%% → %.0f%%",
+            old_req, result.required_skill_coverage,
+            old_tech, result.technical_keyword_coverage,
+            old_resp, result.responsibility_coverage,
+            old_skills, result.skills_matched_coverage,
+            old_activities, result.activities_matched_coverage,
+        )
 
         # Rebuild keyword coverage list
         all_jd_keywords = jd.all_keywords()
@@ -783,9 +793,12 @@ async def accept_reject_bullet(resume_id: str, req: AcceptRejectRequest):
 
     # Return result with updated coverage
     response = result.model_dump()
-    print(f"DEBUG: Accept response being returned: Required {response.get('required_skill_coverage'):.0f}%, "
-          f"Technical {response.get('technical_keyword_coverage'):.0f}%, "
-          f"Responsibility {response.get('responsibility_coverage'):.0f}%")
+    logger.debug(
+        "Accept response being returned: Required %.0f%%, Technical %.0f%%, Responsibility %.0f%%",
+        response.get("required_skill_coverage"),
+        response.get("technical_keyword_coverage"),
+        response.get("responsibility_coverage"),
+    )
     return response
 
 
@@ -996,25 +1009,31 @@ async def export_tailored_docx(resume_id: str, filename: str | None = None):
 
 
 class LayoutSettingsUpdate(BaseModel):
+    # Bounds below prevent a negative/zero/absurd value from flowing
+    # straight into ReportLab/python-docx's Pt()/Inches() constructors and
+    # crashing the render with a generic, uncaught-looking 500 -- unlike
+    # TailorRequest's fields, these previously had no ge/le constraints at
+    # all. Ranges are generous (not the app's own recommended values) since
+    # this is just a last-resort sanity check, not UX guidance.
     # Page margins (inches)
-    margin_top: float | None = None
-    margin_bottom: float | None = None
-    margin_left: float | None = None
-    margin_right: float | None = None
+    margin_top: float | None = Field(default=None, ge=0, le=5)
+    margin_bottom: float | None = Field(default=None, ge=0, le=5)
+    margin_left: float | None = Field(default=None, ge=0, le=5)
+    margin_right: float | None = Field(default=None, ge=0, le=5)
     # Font
     font_family: str | None = None
     # Font sizes (points)
-    name_size_pt: float | None = None
-    heading_size_pt: float | None = None
-    body_size_pt: float | None = None
+    name_size_pt: float | None = Field(default=None, gt=0, le=72)
+    heading_size_pt: float | None = Field(default=None, gt=0, le=72)
+    body_size_pt: float | None = Field(default=None, gt=0, le=72)
     # Spacing
-    line_spacing: float | None = None  # multiplier (1.0 = single, 1.15, 1.5, 2.0)
-    spacer_size_pt: float | None = None  # gap between sections/entries
-    section_gap_pt: float | None = None  # spacer before section headings
-    entry_gap_pt: float | None = None  # spacer between entries
+    line_spacing: float | None = Field(default=None, gt=0, le=5)  # multiplier (1.0 = single, 1.15, 1.5, 2.0)
+    spacer_size_pt: float | None = Field(default=None, ge=0, le=72)  # gap between sections/entries
+    section_gap_pt: float | None = Field(default=None, ge=0, le=72)  # spacer before section headings
+    entry_gap_pt: float | None = Field(default=None, ge=0, le=72)  # spacer between entries
     # Bullet
-    bullet_symbol: str | None = None
-    bullet_indent_in: float | None = None
+    bullet_symbol: str | None = Field(default=None, max_length=10)
+    bullet_indent_in: float | None = Field(default=None, ge=0, le=5)
 
 
 @app.get("/layout/{resume_id}/settings")
