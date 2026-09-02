@@ -34,11 +34,16 @@ def _extract_facts_from_bullet(bullet_text: str, prefix: str) -> list[Fact]:
         tags=_extract_tags(bullet_text),
     ))
 
-    # Extract metrics/numbers as separate facts
-    metrics = re.findall(r"\b\d+[\d,]*\+?\b[^.]*", bullet_text)
+    # Extract metrics/numbers as separate facts. Capture the number plus a
+    # short trailing unit/context (e.g. "25%", "3 years", "$250k"), not the
+    # rest of the sentence -- `[^.]*` used to run unbounded to the next
+    # period, so a bullet with no interior period produced a "metric" fact
+    # that was really just the whole bullet again (already captured above
+    # as the "_full" fact), defeating the point of extracting an atomic fact.
+    metrics = re.findall(r"\b\d+[\d,]*\+?%?\s*(?:[a-zA-Z]+\.?){0,3}", bullet_text)
     for i, metric in enumerate(metrics):
         metric = metric.strip().rstrip(",;")
-        if len(metric) > 5:
+        if len(metric) > 2:
             facts.append(Fact(
                 id=f"{prefix}_metric_{i}",
                 text=metric,
@@ -63,7 +68,13 @@ def _extract_tags(text: str) -> list[str]:
     }
 
     for term in tech_terms:
-        if term in text_lower:
+        # Word-boundary match, not substring -- a plain `term in text_lower`
+        # check false-matches "r" in nearly every sentence, "git" inside
+        # "digital", "api" inside "rapid", etc. Same bug class already
+        # fixed in matcher.py's _text_contains_keyword_direct; (?<!\w)/
+        # (?!\w) is used instead of \b so multi-word/punctuated terms like
+        # "c++", "next.js", "rest api" still match correctly.
+        if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text_lower):
             tags.append(term)
 
     return tags
@@ -130,15 +141,31 @@ def generate_bank_from_ir(ir: ResumeIR) -> ResumeBank:
 
 
 def save_bank(bank: ResumeBank, resume_id: str):
-    """Save a resume bank to disk."""
+    """Save a resume bank to disk.
+
+    Writes to a temp file and renames into place so a concurrent load_bank
+    (e.g. a double-submitted request for the same resume_id) never observes
+    a partially-written file -- os.replace is atomic on both POSIX and
+    Windows.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = DATA_DIR / f"{resume_id}_bank.json"
-    path.write_text(bank.model_dump_json(indent=2))
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(bank.model_dump_json(indent=2))
+    tmp_path.replace(path)
 
 
 def load_bank(resume_id: str) -> Optional[ResumeBank]:
-    """Load a resume bank from disk."""
+    """Load a resume bank from disk.
+
+    Returns None (triggering regeneration by the caller) rather than
+    propagating a raw parse error if the file is missing, empty, or
+    corrupt/torn -- e.g. from a read racing an old, non-atomic write.
+    """
     path = DATA_DIR / f"{resume_id}_bank.json"
-    if path.exists():
+    if not path.exists():
+        return None
+    try:
         return ResumeBank.model_validate_json(path.read_text())
-    return None
+    except (json.JSONDecodeError, ValueError):
+        return None
