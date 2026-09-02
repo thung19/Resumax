@@ -95,12 +95,30 @@ class SemanticClassifier:
     """Validates and corrects section type assignments."""
 
     def classify_section_title(self, title: str) -> SectionType:
-        """Classify a section by its title."""
+        """Classify a section by its title.
+
+        Checks every category's patterns rather than stopping at the
+        first match in SECTION_PATTERNS' dict order, and prefers
+        whichever pattern matched the LONGEST span of the title — a
+        longer, more specific keyword match (e.g. "certif" matching
+        "Certification") is a better signal than a shorter, more
+        generic one (e.g. "skill" matching "SkillBridge") that happens
+        to appear as a substring. Without this, dict insertion order
+        alone decided ties: a section titled "Publications & Research
+        Activities" matched VOLUNTEER's broad "activit" pattern before
+        ever reaching PUBLICATIONS's own patterns, purely because
+        VOLUNTEER was defined earlier in the dict — silently mislabeling
+        the whole publications list with no error or diagnostic.
+        """
+        best_type: Optional[SectionType] = None
+        best_len = 0
         for section_type, patterns in SECTION_PATTERNS.items():
             for pattern in patterns:
-                if pattern.search(title):
-                    return section_type
-        return SectionType.CUSTOM
+                match = pattern.search(title)
+                if match and (match.end() - match.start()) > best_len:
+                    best_len = match.end() - match.start()
+                    best_type = section_type
+        return best_type or SectionType.CUSTOM
 
     def _validate_section(self, section: ResumeSection) -> Optional[SectionType]:
         """Check if a section's content matches its type."""
@@ -130,10 +148,26 @@ class SemanticClassifier:
             if has_edu_keywords:
                 return SectionType.EDUCATION
 
-        if section.skill_categories:
+        # Unlike EXPERIENCE/EDUCATION above, these two used to fire on
+        # "is the list non-empty" alone, with no corroborating check —
+        # so a catch-all section (e.g. "Additional Information" mixing
+        # an Eagle Scout note, a volunteering line, and one incidental
+        # "Languages: Spanish" entry) got force-relabeled SKILLS just
+        # because *something* parsed into a SkillCategory, discarding
+        # that the section was mostly other content. Only apply these
+        # when skill/project entries are the section's ONLY populated
+        # content — a genuinely skills-only or projects-only ambiguous
+        # section is still classified correctly, but a mixed one is left
+        # CUSTOM rather than force-guessed.
+        no_other_content = not any([
+            section.experience_entries, section.education_entries,
+            section.generic_entries, section.raw_lines,
+        ])
+
+        if section.skill_categories and not section.project_entries and no_other_content:
             return SectionType.SKILLS
 
-        if section.project_entries:
+        if section.project_entries and not section.skill_categories and no_other_content:
             return SectionType.PROJECTS
 
         return None
