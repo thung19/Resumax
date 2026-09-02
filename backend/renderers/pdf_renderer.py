@@ -633,10 +633,14 @@ class PdfRenderer:
     def _render_generic(self, entry: GenericEntry) -> list:
         items: list = []
         header_style = self._content_style("entry_header", f"eh_{entry.id}")
+        sub_style = self._content_style("entry_subheader", f"es_{entry.id}")
         bullet_style = self._content_style("bullet", f"b_{entry.id}")
 
         if entry.title:
             items.append(Paragraph(_escape(entry.title), header_style))
+
+        if entry.subtitle:
+            items.append(Paragraph(_escape(entry.subtitle), sub_style))
 
         for bullet in entry.bullets:
             text = f"\u2022 {_escape(bullet.text)}"

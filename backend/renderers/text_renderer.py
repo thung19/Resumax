@@ -164,6 +164,8 @@ class TextRenderer:
         lines: list[str] = []
         if entry.title:
             lines.append(entry.title)
+        if entry.subtitle:
+            lines.append(entry.subtitle)
         for bullet in entry.bullets:
             lines.append(f"- {bullet.text}")
         return lines

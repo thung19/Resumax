@@ -202,16 +202,32 @@ def _split_at_tab(fmt: ElementFormatting) -> None:
     dates across.  We collapse everything between the first tab and
     the next real text into a single split.
     """
-    first_tab: Optional[int] = None
+    # Find the first REAL (non-tab, non-blank) run before looking for the
+    # split tab. A leading tab before any text (e.g. a paragraph starting
+    # "<tab>Acme Corp<tab>Jan 2023") is indentation, not a left/right
+    # column separator — without this, `first_tab` below would land on
+    # that leading tab, making `left_runs` empty and dumping BOTH the
+    # header text and the date into `right_runs` concatenated together
+    # with no separator (e.g. "Acme CorpJan 2023") jammed into the
+    # right-aligned cell.
+    first_text_idx: Optional[int] = None
     for i, seg in enumerate(fmt.runs):
-        if seg.is_tab:
+        if not seg.is_tab and seg.text.strip():
+            first_text_idx = i
+            break
+    if first_text_idx is None:
+        return
+
+    first_tab: Optional[int] = None
+    for i in range(first_text_idx, len(fmt.runs)):
+        if fmt.runs[i].is_tab:
             first_tab = i
             break
     if first_tab is None:
         return
 
     fmt.has_left_right = True
-    fmt.left_runs = [s for s in fmt.runs[:first_tab] if not s.is_tab]
+    fmt.left_runs = [s for s in fmt.runs[first_text_idx:first_tab] if not s.is_tab]
 
     # Skip all tab runs and whitespace-only padding to find right content
     fmt.right_runs = []
