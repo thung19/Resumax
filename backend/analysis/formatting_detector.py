@@ -103,6 +103,24 @@ class FormattingDetector:
         """Group paragraphs by formatting similarity."""
         clusters: dict[tuple, list[int]] = defaultdict(list)
 
+        # The most common font size across the document — a reasonable
+        # proxy for "body/bullet text size", since those are by far the
+        # most numerous paragraphs in a typical resume. Used below so a
+        # bold, noticeably-LARGER-than-body paragraph can be recognized
+        # as a section heading even when it isn't ALL-CAPS (a bold,
+        # title-case heading like "Work Experience" otherwise fell
+        # through to "entry_header", merging it with real entry headers
+        # like company names and silently absorbing whichever
+        # formatting happened to be inserted first into that role — see
+        # _infer_role_from_cluster and the merge logic below).
+        sizes = Counter(
+            p.font_size_pt for p in self._paragraphs
+            if not p.is_empty and p.font_size_pt
+        )
+        self._baseline_font_size: Optional[float] = (
+            sizes.most_common(1)[0][0] if sizes else None
+        )
+
         for i, p in enumerate(self._paragraphs):
             if p.is_empty:
                 continue
@@ -125,7 +143,17 @@ class FormattingDetector:
 
             clusters[sig.signature_key()].append(i)
 
-        # Assign roles to clusters
+        # Assign roles to clusters. When two DIFFERENT formatting
+        # clusters resolve to the same role (e.g. two visually distinct
+        # paragraph styles both get classified "entry_header"), track
+        # which one is more representative of that role — the largest
+        # cluster by paragraph count — so the merged pattern's
+        # signature/example_texts describe the role's actual dominant
+        # formatting instead of silently keeping whichever cluster
+        # happened to be inserted first (dict iteration order), even if
+        # a later, more common cluster had different formatting (e.g. a
+        # different font size) or more representative example text.
+        dominant_cluster_size: dict[str, int] = {}
         for sig_key, indices in clusters.items():
             representative = self._paragraphs[indices[0]]
             role = self._infer_role_from_cluster(representative, indices)
@@ -156,8 +184,13 @@ class FormattingDetector:
                 existing = self._patterns[role]
                 existing.count += pattern.count
                 existing.paragraph_indices.extend(pattern.paragraph_indices)
+                if len(indices) > dominant_cluster_size.get(role, 0):
+                    existing.signature = pattern.signature
+                    existing.example_texts = pattern.example_texts
+                    dominant_cluster_size[role] = len(indices)
             else:
                 self._patterns[role] = pattern
+                dominant_cluster_size[role] = len(indices)
 
     def _infer_role_from_cluster(self, rep, indices: list[int]) -> str:
         """Infer the semantic role of a formatting cluster."""
@@ -175,11 +208,40 @@ class FormattingDetector:
         if rep.bold and text.isupper() and len(text) > 2:
             return "section_heading"
 
+        # Bold, has its own visual rule (a bottom border or drawn line),
+        # and/or is noticeably larger than the document's body text —
+        # still a section heading even without ALL-CAPS (e.g. a
+        # title-case "Work Experience" heading). A rule/line under a
+        # paragraph is a strong, case-independent heading signal on its
+        # own; font size alone only counts when paired with bold, so an
+        # incidentally-larger bold company name doesn't get swept in.
+        if rep.bold and (rep.has_bottom_border or rep.has_line_shape):
+            return "section_heading"
+        if (
+            rep.bold and rep.font_size_pt and self._baseline_font_size
+            and rep.font_size_pt > self._baseline_font_size + 1.5
+        ):
+            return "section_heading"
+
         # Bullets
         if rep.has_numbering or text.startswith("•") or text.startswith("-"):
             return "bullet"
 
         has_tabs = any(r.get("tab_count", 0) > 0 for r in rep.runs)
+
+        # Skills/label row ("Label: value, value"), checked BEFORE the
+        # bold entry_header checks below and gated on NOT having tabs —
+        # matches docx_importer.py's _classify_paragraph_role, fixed
+        # earlier this session for the identical reason: an entry header
+        # whose company/project name happens to contain a colon (e.g.
+        # "Acme Inc: A Case Study") almost always still has its date
+        # tab-aligned on the same line, while a genuine skills row never
+        # does. Checking bold first here (the order before this fix)
+        # meant a bold colon-containing skills row NEVER reached this
+        # check at all, and disagreed with docx_importer.py's own
+        # classification for the identical paragraph.
+        if ":" in text and not has_tabs:
+            return "skills_row"
 
         # Bold with tabs = entry header (company + date)
         if rep.bold and has_tabs:
@@ -192,10 +254,6 @@ class FormattingDetector:
         # Non-bold with tabs = entry subheader (role + location)
         if has_tabs:
             return "entry_subheader"
-
-        # Contains colon = skills/label row
-        if ":" in text:
-            return "skills_row"
 
         return "body_text"
 
