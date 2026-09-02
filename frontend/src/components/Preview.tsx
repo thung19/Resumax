@@ -25,6 +25,13 @@ interface PageDimensions {
 export function Preview({ resumeId, apiUrl, previewUrl, editable = false, onTextEdit, onSave, hasEdits = false, saveLoading = false }: PreviewProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const editContainerRef = useRef<HTMLDivElement>(null);
+  // Holds a function that immediately applies whatever edit is currently
+  // sitting in the 500ms debounce window, set by the Shadow DOM effect
+  // below and invoked by the Save button before saving -- otherwise a
+  // click within 500ms of the last keystroke reads previewEdits from a
+  // stale closure that doesn't yet include that keystroke, silently
+  // dropping it from the save.
+  const flushPendingEditRef = useRef<(() => void) | null>(null);
   const [scale, setScale] = useState(1);
   const [loadError, setLoadError] = useState(false);
   const [htmlContent, setHtmlContent] = useState<string>("");
@@ -93,24 +100,27 @@ export function Preview({ resumeId, apiUrl, previewUrl, editable = false, onText
 
         // Set up mutation observer to track bullet edits
         if (onTextEdit) {
+          const applyEdits = () => {
+            // Read the real bullet id the renderer stamped on each
+            // bullet div — previously this fabricated a random id per
+            // edit, which never matched a real bullet on save, so
+            // nothing typed here was ever actually persisted.
+            const bulletDivs = wrapper.querySelectorAll<HTMLElement>("[data-bullet-id]");
+            bulletDivs.forEach((div) => {
+              const bulletId = div.dataset.bulletId;
+              const text = div.textContent?.trim();
+              if (bulletId && text && text.startsWith("•")) {
+                const cleanText = text.substring(1).trim();
+                onTextEdit(bulletId, cleanText);
+              }
+            });
+          };
+
+          let debounceTimeout: ReturnType<typeof setTimeout> | undefined;
           const observer = new MutationObserver(() => {
             // Debounce to avoid too many updates
-            clearTimeout((observer as any).debounceTimeout);
-            (observer as any).debounceTimeout = setTimeout(() => {
-              // Read the real bullet id the renderer stamped on each
-              // bullet div — previously this fabricated a random id per
-              // edit, which never matched a real bullet on save, so
-              // nothing typed here was ever actually persisted.
-              const bulletDivs = wrapper.querySelectorAll<HTMLElement>("[data-bullet-id]");
-              bulletDivs.forEach((div) => {
-                const bulletId = div.dataset.bulletId;
-                const text = div.textContent?.trim();
-                if (bulletId && text && text.startsWith("•")) {
-                  const cleanText = text.substring(1).trim();
-                  onTextEdit(bulletId, cleanText);
-                }
-              });
-            }, 500);
+            clearTimeout(debounceTimeout);
+            debounceTimeout = setTimeout(applyEdits, 500);
           });
 
           observer.observe(wrapper, {
@@ -119,7 +129,24 @@ export function Preview({ resumeId, apiUrl, previewUrl, editable = false, onText
             characterData: true,
           });
 
-          return () => observer.disconnect();
+          // Let the Save button flush a still-pending debounce instead of
+          // losing it (see flushPendingEditRef declaration above).
+          flushPendingEditRef.current = () => {
+            clearTimeout(debounceTimeout);
+            applyEdits();
+          };
+
+          return () => {
+            observer.disconnect();
+            // Previously only disconnect() ran here, leaving any
+            // already-armed setTimeout to fire later against a detached
+            // wrapper (e.g. right after Save resets previewEdits to {},
+            // or after switching away from the editable tab) and
+            // resurrect a stale edit into state that had just been
+            // cleared or was no longer being shown.
+            clearTimeout(debounceTimeout);
+            flushPendingEditRef.current = null;
+          };
         }
       } catch (err) {
         console.error("Failed to set up Shadow DOM:", err);
@@ -175,7 +202,13 @@ export function Preview({ resumeId, apiUrl, previewUrl, editable = false, onText
 
         {onSave && (
           <button
-            onClick={onSave}
+            onClick={() => {
+              // Apply any edit still sitting in the 500ms debounce window
+              // before saving, so a click right after typing doesn't
+              // silently drop the last keystroke(s).
+              flushPendingEditRef.current?.();
+              onSave();
+            }}
             disabled={!hasEdits || saveLoading}
             className={`px-3 py-1 text-xs font-medium rounded transition-colors ${
               hasEdits && !saveLoading

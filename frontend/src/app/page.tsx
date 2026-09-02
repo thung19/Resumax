@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { Upload } from "@/components/Upload";
 import { Preview } from "@/components/Preview";
 import { Inspector } from "@/components/Inspector";
@@ -33,6 +33,16 @@ export default function Home() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [lastTailorOpts, setLastTailorOpts] = useState<any>(null);
   const [previewEdits, setPreviewEdits] = useState<Record<string, string>>({});
+  // Mirrors previewEdits synchronously. handleSaveAllEdits is a useCallback
+  // closed over the `previewEdits` state from whatever render created it --
+  // if Preview.tsx flushes a still-debounced edit right before calling
+  // onSave (both happen synchronously in the same click handler), the
+  // setPreviewEdits() from that flush hasn't been committed to a new
+  // render yet, so the onSave closure would still see the old value and
+  // silently drop the last edit. Reading from this ref instead guarantees
+  // handleSaveAllEdits always sees whatever was written a moment ago,
+  // even within the same synchronous handler.
+  const previewEditsRef = useRef<Record<string, string>>({});
   const [saveEditLoading, setSaveEditLoading] = useState(false);
 
   const handleUpload = useCallback(async (file: File) => {
@@ -203,23 +213,27 @@ export default function Home() {
   const handlePreviewEdit = useCallback(
     (bulletId: string, newText: string) => {
       console.log(`[Preview Edit] bulletId=${bulletId}, text="${newText.substring(0, 50)}..."`);
-      setPreviewEdits((prev) => ({ ...prev, [bulletId]: newText }));
+      previewEditsRef.current = { ...previewEditsRef.current, [bulletId]: newText };
+      setPreviewEdits(previewEditsRef.current);
     },
     []
   );
 
   const handleSaveAllEdits = useCallback(
     async () => {
-      if (!resumeId || (Object.keys(previewEdits).length === 0)) return;
+      // Read from the ref, not the `previewEdits` state this callback
+      // closed over -- see previewEditsRef's declaration above.
+      const edits = previewEditsRef.current;
+      if (!resumeId || Object.keys(edits).length === 0) return;
 
       setSaveEditLoading(true);
       try {
-        console.log(`[Save] Saving ${Object.keys(previewEdits).length} preview edits`);
+        console.log(`[Save] Saving ${Object.keys(edits).length} preview edits`);
 
         const response = await fetch(`${API}/tailor/${resumeId}/save-edits`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ edited_bullets: previewEdits }),
+          body: JSON.stringify({ edited_bullets: edits }),
         });
 
         if (!response.ok) throw new Error("Failed to save edits");
@@ -228,6 +242,7 @@ export default function Home() {
 
         // Update tailoring result with new data
         setTailoringResult(updated);
+        previewEditsRef.current = {};
         setPreviewEdits({});
         setPreviewKey((k) => k + 1);
 
@@ -239,7 +254,7 @@ export default function Home() {
         setSaveEditLoading(false);
       }
     },
-    [resumeId, previewEdits]
+    [resumeId]
   );
 
   const previewUrl = isTailored

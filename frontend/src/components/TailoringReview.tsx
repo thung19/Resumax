@@ -64,9 +64,18 @@ export function TailoringReview({ result, onAcceptReject, onSkillChange, onSkill
   const [editMessage, setEditMessage] = useState("");
   const [editLoading, setEditLoading] = useState(false);
   const data = result as TailoringResultData;
+  // `result` comes straight from five different API responses (tailor,
+  // accept, skill, freeform edit, accept-all) with no runtime validation.
+  // If any of them ever returns a payload missing bullet_changes (e.g. a
+  // differently-shaped error/partial object), this used to throw
+  // synchronously during render -- and with no error boundary anywhere in
+  // the tree, that white-screened the whole app rather than just this
+  // tab. Default to [] so a malformed response degrades to an empty
+  // review list instead of a crash.
+  const bulletChanges = Array.isArray(data?.bullet_changes) ? data.bullet_changes : [];
 
-  const rewrites = data.bullet_changes.filter((c) => c.action === "rewrite");
-  const keeps = data.bullet_changes.filter((c) => c.action === "keep");
+  const rewrites = bulletChanges.filter((c) => c.action === "rewrite");
+  const keeps = bulletChanges.filter((c) => c.action === "keep");
 
   // Use backend resolved field — no local state needed
   const pending = rewrites.filter((c) => !c.resolved);
