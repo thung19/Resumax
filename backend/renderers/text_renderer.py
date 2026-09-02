@@ -18,6 +18,7 @@ from backend.models.resume_content import (
     SkillCategory,
 )
 from backend.models.resume_ir import ResumeIR
+from backend.renderers.element_styles import format_date_range
 
 
 class TextRenderer:
@@ -95,14 +96,10 @@ class TextRenderer:
     def _render_experience_entry(self, entry: ExperienceEntry) -> list[str]:
         lines: list[str] = []
 
-        # Company + date
-        date_str = ""
-        if entry.start_date and entry.end_date:
-            date_str = f"{entry.start_date} - {entry.end_date}"
-        elif entry.start_date:
-            date_str = entry.start_date
-        elif entry.end_date:
-            date_str = entry.end_date
+        # Company + date. This renderer stays ASCII-only for ATS/portal
+        # compatibility (see module docstring), so a plain hyphen is passed
+        # as the separator rather than the en dash the other renderers use.
+        date_str = format_date_range(entry.start_date, entry.end_date, sep="-")
 
         header = entry.company
         if date_str:
@@ -124,9 +121,10 @@ class TextRenderer:
     def _render_education_entry(self, entry: EducationEntry) -> list[str]:
         lines: list[str] = []
 
+        date_str = format_date_range(entry.start_date, entry.end_date, sep="-")
         header = entry.institution
-        if entry.end_date:
-            header = f"{entry.institution} | {entry.end_date}"
+        if date_str:
+            header = f"{entry.institution} | {date_str}"
         lines.append(header)
 
         degree_line = ""
@@ -150,9 +148,10 @@ class TextRenderer:
     def _render_project_entry(self, entry: ProjectEntry) -> list[str]:
         lines: list[str] = []
 
+        date_str = format_date_range(entry.start_date, entry.end_date, sep="-")
         header = entry.name
-        if entry.start_date and entry.end_date:
-            header = f"{entry.name} | {entry.start_date} - {entry.end_date}"
+        if date_str:
+            header = f"{entry.name} | {date_str}"
         lines.append(header)
 
         for bullet in entry.bullets:

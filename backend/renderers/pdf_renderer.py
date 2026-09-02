@@ -58,6 +58,7 @@ from backend.renderers.element_styles import (
     default_font_from_layout,
     default_size_from_layout,
     extract_formatting,
+    format_date_range,
     joined_text,
     spacer_height_pt,
 )
@@ -673,13 +674,7 @@ class PdfRenderer:
         sub_style = self._content_style("entry_subheader", f"es_{entry.id}")
         bullet_style = self._content_style("bullet", f"b_{entry.id}")
 
-        date_str = ""
-        if entry.start_date and entry.end_date:
-            date_str = f"{entry.start_date} \u2013 {entry.end_date}"
-        elif entry.start_date:
-            date_str = entry.start_date
-        elif entry.end_date:
-            date_str = entry.end_date
+        date_str = format_date_range(entry.start_date, entry.end_date)
 
         right_style = ParagraphStyle("r_tmp", parent=header_style, alignment=TA_RIGHT)
         items.append(self._left_right_row(entry.company, date_str, header_style, right_style))
@@ -699,9 +694,7 @@ class PdfRenderer:
         sub_style = self._content_style("entry_subheader", f"es_{entry.id}")
         skills_style = self._content_style("skills_row", f"sk_{entry.id}")
 
-        date_str = entry.end_date or ""
-        if entry.start_date and entry.end_date:
-            date_str = f"{entry.start_date} \u2013 {entry.end_date}"
+        date_str = format_date_range(entry.start_date, entry.end_date)
 
         right_style = ParagraphStyle("r_tmp", parent=header_style, alignment=TA_RIGHT)
         items.append(self._left_right_row(entry.institution, date_str, header_style, right_style))
@@ -728,9 +721,7 @@ class PdfRenderer:
         header_style = self._content_style("entry_header", f"eh_{entry.id}")
         bullet_style = self._content_style("bullet", f"b_{entry.id}")
 
-        date_str = ""
-        if entry.start_date and entry.end_date:
-            date_str = f"{entry.start_date} \u2013 {entry.end_date}"
+        date_str = format_date_range(entry.start_date, entry.end_date)
 
         if date_str:
             right_style = ParagraphStyle("r_tmp", parent=header_style, alignment=TA_RIGHT)

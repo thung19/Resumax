@@ -21,6 +21,7 @@ from typing import Optional
 from backend.models.job_description import JobAnalysis
 from backend.models.resume_content import ResumeContent, SectionType
 from backend.models.tailoring import BulletChange, ResumeBank
+from backend.renderers.element_styles import format_date_range
 from backend.prompts import (
     TAILORING_SYSTEM_V2,
     TAILORING_USER_V2,
@@ -121,9 +122,8 @@ def _build_resume_text(
             parts.append(f"\n=== {section.title} ===")
 
         for entry in section.experience_entries:
-            date = ""
-            if entry.start_date and entry.end_date:
-                date = f" ({entry.start_date} – {entry.end_date})"
+            date_range = format_date_range(entry.start_date, entry.end_date)
+            date = f" ({date_range})" if date_range else ""
             parts.append(f"\n{entry.company}{date}")
             parts.append(f"{entry.role} | {entry.location or ''}")
             for b in entry.bullets:

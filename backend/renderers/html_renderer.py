@@ -26,6 +26,7 @@ from backend.renderers.element_styles import (
     default_font_from_layout,
     default_size_from_layout,
     extract_formatting,
+    format_date_range,
     spacer_height_pt,
 )
 from backend.renderers.fonts import find_font_file
@@ -392,13 +393,7 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
 
     def _render_experience(self, e) -> str:
         parts: list[str] = []
-        date = ""
-        if e.start_date and e.end_date:
-            date = f"{e.start_date} \u2013 {e.end_date}"
-        elif e.start_date:
-            date = e.start_date
-        elif e.end_date:
-            date = e.end_date
+        date = format_date_range(e.start_date, e.end_date)
 
         parts.append(self._lr(e.company, date, "bold", "bold"))
         parts.append(self._lr(e.role, e.location or "", "italic", ""))
@@ -409,9 +404,7 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
 
     def _render_education(self, e) -> str:
         parts: list[str] = []
-        date = e.end_date or ""
-        if e.start_date and e.end_date:
-            date = f"{e.start_date} \u2013 {e.end_date}"
+        date = format_date_range(e.start_date, e.end_date)
 
         parts.append(self._lr(e.institution, date, "bold", "bold"))
 
@@ -432,9 +425,7 @@ a.hl {{ color: #1a0dab; text-decoration: underline; }}
 
     def _render_project(self, e) -> str:
         parts: list[str] = []
-        date = ""
-        if e.start_date and e.end_date:
-            date = f"{e.start_date} \u2013 {e.end_date}"
+        date = format_date_range(e.start_date, e.end_date)
 
         name_html = escape(e.name)
         if hasattr(e, 'url') and e.url:

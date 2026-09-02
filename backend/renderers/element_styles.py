@@ -24,6 +24,26 @@ from backend.models.resume_layout import (
 # Data classes – renderer-neutral formatting
 # ------------------------------------------------------------------
 
+def format_date_range(start: Optional[str], end: Optional[str], sep: str = "–") -> str:
+    """Build a human-readable date string from optional start/end dates.
+
+    Renders a "start {sep} end" range when both are present, falls back to
+    whichever single date is set (so a still-in-progress entry with only a
+    start_date still shows a date), and returns "" when neither is set.
+
+    Shared by every renderer (and the tailoring engine's LLM-facing resume
+    text) -- this exact "build a date string from start/end" logic used to
+    be hand-written independently in six places (docx/pdf/text/html
+    renderers plus tailoring_engine.py) and had drifted: some renderers
+    used an en dash and some a plain hyphen, project/education entries had
+    the both-dates-required bug fixed in some renderers but not others.
+    Fixing it once here means the whole class of drift can't recur.
+    """
+    if start and end:
+        return f"{start} {sep} {end}"
+    return start or end or ""
+
+
 @dataclass
 class RunSegment:
     """A text segment with formatting normalised to points."""

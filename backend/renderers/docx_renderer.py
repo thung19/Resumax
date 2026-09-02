@@ -34,6 +34,7 @@ from backend.models.resume_layout import (
     TabAlignment,
     TabStop,
 )
+from backend.renderers.element_styles import format_date_range
 
 
 class DocxRenderer:
@@ -718,7 +719,7 @@ class DocxRenderer:
 
         if section.type == SectionType.EDUCATION:
             for e in section.education_entries:
-                date = e.end_date or ""
+                date = format_date_range(e.start_date, e.end_date)
                 self._add_lr_para(font, e.institution, date, bold=True)
                 degree = e.degree or ""
                 self._add_lr_para(font, degree, e.location or "")
@@ -735,17 +736,7 @@ class DocxRenderer:
             for i, e in enumerate(section.experience_entries):
                 if i > 0:
                     self._add_empty_para(font)
-                date = ""
-                if e.start_date and e.end_date:
-                    date = f"{e.start_date} \u2013 {e.end_date}"
-                elif e.start_date:
-                    # Currently-employed entries have a start_date and
-                    # no end_date \u2014 this used to render with no date at
-                    # all (pdf_renderer.py and text_renderer.py both
-                    # already fell back correctly here).
-                    date = e.start_date
-                elif e.end_date:
-                    date = e.end_date
+                date = format_date_range(e.start_date, e.end_date)
                 self._add_lr_para(font, e.company, date, bold=True)
                 self._add_lr_para(font, e.role, e.location or "", italic=True)
                 for b in e.bullets:
@@ -758,17 +749,7 @@ class DocxRenderer:
             for i, e in enumerate(section.project_entries):
                 if i > 0:
                     self._add_empty_para(font)
-                # pdf_renderer.py/text_renderer.py both include the date
-                # range when present \u2014 this fallback never read
-                # start_date/end_date at all, so project dates were
-                # silently absent from this render path.
-                date = ""
-                if e.start_date and e.end_date:
-                    date = f"{e.start_date} \u2013 {e.end_date}"
-                elif e.start_date:
-                    date = e.start_date
-                elif e.end_date:
-                    date = e.end_date
+                date = format_date_range(e.start_date, e.end_date)
                 if date:
                     self._add_lr_para(font, e.name, date, bold=True)
                 else:
